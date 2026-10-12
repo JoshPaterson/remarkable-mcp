@@ -44,6 +44,7 @@ from remarkable_mcp.api import (
     get_rmapi,
 )
 from remarkable_mcp.capabilities import client_supports_elicitation
+from remarkable_mcp.pages import content_page_ids
 from remarkable_mcp.responses import make_error, make_response
 from remarkable_mcp.ssh import XOCHITL_PATH, Document, SSHClient
 from remarkable_mcp.ssh_reliability import (
@@ -686,17 +687,10 @@ def _page_ids_from_content(content_data: dict) -> list:
     """Return ordered page ids from a parsed ``.content`` file.
 
     Handles both the modern ``cPages.pages[].id`` schema (native notebooks) and
-    the legacy flat ``pages`` UUID list (PDF/EPUB-backed documents).
+    the legacy flat ``pages`` UUID list (PDF/EPUB-backed documents). Pages
+    deleted on the tablet are skipped.
     """
-    cpages = content_data.get("cPages")
-    if isinstance(cpages, dict) and isinstance(cpages.get("pages"), list):
-        ids = [p.get("id") for p in cpages["pages"] if isinstance(p, dict) and p.get("id")]
-        if ids:
-            return ids
-    pages = content_data.get("pages")
-    if isinstance(pages, list) and all(isinstance(p, str) for p in pages):
-        return list(pages)
-    return []
+    return content_page_ids(content_data)
 
 
 def _read_remote_bytes(ssh_client: SSHClient, remote_path: str) -> Optional[bytes]:
