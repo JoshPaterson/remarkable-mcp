@@ -1941,20 +1941,38 @@ def get_document_file_type(zip_path: Path) -> str:
     return ""
 
 
+# v6 pen ids (rmscene ``Pen``) for highlighters and erasers.
+_HIGHLIGHTER_PENS = {5, 18}
+_ERASER_PENS = {6, 8}
+
+
+def _stroke_bbox(points) -> Optional[List[float]]:
+    """``[x0, y0, x1, y1]`` of a stroke's points in page units, rounded."""
+    xs = [p.x for p in points]
+    ys = [p.y for p in points]
+    if not xs:
+        return None
+    return [round(min(xs), 1), round(min(ys), 1), round(max(xs), 1), round(max(ys), 1)]
+
+
 def _page_annotation_details(rm_file: Path) -> Dict[str, Any]:
-    """Extract a page's text highlights (with colors) and whether it has pen strokes.
+    """Extract a page's highlights, highlighter strokes and pen-stroke presence.
 
     reMarkable text highlights are stored as ``GlyphRange`` scene items inside the
     page's v6 ``.rm`` file (each carries the selected ``text``, its bounding
-    ``rectangles`` and its color); freehand ink is stored as ``Line`` items. The
-    legacy ``.highlights`` JSON scanned elsewhere does not cover current
-    firmware, so read them here.
+    ``rectangles`` and its color); freehand ink is stored as ``Line`` items. A
+    highlighter stroke that did not snap to text is a ``Line`` drawn with a
+    highlighter pen. The legacy ``.highlights`` JSON scanned elsewhere does not
+    cover current firmware, so read them here.
 
-    Returns ``{"highlights": [...], "has_strokes": bool}`` where each highlight
-    is ``{"text", "color", "color_id", "color_hex"}`` in reading order. Returns
-    no highlights and no strokes if the file cannot be parsed.
+    Returns ``{"highlights": [...], "highlighter_strokes": [...], "has_strokes":
+    bool}``. Each highlight is ``{"text", "color", "color_id", "color_hex"}`` in
+    reading order; each highlighter stroke is ``{"color", "color_id",
+    "color_hex", "bbox"}`` ordered top to bottom, with ``bbox`` as ``[x0, y0,
+    x1, y1]`` in page units. ``has_strokes`` covers pen strokes other than
+    highlighters and erasers. Returns empty results if the file cannot be parsed.
     """
-    details: Dict[str, Any] = {"highlights": [], "has_strokes": False}
+    details: Dict[str, Any] = {"highlights": [], "highlighter_strokes": [], "has_strokes": False}
     try:
         import rmscene
     except Exception:
@@ -1966,11 +1984,24 @@ def _page_annotation_details(rm_file: Path) -> Dict[str, Any]:
         return details
 
     highlights: list = []
+    highlighter_strokes: list = []
     try:
         for item in tree.walk():
             kind = type(item).__name__
             if kind == "Line":
-                details["has_strokes"] = True
+                tool = getattr(item, "tool", None)
+                tool = getattr(tool, "value", tool)
+                if tool in _ERASER_PENS:
+                    continue
+                if tool not in _HIGHLIGHTER_PENS:
+                    details["has_strokes"] = True
+                    continue
+                bbox = _stroke_bbox(getattr(item, "points", None) or [])
+                if bbox is None:
+                    continue
+                entry = color_info(getattr(item, "color", None), getattr(item, "color_rgba", None))
+                entry["bbox"] = bbox
+                highlighter_strokes.append(entry)
             elif kind == "GlyphRange":
                 text = getattr(item, "text", None)
                 if not text:
@@ -1988,6 +2019,8 @@ def _page_annotation_details(rm_file: Path) -> Dict[str, Any]:
 
     highlights.sort(key=lambda t: (t[0], t[1]))  # top-to-bottom, left-to-right
     details["highlights"] = [t[2] for t in highlights]
+    highlighter_strokes.sort(key=lambda h: (h["bbox"][1], h["bbox"][0]))
+    details["highlighter_strokes"] = highlighter_strokes
     return details
 
 
@@ -2019,12 +2052,17 @@ def extract_text_from_document_zip(
                 {"page": int, "text": str, "color": str,
                  "color_id": int, "color_hex": str | None},
             ],
+            "highlighter_strokes": [   # Highlighter strokes not snapped to text
+                {"page": int, "color": str, "color_id": int,
+                 "color_hex": str | None, "bbox": [x0, y0, x1, y1]},
+            ],
             "annotated_pages": [       # Only pages that carry annotations
                 {"page": int,          # 1-based page number
                  "page_id": str,
                  "has_handwriting": bool,   # page has pen strokes
                  "highlights": [str],  # highlighted text on the page
-                 "highlight_details": [dict]},  # text plus color, as above
+                 "highlight_details": [dict],  # text plus color, as above
+                 "highlighter_strokes": [dict]},  # as above, without "page"
             ],
             "ocr_backend": str,        # Which OCR backend was used (if any)
         }
@@ -2044,6 +2082,7 @@ def extract_text_from_document_zip(
         "typed_text": [],
         "highlights": [],
         "highlight_details": [],
+        "highlighter_strokes": [],
         "handwritten_text": None,
         "pages": 0,
         "page_ids": [],
@@ -2115,8 +2154,9 @@ def extract_text_from_document_zip(
             page_num = page_pos.get(rm_file.stem, order_pos) + 1
             details = _page_annotation_details(rm_file)
             page_details = details["highlights"]
+            page_strokes = details["highlighter_strokes"]
             has_strokes = details["has_strokes"]
-            if page_details or has_strokes:
+            if page_details or page_strokes or has_strokes:
                 page_highlights = [h["text"] for h in page_details]
                 result["annotated_pages"].append(
                     {
@@ -2125,6 +2165,7 @@ def extract_text_from_document_zip(
                         "has_handwriting": has_strokes,
                         "highlights": page_highlights,
                         "highlight_details": page_details,
+                        "highlighter_strokes": page_strokes,
                     }
                 )
                 result["highlights"].extend(page_highlights)
@@ -2133,6 +2174,11 @@ def extract_text_from_document_zip(
             {"page": ap["page"], **h}
             for ap in result["annotated_pages"]
             for h in ap["highlight_details"]
+        ]
+        result["highlighter_strokes"] = [
+            {"page": ap["page"], **h}
+            for ap in result["annotated_pages"]
+            for h in ap["highlighter_strokes"]
         ]
 
         # Extract text from .txt and .md files

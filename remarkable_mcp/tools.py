@@ -610,6 +610,14 @@ async def remarkable_read(
                         n_hl = len(ap.get("highlights") or [])
                         if n_hl:
                             marks.append(f"{n_hl} highlight" + ("s" if n_hl != 1 else ""))
+                        strokes = ap.get("highlighter_strokes") or []
+                        if strokes:
+                            colors = list(dict.fromkeys(h.get("color") for h in strokes))
+                            marks.append(
+                                f"{len(strokes)} highlighter stroke"
+                                + ("s" if len(strokes) != 1 else "")
+                                + f" ({', '.join(str(c) for c in colors)})"
+                            )
                         annotation_parts.append(
                             f"Page {ap['page']}: " + (", ".join(marks) or "annotated")
                         )
@@ -621,6 +629,12 @@ async def remarkable_read(
                             prefix = f"[{color}] " if color else ""
                             annotation_parts.append(f"  • {prefix}{h['text']}")
                             shown_highlights.add(h["text"])
+                        for h in strokes:
+                            x0, y0, x1, y1 = h["bbox"]
+                            annotation_parts.append(
+                                f"  ~ [{h.get('color')}] highlighter stroke, "
+                                f"box ({x0:g}, {y0:g})-({x1:g}, {y1:g})"
+                            )
                 # Highlights not covered by the per-page index above — e.g. from
                 # the legacy .highlights JSON (older firmware), which has no page
                 # attribution. Without this, a doc whose pages carry pen strokes
@@ -907,6 +921,9 @@ async def remarkable_read(
             highlight_details = content.get("highlight_details")
             if highlight_details:
                 result["highlights"] = highlight_details
+            highlighter_strokes = content.get("highlighter_strokes")
+            if highlighter_strokes:
+                result["highlighter_strokes"] = highlighter_strokes
 
         if has_more:
             result["next_page"] = page + 1

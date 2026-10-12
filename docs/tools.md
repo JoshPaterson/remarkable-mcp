@@ -118,6 +118,12 @@ is a custom color named from the stored ARGB value, or `#rrggbb` when the value
 is not a known highlighter color. `color_hex` is set only when the tablet stores
 an ARGB value.
 
+Highlighter strokes that did not snap to text (freehand highlighter ink) are
+summarized per page, e.g. `Page 2: 2 highlighter strokes (pink, yellow)`, and
+returned as `highlighter_strokes` with `page`, the same color fields, and
+`bbox` (`[x0, y0, x1, y1]` in page units). Other pen strokes are summarized as
+"handwritten notes".
+
 ### Smart Features
 
 - **Auto-OCR**: If a notebook has no typed text and `include_ocr=False`, OCR is automatically enabled and you're notified via `_ocr_auto_enabled: true`

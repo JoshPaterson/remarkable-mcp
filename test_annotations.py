@@ -335,3 +335,96 @@ async def test_read_annotations_prefixes_highlights_with_color():
     assert "  • [yellow] Sidereal month" in data["content"]
     assert "  • [pink] Apsidal period" in data["content"]
     assert [(h["page"], h["color"]) for h in data["highlights"]] == [(1, "yellow"), (1, "pink")]
+
+
+# --- highlighter strokes ----------------------------------------------------
+
+HIGHLIGHTER = 18  # Pen.HIGHLIGHTER_2
+FINELINER = 17  # Pen.FINELINER_2
+ERASER = 6
+
+
+def test_highlighter_strokes_reported_with_color_and_bbox(tmp_path):
+    rm_file = tmp_path / "page.rm"
+    rm_file.write_bytes(
+        build_rm(
+            [
+                (
+                    "Layer 1",
+                    True,
+                    [
+                        stroke(3, HIGHLIGHTER, [(10, 400), (200, 410)]),
+                        stroke(5, HIGHLIGHTER, [(-50, 100), (150, 120)]),
+                        stroke(9, HIGHLIGHTER, [(0, 700), (90, 705)], argb=0xFFFFC38C),
+                        stroke(6, ERASER, [(0, 0), (5, 5)]),
+                    ],
+                )
+            ]
+        )
+    )
+
+    details = _page_annotation_details(rm_file)
+
+    assert [h["color"] for h in details["highlighter_strokes"]] == ["pink", "yellow", "orange"]
+    assert details["highlighter_strokes"][0]["bbox"] == [-50.0, 100.0, 150.0, 120.0]
+    assert details["has_strokes"] is False
+
+
+def test_pen_strokes_stay_handwriting(tmp_path):
+    rm_file = tmp_path / "page.rm"
+    rm_file.write_bytes(build_rm([("Layer 1", True, [stroke(0, FINELINER, [(0, 0), (10, 10)])])]))
+
+    details = _page_annotation_details(rm_file)
+
+    assert details["has_strokes"] is True
+    assert details["highlighter_strokes"] == []
+
+
+def test_document_extraction_indexes_highlighter_only_pages(tmp_path):
+    page = build_rm([("Layer 1", True, [stroke(5, HIGHLIGHTER, [(0, 10), (50, 12)])])])
+    zip_path = write_document_zip(
+        tmp_path / "doc.zip",
+        {"p2": page},
+        {"cPages": {"pages": [{"id": "p1"}, {"id": "p2"}]}},
+    )
+
+    result = extract_text_from_document_zip(zip_path)
+
+    assert [ap["page"] for ap in result["annotated_pages"]] == [2]
+    assert result["annotated_pages"][0]["has_handwriting"] is False
+    assert result["highlighter_strokes"][0]["page"] == 2
+    assert result["highlighter_strokes"][0]["color"] == "pink"
+
+
+async def test_read_annotations_summarizes_highlighter_strokes():
+    strokes = [
+        {"color": "pink", "color_id": 5, "color_hex": None, "bbox": [0.0, 10.0, 50.0, 12.0]},
+        {"color": "yellow", "color_id": 3, "color_hex": None, "bbox": [0.0, 90.0, 40.0, 95.5]},
+    ]
+    data = await _read_annotations(
+        {
+            "typed_text": [],
+            "highlights": [],
+            "highlight_details": [],
+            "highlighter_strokes": [{"page": 2, **h} for h in strokes],
+            "handwritten_text": None,
+            "pages": 2,
+            "page_ids": ["p1", "p2"],
+            "annotated_pages": [
+                {
+                    "page": 2,
+                    "page_id": "p2",
+                    "has_handwriting": True,
+                    "highlights": [],
+                    "highlight_details": [],
+                    "highlighter_strokes": strokes,
+                }
+            ],
+            "ocr_backend": None,
+            "tags": [],
+        }
+    )
+
+    assert "Page 2: handwritten notes, 2 highlighter strokes (pink, yellow)" in data["content"]
+    assert "  ~ [yellow] highlighter stroke, box (0, 90)-(40, 95.5)" in data["content"]
+    assert [h["color"] for h in data["highlighter_strokes"]] == ["pink", "yellow"]

@@ -432,6 +432,13 @@ def write_markdown_export(
                 if colors:
                     mark += f" ({', '.join(colors)})"
                 marks.append(mark)
+            strokes = entry.get("highlighter_strokes") or []
+            if strokes:
+                colors = _unique_strings(str(h.get("color")) for h in strokes if h.get("color"))
+                mark = f"{len(strokes)} highlighter stroke" + ("s" if len(strokes) != 1 else "")
+                if colors:
+                    mark += f" ({', '.join(colors)})"
+                marks.append(mark)
             page_id = entry.get("page_id")
             identity = f"; page ID `{page_id}`" if page_id else ""
             lines.append(
