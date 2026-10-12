@@ -101,6 +101,23 @@ remarkable_read("/Work/Projects/Q4 Planning")
 }
 ```
 
+### Highlight colors
+
+Text highlights are listed per page with their highlighter color, e.g.
+`• [pink] The line of apsides advances...`. For `text` and `annotations`
+reads, the response also carries a `highlights` list:
+
+```json
+"highlights": [
+  {"page": 1, "text": "...", "color": "blue", "color_id": 9, "color_hex": "#beeafe"}
+]
+```
+
+`color` is a name (yellow, green, pink, gray, blue, orange, ...). Color id 9
+is a custom color named from the stored ARGB value, or `#rrggbb` when the value
+is not a known highlighter color. `color_hex` is set only when the tablet stores
+an ARGB value.
+
 ### Smart Features
 
 - **Auto-OCR**: If a notebook has no typed text and `include_ocr=False`, OCR is automatically enabled and you're notified via `_ocr_auto_enabled: true`

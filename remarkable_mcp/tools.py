@@ -613,9 +613,14 @@ async def remarkable_read(
                         annotation_parts.append(
                             f"Page {ap['page']}: " + (", ".join(marks) or "annotated")
                         )
-                        for h in ap.get("highlights") or []:
-                            annotation_parts.append(f"  • {h}")
-                            shown_highlights.add(h)
+                        details = ap.get("highlight_details")
+                        if details is None:
+                            details = [{"text": h} for h in ap.get("highlights") or []]
+                        for h in details:
+                            color = h.get("color")
+                            prefix = f"[{color}] " if color else ""
+                            annotation_parts.append(f"  • {prefix}{h['text']}")
+                            shown_highlights.add(h["text"])
                 # Highlights not covered by the per-page index above — e.g. from
                 # the legacy .highlights JSON (older firmware), which has no page
                 # attribution. Without this, a doc whose pages carry pen strokes
@@ -896,6 +901,12 @@ async def remarkable_read(
         tags = getattr(target_doc, "tags", None) or (content.get("tags") if content else None)
         if tags:
             result["tags"] = tags
+
+        # Highlights with their colors, in page order
+        if content_type in ("text", "annotations") and content:
+            highlight_details = content.get("highlight_details")
+            if highlight_details:
+                result["highlights"] = highlight_details
 
         if has_more:
             result["next_page"] = page + 1

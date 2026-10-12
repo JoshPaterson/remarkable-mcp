@@ -14,6 +14,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from xml.sax.saxutils import escape as _xml_escape
 
+from remarkable_mcp.colors import color_info, render_color
+
 logger = logging.getLogger(__name__)
 
 
@@ -648,22 +650,6 @@ def _v6_paths_from_blocks(blocks: list, anchor_pos: Optional[dict] = None) -> Tu
     # Integer pen/color values (rmscene exposes ints on blocks).
     HIGHLIGHTER_PENS = {5, 18}  # HIGHLIGHTER_1, HIGHLIGHTER_2
     ERASER_PENS = {6, 8}  # ERASER, ERASER_AREA
-    COLOR_MAP = {
-        0: "black",  # BLACK
-        1: "#808080",  # GRAY
-        2: "white",  # WHITE
-        3: "#FFD700",  # YELLOW
-        4: "#00A000",  # GREEN
-        5: "#FF69B4",  # PINK
-        6: "#4169E1",  # BLUE
-        7: "#E00000",  # RED
-        8: "#A0A0A0",  # GRAY_OVERLAP
-        9: "#FFD700",  # HIGHLIGHT
-        10: "#00C000",  # GREEN_2
-        11: "#00CED1",  # CYAN
-        12: "#FF00FF",  # MAGENTA
-        13: "#FFD700",  # YELLOW_2
-    }
 
     group_offsets = _v6_group_offsets(blocks, anchor_pos) if anchor_pos else {}
 
@@ -679,9 +665,9 @@ def _v6_paths_from_blocks(blocks: list, anchor_pos: Optional[dict] = None) -> Tu
         # (highlight boxes over selected text) rather than stroke `points`.
         # Emit a translucent filled rect per rectangle in the highlight colour.
         if getattr(line, "rectangles", None):
-            hl_color = getattr(line, "color", 9)
-            hl_color = hl_color.value if hasattr(hl_color, "value") else hl_color
-            hl_fill = COLOR_MAP.get(hl_color, "#FFD700")
+            hl_fill = render_color(
+                getattr(line, "color", 9), getattr(line, "color_rgba", None), "#FFD700"
+            )
             for r in line.rectangles:
                 paths.append(
                     f'<rect x="{r.x + dx:.1f}" y="{r.y + dy:.1f}" '
@@ -705,7 +691,7 @@ def _v6_paths_from_blocks(blocks: list, anchor_pos: Optional[dict] = None) -> Tu
             continue
 
         is_highlighter = tool in HIGHLIGHTER_PENS
-        stroke_color = COLOR_MAP.get(color, "black")
+        stroke_color = render_color(color, getattr(line, "color_rgba", None))
 
         if is_highlighter:
             avg_width = (
@@ -1955,35 +1941,36 @@ def get_document_file_type(zip_path: Path) -> str:
     return ""
 
 
-def _extract_page_annotations(rm_file: Path) -> Tuple[List[str], bool]:
-    """Extract a page's text highlights and whether it has pen strokes.
+def _page_annotation_details(rm_file: Path) -> Dict[str, Any]:
+    """Extract a page's text highlights (with colors) and whether it has pen strokes.
 
     reMarkable text highlights are stored as ``GlyphRange`` scene items inside the
-    page's v6 ``.rm`` file (each carries the selected ``text`` and its bounding
-    ``rectangles``); freehand ink is stored as ``Line`` items. The legacy
-    ``.highlights`` JSON scanned elsewhere does not cover current firmware, so
-    read them here.
+    page's v6 ``.rm`` file (each carries the selected ``text``, its bounding
+    ``rectangles`` and its color); freehand ink is stored as ``Line`` items. The
+    legacy ``.highlights`` JSON scanned elsewhere does not cover current
+    firmware, so read them here.
 
-    Returns ``(highlighted_texts_in_reading_order, has_pen_strokes)``. Returns
-    ``([], False)`` if the file cannot be parsed.
+    Returns ``{"highlights": [...], "has_strokes": bool}`` where each highlight
+    is ``{"text", "color", "color_id", "color_hex"}`` in reading order. Returns
+    no highlights and no strokes if the file cannot be parsed.
     """
+    details: Dict[str, Any] = {"highlights": [], "has_strokes": False}
     try:
         import rmscene
     except Exception:
-        return [], False
+        return details
     try:
         with rm_file.open("rb") as fh:
             tree = rmscene.read_tree(fh)
     except Exception:
-        return [], False
+        return details
 
     highlights: list = []
-    has_strokes = False
     try:
         for item in tree.walk():
             kind = type(item).__name__
             if kind == "Line":
-                has_strokes = True
+                details["has_strokes"] = True
             elif kind == "GlyphRange":
                 text = getattr(item, "text", None)
                 if not text:
@@ -1991,12 +1978,23 @@ def _extract_page_annotations(rm_file: Path) -> Tuple[List[str], bool]:
                 rects = getattr(item, "rectangles", None) or []
                 y = rects[0].y if rects else 0.0
                 x = rects[0].x if rects else 0.0
-                highlights.append((y, x, text))
+                entry = {"text": text}
+                entry.update(
+                    color_info(getattr(item, "color", None), getattr(item, "color_rgba", None))
+                )
+                highlights.append((y, x, entry))
     except Exception:
         pass
 
     highlights.sort(key=lambda t: (t[0], t[1]))  # top-to-bottom, left-to-right
-    return [t[2] for t in highlights], has_strokes
+    details["highlights"] = [t[2] for t in highlights]
+    return details
+
+
+def _extract_page_annotations(rm_file: Path) -> Tuple[List[str], bool]:
+    """Return ``(highlighted_texts_in_reading_order, has_pen_strokes)`` for a page."""
+    details = _page_annotation_details(rm_file)
+    return [h["text"] for h in details["highlights"]], details["has_strokes"]
 
 
 def extract_text_from_document_zip(
@@ -2017,11 +2015,16 @@ def extract_text_from_document_zip(
             "handwritten_text": [...], # From OCR (if enabled) - one per page, in order
             "pages": int,
             "page_ids": [...],         # Page UUIDs in order
+            "highlight_details": [     # GlyphRange highlights with colors
+                {"page": int, "text": str, "color": str,
+                 "color_id": int, "color_hex": str | None},
+            ],
             "annotated_pages": [       # Only pages that carry annotations
                 {"page": int,          # 1-based page number
                  "page_id": str,
                  "has_handwriting": bool,   # page has pen strokes
-                 "highlights": [str]}, # highlighted text on the page
+                 "highlights": [str],  # highlighted text on the page
+                 "highlight_details": [dict]},  # text plus color, as above
             ],
             "ocr_backend": str,        # Which OCR backend was used (if any)
         }
@@ -2040,6 +2043,7 @@ def extract_text_from_document_zip(
     result: Dict[str, Any] = {
         "typed_text": [],
         "highlights": [],
+        "highlight_details": [],
         "handwritten_text": None,
         "pages": 0,
         "page_ids": [],
@@ -2109,18 +2113,27 @@ def extract_text_from_document_zip(
         page_pos = {pid: i for i, pid in enumerate(page_order)}
         for order_pos, rm_file in enumerate(rm_files):
             page_num = page_pos.get(rm_file.stem, order_pos) + 1
-            page_highlights, has_strokes = _extract_page_annotations(rm_file)
-            if page_highlights or has_strokes:
+            details = _page_annotation_details(rm_file)
+            page_details = details["highlights"]
+            has_strokes = details["has_strokes"]
+            if page_details or has_strokes:
+                page_highlights = [h["text"] for h in page_details]
                 result["annotated_pages"].append(
                     {
                         "page": page_num,
                         "page_id": rm_file.stem,
                         "has_handwriting": has_strokes,
                         "highlights": page_highlights,
+                        "highlight_details": page_details,
                     }
                 )
                 result["highlights"].extend(page_highlights)
         result["annotated_pages"].sort(key=lambda a: a["page"])
+        result["highlight_details"] = [
+            {"page": ap["page"], **h}
+            for ap in result["annotated_pages"]
+            for h in ap["highlight_details"]
+        ]
 
         # Extract text from .txt and .md files
         for txt_file in tmpdir_path.glob("**/*.txt"):
