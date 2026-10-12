@@ -405,15 +405,21 @@ For PNG format, returns an embedded image resource that can be displayed inline.
 
 For SVG format, returns an embedded text resource with the SVG content.
 
-When `compatibility=True`, returns a JSON object with the resource URI:
+When `compatibility=True`, a PNG is not embedded. The response is a JSON
+object with a link to a temporary resource holding the rendered image, which
+expires after 15 minutes:
 
 ```json
 {
-  "resource_uri": "remarkableimg:///path/doc.page-1.merged.png",
+  "mime_type": "image/png",
   "page": 1,
   "total_pages": 5,
+  "resource_uri": "remarkableexport:///png/3f2a...",
+  "size": 182311,
+  "expires_at": "2026-10-12T09:15:00+00:00",
   "merged": true,
-  "_hint": "Page 1/5. Use resource URI to access the image."
+  "render_source": "strokes",
+  "_hint": "Page 1/5 as a PNG resource; read resource_uri before it expires..."
 }
 ```
 

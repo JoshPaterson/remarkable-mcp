@@ -1749,6 +1749,15 @@ async def _render_png_page(
     return png_data, merged_note, is_merged, rendered_via_pdf
 
 
+def _publish_png(png_data: bytes, title: str) -> PublishedExport[None]:
+    """Publish a rendered page image as a temporary resource."""
+
+    def write(path: Path) -> None:
+        path.write_bytes(png_data)
+
+    return export_store.publish(filename=title, output_format="png", writer=write)
+
+
 @mcp.tool(annotations=IMAGE_ANNOTATIONS)
 async def remarkable_image(
     document: str,
@@ -1782,8 +1791,9 @@ async def remarkable_image(
     - SVG: Returned as TextResourceContents with SVG markup
 
     If your client doesn't support embedded resources in tool responses, set
-    compatibility=True to receive a JSON response with just the resource URI.
-    The client can then fetch the resource separately.
+    compatibility=True to receive a JSON response with just a resource URI. For
+    PNG it points to a temporary copy of the rendered image that expires after
+    15 minutes; the client can then fetch the resource separately.
 
     Optionally, enable include_ocr=True to extract text from the image using OCR.
     Google Vision is used when configured; otherwise OCR runs locally with Tesseract.
@@ -2048,7 +2058,6 @@ async def remarkable_image(
 
                 uri_suffix = ".merged.png" if is_merged else ".png"
                 resource_uri = f"remarkableimg:///{uri_path}.page-{page}{uri_suffix}"
-                png_base64 = base64.b64encode(png_data).decode("utf-8")
 
                 # Build OCR info for response if OCR was requested
                 ocr_info = {}
@@ -2059,13 +2068,18 @@ async def remarkable_image(
                         ocr_info["ocr_message"] = "No text detected in image"
 
                 if compatibility:
-                    # Return base64 PNG in JSON for clients without embedded resource support
-                    # Include data URI format for direct use in HTML <img> tags
-                    data_uri = f"data:image/png;base64,{png_base64}"
+                    # Clients without embedded resource support get a link to a
+                    # temporary resource holding exactly this rendered image.
+                    published = await run_blocking(
+                        _publish_png,
+                        png_data,
+                        f"{target_doc.VissibleName} page {page}",
+                    )
+                    image_resource = published.resource
                     hint = (
-                        f"Page {page}/{total_pages} as base64-encoded PNG. "
-                        f"Use 'data_uri' directly in HTML img src. "
-                        f"Use compatibility=False for embedded resource format."
+                        f"Page {page}/{total_pages} as a PNG resource; read resource_uri "
+                        f"before it expires at {image_resource.expires_at.isoformat()}. "
+                        f"Use compatibility=False to embed the image instead."
                     )
                     if include_ocr and ocr_text:
                         hint = (
@@ -2085,12 +2099,12 @@ async def remarkable_image(
                         )
 
                     response_data = {
-                        "data_uri": data_uri,
-                        "image_base64": png_base64,
                         "mime_type": "image/png",
                         "page": page,
                         "total_pages": total_pages,
-                        "resource_uri": resource_uri,
+                        "resource_uri": image_resource.uri,
+                        "size": image_resource.size,
+                        "expires_at": image_resource.expires_at.isoformat(),
                         "merged": is_merged,
                         "render_source": "tablet_pdf" if rendered_via_pdf else "strokes",
                         **ocr_info,
@@ -2098,6 +2112,7 @@ async def remarkable_image(
                     return make_response(response_data, hint)
                 else:
                     # Return PNG as embedded BlobResourceContents with info hint
+                    png_base64 = base64.b64encode(png_data).decode("utf-8")
                     blob_resource = BlobResourceContents(
                         uri=resource_uri,
                         mime_type="image/png",

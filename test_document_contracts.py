@@ -10,6 +10,7 @@ from unittest.mock import Mock, patch
 import pytest
 from mcp import types
 
+from remarkable_mcp.export_resources import export_store
 from remarkable_mcp.server import mcp
 
 
@@ -612,7 +613,7 @@ class TestPdfRenderingDefault:
 
         data = _response_json(result)
         assert "_error" not in data
-        assert data["image_base64"]
+        assert export_store.read_bytes(data["resource_uri"].rsplit("/", 1)[-1], "png")
         assert data["merged"] is expected_merged
 
     @pytest.mark.asyncio
@@ -679,7 +680,7 @@ class TestPdfRenderingDefault:
         assert data["total_pages"] == 1
         assert data["render_source"] == "tablet_pdf"
         assert data["merged"] is False
-        assert data["image_base64"]
+        assert export_store.read_bytes(data["resource_uri"].rsplit("/", 1)[-1], "png")
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(

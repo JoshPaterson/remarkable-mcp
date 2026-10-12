@@ -26,6 +26,7 @@ from remarkable_mcp.api import (
     get_items_by_id,
     register_and_get_token,
 )
+from remarkable_mcp.export_resources import export_store
 from remarkable_mcp.extract import (
     extract_text_from_document_zip,
     extract_text_from_rm_file,
@@ -953,7 +954,9 @@ class TestRemarkableImage:
         assert any(isinstance(content, EmbeddedResource) for content in embedded.content)
         compatible_data = json.loads(compatible.content[0].text)
         assert compatible_data["mime_type"] == "image/png"
-        assert compatible_data["image_base64"]
+        assert "image_base64" not in compatible_data
+        assert compatible_data["resource_uri"].startswith("remarkableexport:///png/")
+        assert export_store.read_bytes(compatible_data["resource_uri"].rsplit("/", 1)[-1], "png")
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
@@ -1199,7 +1202,7 @@ class TestMergedRendering:
 
         data = json.loads(result.content[0].text)
         assert data.get("merged") is True
-        assert data.get("resource_uri", "").endswith(".merged.png")
+        assert data.get("resource_uri", "").startswith("remarkableexport:///png/")
         hint = data.get("_hint", "")
         assert "PDF" in hint and "annotation" in hint.lower()
         # The merged renderer should have been called once for this page
@@ -1419,7 +1422,7 @@ class TestRenderTabletPdfFallback:
         data = json.loads(result.content[0].text)
         assert "_error" not in data
         assert data.get("render_source") == "tablet_pdf"
-        assert data.get("image_base64")
+        assert export_store.read_bytes(data["resource_uri"].rsplit("/", 1)[-1], "png")
         assert "native PDF export" in data.get("_hint", "")
         mock_download_raw.assert_called_once()
 
@@ -1514,7 +1517,7 @@ class TestRenderTabletPdfFallback:
 
         data = json.loads(result.content[0].text)
         assert "_error" not in data
-        assert data.get("image_base64")
+        assert export_store.read_bytes(data["resource_uri"].rsplit("/", 1)[-1], "png")
         mock_full.assert_called_once()
 
 
@@ -3044,12 +3047,12 @@ class TestWriteTools:
         ]
 
         for tool_name in write_tool_names:
-            assert tool_name in tool_names, (
-                f"Write tool {tool_name} should be registered by default"
-            )
-        assert "remarkable_author" not in tool_names, (
-            "remarkable_author is SSH-only and must be hidden in cloud mode"
-        )
+            assert (
+                tool_name in tool_names
+            ), f"Write tool {tool_name} should be registered by default"
+        assert (
+            "remarkable_author" not in tool_names
+        ), "remarkable_author is SSH-only and must be hidden in cloud mode"
 
     @pytest.mark.asyncio
     async def test_write_tools_registered_when_enabled(self):
