@@ -120,9 +120,12 @@ an ARGB value.
 
 Highlighter strokes that did not snap to text (freehand highlighter ink) are
 summarized per page, e.g. `Page 2: 2 highlighter strokes (pink, yellow)`, and
-returned as `highlighter_strokes` with `page`, the same color fields, and
-`bbox` (`[x0, y0, x1, y1]` in page units). Other pen strokes are summarized as
-"handwritten notes".
+returned as `highlighter_strokes` with `page`, the same color fields, and the
+stroke's extent including the pen width, as `[left, top, right, bottom]` from
+the page's top-left corner: `bbox_mm` in millimetres and `region` as fractions
+of the page. `region` can be passed to `remarkable_image(region=...)` to view
+the marked area. PDF-backed pages are measured on their PDF page. Other pen
+strokes are summarized as "handwritten notes".
 
 ### Smart Features
 

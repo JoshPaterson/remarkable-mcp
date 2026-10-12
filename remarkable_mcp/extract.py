@@ -1947,12 +1947,88 @@ _ERASER_PENS = {6, 8}
 
 
 def _stroke_bbox(points) -> Optional[List[float]]:
-    """``[x0, y0, x1, y1]`` of a stroke's points in page units, rounded."""
+    """``[x0, y0, x1, y1]`` of a stroke in stroke units, including the pen width.
+
+    v6 point widths are four times the width in stroke units.
+    """
     xs = [p.x for p in points]
     ys = [p.y for p in points]
     if not xs:
         return None
-    return [round(min(xs), 1), round(min(ys), 1), round(max(xs), 1), round(max(ys), 1)]
+    half_width = max((getattr(p, "width", 0) or 0) for p in points) / 4.0 / 2.0
+    return [
+        min(xs) - half_width,
+        min(ys) - half_width,
+        max(xs) + half_width,
+        max(ys) + half_width,
+    ]
+
+
+MM_PER_POINT = 25.4 / 72.0
+
+
+def _pdf_page_sizes(tmpdir_path: Path) -> List[Tuple[float, float]]:
+    """``(width, height)`` in points for each page of a document's PDF, if any."""
+    pdf_files = sorted(tmpdir_path.glob("**/*.pdf"))
+    if not pdf_files:
+        return []
+    content_stems = {p.stem for p in tmpdir_path.glob("*.content")}
+    matching = [p for p in pdf_files if p.stem in content_stems]
+    try:
+        import fitz
+
+        with fitz.open(matching[0] if matching else pdf_files[0]) as pdf:
+            return [(page.rect.width, page.rect.height) for page in pdf]
+    except Exception:
+        return []
+
+
+def _page_frame(
+    tmpdir_path: Path,
+    page: int,
+    rm_file: Optional[Path],
+    pdf_page_sizes: List[Tuple[float, float]],
+) -> Tuple[float, float, float]:
+    """``(width, height, points_per_unit)`` of a page as rendered, in stroke units.
+
+    PDF-backed pages span their PDF page; other pages span the scene's paper
+    size. Stroke x coordinates are centered on the page, y starts at the top.
+    """
+    blocks = _v6_blocks(rm_file) if rm_file is not None else None
+    paper = _v6_paper_size(blocks) if blocks else (REMARKABLE_WIDTH, REMARKABLE_HEIGHT)
+    ppu = _points_per_unit(paper)
+    if pdf_page_sizes:
+        index = _resolve_pdf_page_index(tmpdir_path, page)
+        if index is not None and 0 <= index < len(pdf_page_sizes):
+            width_pt, height_pt = pdf_page_sizes[index]
+            return width_pt / ppu, height_pt / ppu, ppu
+    return float(paper[0]), float(paper[1]), ppu
+
+
+def _locate_on_page(
+    bbox: List[float], frame: Tuple[float, float, float]
+) -> Tuple[List[float], List[float]]:
+    """A stroke-unit bbox as page millimetres and page fractions.
+
+    Both are ``[left, top, right, bottom]`` from the page's top-left corner.
+    The fractions are clamped to the page, matching ``remarkable_image``'s
+    ``region`` parameter.
+    """
+    width, height, ppu = frame
+    left, top = bbox[0] + width / 2.0, bbox[1]
+    right, bottom = bbox[2] + width / 2.0, bbox[3]
+    mm = [round(v * ppu * MM_PER_POINT, 1) for v in (left, top, right, bottom)]
+
+    def fraction(value: float, extent: float) -> float:
+        return round(min(max(value / extent, 0.0), 1.0), 3)
+
+    region = [
+        fraction(left, width),
+        fraction(top, height),
+        fraction(right, width),
+        fraction(bottom, height),
+    ]
+    return mm, region
 
 
 def _page_annotation_details(rm_file: Path) -> Dict[str, Any]:
@@ -1969,8 +2045,9 @@ def _page_annotation_details(rm_file: Path) -> Dict[str, Any]:
     bool}``. Each highlight is ``{"text", "color", "color_id", "color_hex"}`` in
     reading order; each highlighter stroke is ``{"color", "color_id",
     "color_hex", "bbox"}`` ordered top to bottom, with ``bbox`` as ``[x0, y0,
-    x1, y1]`` in page units. ``has_strokes`` covers pen strokes other than
-    highlighters and erasers. Returns empty results if the file cannot be parsed.
+    x1, y1]`` in stroke units, padded by the pen width. ``has_strokes`` covers
+    pen strokes other than highlighters and erasers. Returns empty results if
+    the file cannot be parsed.
     """
     details: Dict[str, Any] = {"highlights": [], "highlighter_strokes": [], "has_strokes": False}
     try:
@@ -2054,7 +2131,9 @@ def extract_text_from_document_zip(
             ],
             "highlighter_strokes": [   # Highlighter strokes not snapped to text
                 {"page": int, "color": str, "color_id": int,
-                 "color_hex": str | None, "bbox": [x0, y0, x1, y1]},
+                 "color_hex": str | None,
+                 "bbox_mm": [left, top, right, bottom],  # from page top-left
+                 "region": [left, top, right, bottom]},  # page fractions
             ],
             "annotated_pages": [       # Only pages that carry annotations
                 {"page": int,          # 1-based page number
@@ -2175,6 +2254,18 @@ def extract_text_from_document_zip(
             for ap in result["annotated_pages"]
             for h in ap["highlight_details"]
         ]
+        # Place highlighter strokes on the page as rendered
+        if any(ap["highlighter_strokes"] for ap in result["annotated_pages"]):
+            pdf_sizes = _pdf_page_sizes(tmpdir_path)
+            rm_by_stem = {f.stem: f for f in rm_files}
+            for ap in result["annotated_pages"]:
+                if not ap["highlighter_strokes"]:
+                    continue
+                frame = _page_frame(
+                    tmpdir_path, ap["page"], rm_by_stem.get(ap["page_id"]), pdf_sizes
+                )
+                for stroke in ap["highlighter_strokes"]:
+                    stroke["bbox_mm"], stroke["region"] = _locate_on_page(stroke.pop("bbox"), frame)
         result["highlighter_strokes"] = [
             {"page": ap["page"], **h}
             for ap in result["annotated_pages"]

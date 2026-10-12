@@ -366,7 +366,8 @@ def test_highlighter_strokes_reported_with_color_and_bbox(tmp_path):
     details = _page_annotation_details(rm_file)
 
     assert [h["color"] for h in details["highlighter_strokes"]] == ["pink", "yellow", "orange"]
-    assert details["highlighter_strokes"][0]["bbox"] == [-50.0, 100.0, 150.0, 120.0]
+    # Padded by half the pen width (point width 8 -> 2 stroke units).
+    assert details["highlighter_strokes"][0]["bbox"] == [-51.0, 99.0, 151.0, 121.0]
     assert details["has_strokes"] is False
 
 
@@ -392,14 +393,19 @@ def test_document_extraction_indexes_highlighter_only_pages(tmp_path):
 
     assert [ap["page"] for ap in result["annotated_pages"]] == [2]
     assert result["annotated_pages"][0]["has_handwriting"] is False
-    assert result["highlighter_strokes"][0]["page"] == 2
-    assert result["highlighter_strokes"][0]["color"] == "pink"
+    stroke_entry = result["highlighter_strokes"][0]
+    assert stroke_entry["page"] == 2
+    assert stroke_entry["color"] == "pink"
+    assert "bbox" not in stroke_entry
+    # x is centered on the 1404-unit page; 0.3177 pt per unit.
+    assert stroke_entry["region"] == [0.499, 0.005, 0.536, 0.007]
+    assert stroke_entry["bbox_mm"] == [78.6, 1.0, 84.4, 1.5]
 
 
 async def test_read_annotations_summarizes_highlighter_strokes():
     strokes = [
-        {"color": "pink", "color_id": 5, "color_hex": None, "bbox": [0.0, 10.0, 50.0, 12.0]},
-        {"color": "yellow", "color_id": 3, "color_hex": None, "bbox": [0.0, 90.0, 40.0, 95.5]},
+        {"color": "pink", "color_id": 5, "color_hex": None, "region": [0.1, 0.2, 0.5, 0.25]},
+        {"color": "yellow", "color_id": 3, "color_hex": None, "region": [0.1, 0.4, 0.4, 0.45]},
     ]
     data = await _read_annotations(
         {
@@ -426,5 +432,5 @@ async def test_read_annotations_summarizes_highlighter_strokes():
     )
 
     assert "Page 2: handwritten notes, 2 highlighter strokes (pink, yellow)" in data["content"]
-    assert "  ~ [yellow] highlighter stroke, box (0, 90)-(40, 95.5)" in data["content"]
+    assert "  ~ [yellow] highlighter stroke, region [0.1, 0.4, 0.4, 0.45]" in data["content"]
     assert [h["color"] for h in data["highlighter_strokes"]] == ["pink", "yellow"]

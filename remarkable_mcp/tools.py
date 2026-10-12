@@ -630,10 +630,9 @@ async def remarkable_read(
                             annotation_parts.append(f"  • {prefix}{h['text']}")
                             shown_highlights.add(h["text"])
                         for h in strokes:
-                            x0, y0, x1, y1 = h["bbox"]
+                            location = f", region {h['region']}" if h.get("region") else ""
                             annotation_parts.append(
-                                f"  ~ [{h.get('color')}] highlighter stroke, "
-                                f"box ({x0:g}, {y0:g})-({x1:g}, {y1:g})"
+                                f"  ~ [{h.get('color')}] highlighter stroke{location}"
                             )
                 # Highlights not covered by the per-page index above — e.g. from
                 # the legacy .highlights JSON (older firmware), which has no page
