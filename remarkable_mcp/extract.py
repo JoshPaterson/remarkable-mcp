@@ -464,6 +464,52 @@ def _svg_from_paths(paths: list, all_coords: list) -> Optional[str]:
     )
 
 
+# Pen stroke widths in page units. v6 points store width as a fixed-point
+# value, four times the page-unit width (rmscene reads v1 float widths as
+# ``round(width * 4)``); v5 segments store page units directly.
+V6_POINT_WIDTH_SCALE = 0.25
+MIN_PEN_STROKE_WIDTH = 0.3
+MAX_PEN_STROKE_WIDTH = 100.0
+
+
+def _pen_width(width: float) -> float:
+    return max(MIN_PEN_STROKE_WIDTH, min(width, MAX_PEN_STROKE_WIDTH))
+
+
+def _pen_stroke_paths(
+    points: List[Tuple[float, float, float]], stroke_color: str, attrs: str = ""
+) -> List[str]:
+    """SVG paths for a pen stroke given ``(x, y, width)`` points in page units.
+
+    Consecutive points of equal width (to 0.05 units) share one path, so a
+    constant-width pen yields a single path while pressure-sensitive pens keep
+    their width variation along the stroke.
+    """
+
+    def path(run: list, width: float) -> str:
+        d = f"M {run[0][0]:.1f} {run[0][1]:.1f}"
+        d += "".join(f" L {x:.1f} {y:.1f}" for x, y, _ in run[1:])
+        return (
+            f'<path d="{d}" stroke="{stroke_color}" '
+            f'stroke-width="{width:.2f}" '
+            f'fill="none" stroke-linecap="round" '
+            f'stroke-linejoin="round"{attrs}/>'
+        )
+
+    paths = []
+    run = [points[0]]
+    run_width = round(_pen_width(points[0][2]) * 20) / 20
+    for point in points[1:]:
+        width = round(_pen_width(point[2]) * 20) / 20
+        if width != run_width and len(run) > 1:
+            paths.append(path(run, run_width))
+            run = [run[-1]]
+            run_width = width
+        run.append(point)
+    paths.append(path(run, run_width))
+    return paths
+
+
 def _render_rm_v5_to_svg(rm_file_path: Path) -> Optional[str]:
     """
     Render a v5 .rm file (reMarkable .lines format) to SVG.
@@ -511,21 +557,23 @@ def _render_rm_v5_to_svg(rm_file_path: Path) -> Optional[str]:
                     if pen in ERASER_PENS:
                         continue
 
-                    is_highlighter = pen in HIGHLIGHTER_PENS
-                    if is_highlighter:
-                        stroke_color = HIGHLIGHT_COLORS.get(color, "#FFD700")
-                        avg_width = sum(s[2] for s in segments) / len(segments)
-                        stroke_width = max(10.0, min(avg_width * 2.0, 40.0))
-                        opacity = ' opacity="0.35"'
-                    else:
-                        stroke_color = STROKE_COLORS.get(color, "black")
-                        avg_width = sum(s[2] for s in segments) / len(segments)
-                        stroke_width = max(0.5, min(avg_width * 0.8, 5.0))
-                        opacity = ""
+                    all_coords.extend((s[0], s[1]) for s in segments)
+                    if pen not in HIGHLIGHTER_PENS:
+                        paths.extend(
+                            _pen_stroke_paths(
+                                [(s[0], s[1], s[2]) for s in segments],
+                                STROKE_COLORS.get(color, "black"),
+                            )
+                        )
+                        continue
+
+                    stroke_color = HIGHLIGHT_COLORS.get(color, "#FFD700")
+                    avg_width = sum(s[2] for s in segments) / len(segments)
+                    stroke_width = max(10.0, min(avg_width * 2.0, 40.0))
+                    opacity = ' opacity="0.35"'
 
                     d = f"M {segments[0][0]:.1f} {segments[0][1]:.1f}"
                     d += "".join(f" L {s[0]:.1f} {s[1]:.1f}" for s in segments[1:])
-                    all_coords.extend((s[0], s[1]) for s in segments)
 
                     paths.append(
                         f'<path d="{d}" stroke="{stroke_color}" '
@@ -704,29 +752,31 @@ def _v6_paths_from_blocks(blocks: list, anchor_pos: Optional[dict] = None) -> Tu
         if tool in ERASER_PENS:
             continue
 
-        is_highlighter = tool in HIGHLIGHTER_PENS
         stroke_color = COLOR_MAP.get(color, "black")
+        all_coords.extend((p.x + dx, p.y + dy) for p in line.points)
 
-        if is_highlighter:
-            avg_width = (
-                sum(p.width for p in line.points) / len(line.points)
-                if all(hasattr(p, "width") for p in line.points)
-                else 20.0
+        if tool not in HIGHLIGHTER_PENS:
+            paths.extend(
+                _pen_stroke_paths(
+                    [
+                        (p.x + dx, p.y + dy, getattr(p, "width", 8) * V6_POINT_WIDTH_SCALE)
+                        for p in line.points
+                    ],
+                    stroke_color,
+                )
             )
-            stroke_width = max(10.0, min(avg_width * 2.0, 40.0))
-            opacity = ' opacity="0.35"'
-        else:
-            avg_width = (
-                sum(p.width for p in line.points) / len(line.points)
-                if all(hasattr(p, "width") for p in line.points)
-                else 2.0
-            )
-            stroke_width = max(0.5, min(avg_width * 0.8, 5.0))
-            opacity = ""
+            continue
+
+        avg_width = (
+            sum(p.width for p in line.points) / len(line.points)
+            if all(hasattr(p, "width") for p in line.points)
+            else 20.0
+        )
+        stroke_width = max(10.0, min(avg_width * 2.0, 40.0))
+        opacity = ' opacity="0.35"'
 
         d = f"M {line.points[0].x + dx:.1f} {line.points[0].y + dy:.1f}"
         d += "".join(f" L {p.x + dx:.1f} {p.y + dy:.1f}" for p in line.points[1:])
-        all_coords.extend((p.x + dx, p.y + dy) for p in line.points)
 
         paths.append(
             f'<path d="{d}" stroke="{stroke_color}" '
