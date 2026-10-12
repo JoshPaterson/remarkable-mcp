@@ -139,7 +139,7 @@ When `more: true`, use the `page` parameter to continue reading.
 |-----------|------|---------|-------------|
 | `path` | string | `"/"` | Folder path to browse |
 | `query` | string | `None` | Search documents by name |
-| `tags` | list[string] | `None` | Require all listed tags (case-insensitive) |
+| `tags` | list[string] | `None` | Match documents carrying any listed tag (case-insensitive). Searches the folder and all its subfolders. |
 
 ### Examples
 
@@ -156,7 +156,7 @@ remarkable_browse(query="meeting")
 # Combine path and search
 remarkable_browse("/Work", query="report")
 
-# Filter by tag
+# Documents tagged "project" or "active" anywhere under /Work
 remarkable_browse("/Work", tags=["project", "active"])
 ```
 
@@ -200,7 +200,7 @@ remarkable_browse("/Work", tags=["project", "active"])
 | `grep` | string | `None` | Pattern to search within content |
 | `limit` | int | `5` | Maximum documents to search (max: 5) |
 | `include_ocr` | bool | `False` | Enable OCR for handwritten content |
-| `tags` | list[string] | `None` | Require all listed tags (case-insensitive) |
+| `tags` | list[string] | `None` | Match documents carrying any listed tag (case-insensitive) |
 
 ### Examples
 

@@ -63,6 +63,7 @@ from remarkable_mcp.extract import (
 )
 from remarkable_mcp.responses import make_error, make_response
 from remarkable_mcp.server import mcp
+from remarkable_mcp.tags import matches_tags, tag_names
 
 logger = logging.getLogger(__name__)
 
@@ -205,6 +206,29 @@ def _is_cloud_archived(item) -> bool:
     # Cloud mode: check parent == "trash"
     parent = item.Parent if hasattr(item, "Parent") else getattr(item, "parent", "")
     return parent == "trash"
+
+
+def _item_tags(item) -> List[str]:
+    """Tag names for a listed document (empty when the transport has none)."""
+    tags = getattr(item, "tags", None)
+    return tag_names(tags) if isinstance(tags, (list, tuple)) else []
+
+
+def _descendant_items(items_by_parent: dict, parent_id: str) -> List:
+    """All items below ``parent_id`` in the folder tree, depth-first."""
+    found = []
+    stack = [parent_id]
+    seen = set()
+    while stack:
+        current = stack.pop()
+        if current in seen:
+            continue
+        seen.add(current)
+        for item in items_by_parent.get(current, []):
+            found.append(item)
+            if item.is_folder:
+                stack.append(item.ID)
+    return found
 
 
 def _modified_sort_key(item) -> float:
@@ -892,8 +916,8 @@ async def remarkable_read(
             ),
         }
 
-        # Add tags if present (from listing metadata, or from extraction in USB mode)
-        tags = getattr(target_doc, "tags", None) or (content.get("tags") if content else None)
+        # Add tags if present (from extraction, or from listing metadata)
+        tags = (content.get("tags") if content else None) or _item_tags(target_doc)
         if tags:
             result["tags"] = tags
 
@@ -959,7 +983,8 @@ async def remarkable_browse(
     2. Search mode: Find documents by name
        - Set query="search term" to search across all documents
     3. Filter by tags: Find documents with specific tags
-       - Set tags=["tag1", "tag2"] to filter by tags
+       - Set tags=["tag1", "tag2"] to list documents carrying any of the tags
+       - In browse mode, searches the folder and all of its subfolders
        - Works in both browse and search modes
 
     Results include document names, types, modification dates, and tags.
@@ -1004,12 +1029,8 @@ async def remarkable_browse(
                 if not _is_within_root(item_path, root):
                     continue
                 # Filter by tags if provided
-                if tags:
-                    item_tags_lower = [
-                        t.lower() for t in (item.tags if hasattr(item, "tags") else [])
-                    ]
-                    if not any(tag.lower() in item_tags_lower for tag in tags):
-                        continue
+                if tags and not matches_tags(_item_tags(item), tags):
+                    continue
                 if query_lower in item.VissibleName.lower():
                     match_info = {
                         "name": item.VissibleName,
@@ -1020,8 +1041,9 @@ async def remarkable_browse(
                         ),
                     }
                     # Add tags if present
-                    if hasattr(item, "tags") and item.tags:
-                        match_info["tags"] = item.tags
+                    item_tags = _item_tags(item)
+                    if item_tags:
+                        match_info["tags"] = item_tags
                     matches.append(match_info)
 
             matches.sort(key=lambda x: x["name"])
@@ -1136,47 +1158,72 @@ async def remarkable_browse(
 
             target_parent = current_parent
 
-        items = items_by_parent.get(target_parent, [])
-
         folders = []
         documents = []
 
-        for item in sorted(items, key=lambda x: x.VissibleName.lower()):
-            # Skip cloud-archived items
-            if _is_cloud_archived(item):
-                continue
-            # Filter by tags if provided
-            if tags and not item.is_folder:
-                item_tags_lower = [t.lower() for t in (item.tags if hasattr(item, "tags") else [])]
-                if not any(tag.lower() in item_tags_lower for tag in tags):
+        if tags:
+            # Tag filter: list matching documents in this folder and all of
+            # its subfolders, each with its path.
+            for item in _descendant_items(items_by_parent, target_parent):
+                if item.is_folder or _is_cloud_archived(item):
                     continue
-            if item.is_folder:
-                folders.append({"name": item.VissibleName, "id": item.ID})
-            else:
-                doc_info = {
-                    "name": item.VissibleName,
-                    "id": item.ID,
-                    "modified": (item.ModifiedClient if hasattr(item, "ModifiedClient") else None),
-                }
-                # Add tags if present
-                if hasattr(item, "tags") and item.tags:
-                    doc_info["tags"] = item.tags
-                documents.append(doc_info)
+                item_tags = _item_tags(item)
+                if not matches_tags(item_tags, tags):
+                    continue
+                documents.append(
+                    {
+                        "name": item.VissibleName,
+                        "id": item.ID,
+                        "path": _apply_root_filter(get_item_path(item, items_by_id)),
+                        "modified": (
+                            item.ModifiedClient if hasattr(item, "ModifiedClient") else None
+                        ),
+                        "tags": item_tags,
+                    }
+                )
+            documents.sort(key=lambda d: d["path"].lower())
+        else:
+            items = items_by_parent.get(target_parent, [])
+            for item in sorted(items, key=lambda x: x.VissibleName.lower()):
+                # Skip cloud-archived items
+                if _is_cloud_archived(item):
+                    continue
+                if item.is_folder:
+                    folders.append({"name": item.VissibleName, "id": item.ID})
+                else:
+                    doc_info = {
+                        "name": item.VissibleName,
+                        "id": item.ID,
+                        "modified": (
+                            item.ModifiedClient if hasattr(item, "ModifiedClient") else None
+                        ),
+                    }
+                    # Add tags if present
+                    item_tags = _item_tags(item)
+                    if item_tags:
+                        doc_info["tags"] = item_tags
+                    documents.append(doc_info)
 
         result = {"mode": "browse", "path": path, "folders": folders, "documents": documents}
         if tags:
             result["filter_tags"] = tags
+            result["recursive"] = True
 
         # Build helpful hint
-        tag_desc = f" with tags {tags}" if tags else ""
-        hint_parts = [f"Found {len(folders)} folder(s) and {len(documents)} document(s){tag_desc}."]
+        if tags:
+            hint_parts = [
+                f"Found {len(documents)} document(s) with tags {tags} "
+                "in this folder and its subfolders."
+            ]
+        else:
+            hint_parts = [f"Found {len(folders)} folder(s) and {len(documents)} document(s)."]
 
         if documents:
             hint_parts.append(f"To read a document: remarkable_read('{documents[0]['name']}').")
         if folders:
             folder_path = f"{path.rstrip('/')}/{folders[0]['name']}"
             hint_parts.append(f"To enter a folder: remarkable_browse('{folder_path}').")
-        if not folders and not documents:
+        if not folders and not documents and not tags:
             hint_parts.append("This folder is empty.")
 
         return make_response(result, " ".join(hint_parts))
@@ -1243,8 +1290,9 @@ async def remarkable_recent(limit: int = 10, include_preview: bool = False) -> s
                 "modified": (doc.ModifiedClient if hasattr(doc, "ModifiedClient") else None),
             }
             # Add tags if present
-            if hasattr(doc, "tags") and doc.tags:
-                doc_info["tags"] = doc.tags
+            doc_tags = _item_tags(doc)
+            if doc_tags:
+                doc_info["tags"] = doc_tags
 
             if include_preview:
                 # Download and extract preview (skip notebooks - they need slow OCR)
@@ -2460,7 +2508,7 @@ async def remarkable_export(
             source_type=source_type,
             page_count=None,
             modified=getattr(target_doc, "ModifiedClient", None),
-            tags=tuple(getattr(target_doc, "tags", None) or ()),
+            tags=tuple(_item_tags(target_doc)),
         )
         background = await run_blocking(get_background_color)
         published = await run_blocking(
