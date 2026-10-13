@@ -2140,8 +2140,14 @@ def _page_annotation_details(rm_file: Path) -> Dict[str, Any]:
                 entry.update(
                     color_info(getattr(item, "color", None), getattr(item, "color_rgba", None))
                 )
+                dx, dy = offsets.get(node_id, (0.0, 0.0))
                 entry["rects"] = [
-                    [r.x, r.y, r.x + getattr(r, "w", 0.0), r.y + getattr(r, "h", 0.0)]
+                    [
+                        r.x + dx,
+                        r.y + dy,
+                        r.x + dx + getattr(r, "w", 0.0),
+                        r.y + dy + getattr(r, "h", 0.0),
+                    ]
                     for r in rects
                 ]
                 highlights.append((y, x, entry))
