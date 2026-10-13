@@ -168,8 +168,16 @@ _cache_generation: Dict[str, int] = {}
 _global_cache_generation = 0
 
 
-def _is_cache_valid(cached: Dict[str, Any]) -> bool:
-    """Check if a cached entry is still valid based on TTL."""
+def _is_cache_valid(cached: Dict[str, Any], version: Optional[str] = None) -> bool:
+    """Check if a cached entry is still valid.
+
+    An entry is valid within its TTL, and only for the document version it was
+    built from: ``version`` identifies the document's current content (for
+    cloud documents, its index hash), so content uploaded after the entry was
+    cached is never served from it. A ``version`` of None matches any entry.
+    """
+    if version is not None and cached.get("version") != version:
+        return False
     if "timestamp" not in cached:
         return True  # Old cache entries without timestamp are valid
     return (time.time() - cached["timestamp"]) < CACHE_TTL_SECONDS
@@ -205,6 +213,7 @@ def _cache_extraction_result_if_current(
     result: Dict[str, Any],
     include_ocr: bool,
     token: tuple[int, int],
+    version: Optional[str] = None,
 ) -> bool:
     """Cache only if no mutation invalidated this document during extraction."""
     with _cache_lock:
@@ -217,6 +226,7 @@ def _cache_extraction_result_if_current(
             "result": result,
             "include_ocr": include_ocr,
             "timestamp": time.time(),
+            "version": version,
         }
         return True
 
@@ -225,6 +235,7 @@ def get_cached_ocr_result(
     doc_id: str,
     include_ocr: bool = True,
     ocr_backend: Optional[str] = None,
+    version: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     """
     Get cached OCR result for a document if available and valid.
@@ -234,6 +245,8 @@ def get_cached_ocr_result(
         include_ocr: Whether OCR content is required
         ocr_backend: If specified, only return cache if it was produced by this backend.
                      Use "google" or "tesseract". None accepts any backend.
+        version: The document's current version (see ``_is_cache_valid``);
+                 a result cached from another version is not returned.
 
     Returns:
         Cached result dict or None if not cached/expired/wrong backend
@@ -241,7 +254,7 @@ def get_cached_ocr_result(
     with _cache_lock:
         if doc_id in _extraction_cache:
             cached = _extraction_cache[doc_id]
-            if (cached["include_ocr"] or not include_ocr) and _is_cache_valid(cached):
+            if (cached["include_ocr"] or not include_ocr) and _is_cache_valid(cached, version):
                 if ocr_backend is not None:
                     cached_backend = cached["result"].get("ocr_backend")
                     if cached_backend != ocr_backend:
@@ -254,6 +267,7 @@ def cache_ocr_result(
     doc_id: str,
     result: Dict[str, Any],
     include_ocr: bool = True,
+    version: Optional[str] = None,
 ) -> None:
     """
     Cache an OCR result for a document.
@@ -263,12 +277,14 @@ def cache_ocr_result(
         result: Extraction result dict with keys: typed_text, highlights,
                 handwritten_text, pages, page_ids, ocr_backend
         include_ocr: Whether this result includes OCR content
+        version: The document version the result was built from
     """
     with _cache_lock:
         _extraction_cache[doc_id] = {
             "result": result,
             "include_ocr": include_ocr,
             "timestamp": time.time(),
+            "version": version,
         }
 
 
@@ -2000,7 +2016,10 @@ def _extract_page_annotations(rm_file: Path) -> Tuple[List[str], bool]:
 
 
 def extract_text_from_document_zip(
-    zip_path: Path, include_ocr: bool = False, doc_id: Optional[str] = None
+    zip_path: Path,
+    include_ocr: bool = False,
+    doc_id: Optional[str] = None,
+    version: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Extract all text content from a reMarkable document zip.
@@ -2009,6 +2028,8 @@ def extract_text_from_document_zip(
         zip_path: Path to the document zip file
         include_ocr: Whether to run OCR on handwritten content
         doc_id: Optional document ID for caching OCR results
+        version: The document's current version (e.g. its cloud index hash);
+            a result cached for another version is not reused
 
     Returns:
         {
@@ -2034,7 +2055,11 @@ def extract_text_from_document_zip(
                 _cache_generation.get(doc_id, 0),
             )
             cached = _extraction_cache.get(doc_id)
-            if cached and (cached["include_ocr"] or not include_ocr) and _is_cache_valid(cached):
+            if (
+                cached
+                and (cached["include_ocr"] or not include_ocr)
+                and _is_cache_valid(cached, version)
+            ):
                 return cached["result"]
 
     result: Dict[str, Any] = {
@@ -2172,7 +2197,7 @@ def extract_text_from_document_zip(
             result["ocr_backend"] = ocr_backend
 
     if doc_id and cache_token is not None:
-        _cache_extraction_result_if_current(doc_id, result, include_ocr, cache_token)
+        _cache_extraction_result_if_current(doc_id, result, include_ocr, cache_token, version)
 
     return result
 

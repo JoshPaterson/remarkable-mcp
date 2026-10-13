@@ -20,6 +20,7 @@ from typing import Optional, Set
 
 from mcp.types import Completion, ResourceTemplateReference
 
+from remarkable_mcp.api import document_version
 from remarkable_mcp.server import mcp
 
 logger = logging.getLogger(__name__)
@@ -103,7 +104,10 @@ def _make_doc_resource(client, document):
             try:
                 # First try without OCR (faster) - use doc_id to leverage cache
                 content = extract_text_from_document_zip(
-                    tmp_path, include_ocr=False, doc_id=document.ID
+                    tmp_path,
+                    include_ocr=False,
+                    doc_id=document.ID,
+                    version=document_version(document),
                 )
 
                 if content["typed_text"]:
@@ -116,7 +120,10 @@ def _make_doc_resource(client, document):
                 # If no text found and document has pages, try OCR for handwritten
                 if not text_parts and content["pages"] > 0:
                     content = extract_text_from_document_zip(
-                        tmp_path, include_ocr=True, doc_id=document.ID
+                        tmp_path,
+                        include_ocr=True,
+                        doc_id=document.ID,
+                        version=document_version(document),
                     )
                     if content["handwritten_text"]:
                         text_parts.extend(content["handwritten_text"])
