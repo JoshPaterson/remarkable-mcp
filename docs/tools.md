@@ -101,6 +101,12 @@ remarkable_read("/Work/Projects/Q4 Planning")
 }
 ```
 
+### Page tags
+
+Page tags from the document's `.content` file are shown on their page, e.g.
+`Page 3: handwritten notes; page tags: test-page`, and returned as
+`page_tags: [{"page": 3, "name": "test-page"}]`.
+
 ### Smart Features
 
 - **Auto-OCR**: If a notebook has no typed text and `include_ocr=False`, OCR is automatically enabled and you're notified via `_ocr_auto_enabled: true`

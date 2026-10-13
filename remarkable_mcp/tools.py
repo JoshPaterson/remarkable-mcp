@@ -645,9 +645,12 @@ async def remarkable_read(
                         n_hl = len(ap.get("highlights") or [])
                         if n_hl:
                             marks.append(f"{n_hl} highlight" + ("s" if n_hl != 1 else ""))
-                        annotation_parts.append(
-                            f"Page {ap['page']}: " + (", ".join(marks) or "annotated")
-                        )
+                        summary = ", ".join(marks)
+                        page_tags = ap.get("page_tags") or []
+                        if page_tags:
+                            tag_text = "page tags: " + ", ".join(page_tags)
+                            summary = f"{summary}; {tag_text}" if summary else tag_text
+                        annotation_parts.append(f"Page {ap['page']}: " + (summary or "annotated"))
                         for h in ap.get("highlights") or []:
                             annotation_parts.append(f"  • {h}")
                             shown_highlights.add(h)
@@ -931,6 +934,8 @@ async def remarkable_read(
         tags = (content.get("tags") if content else None) or _item_tags(target_doc)
         if tags:
             result["tags"] = tags
+        if content and content.get("page_tags"):
+            result["page_tags"] = content["page_tags"]
 
         if has_more:
             result["next_page"] = page + 1

@@ -402,6 +402,9 @@ def write_markdown_export(
             highlight_count = len(entry.get("highlights") or [])
             if highlight_count:
                 marks.append(f"{highlight_count} highlight" + ("s" if highlight_count != 1 else ""))
+            page_tags = [str(t) for t in entry.get("page_tags") or []]
+            if page_tags:
+                marks.append("page tags: " + ", ".join(page_tags))
             page_id = entry.get("page_id")
             identity = f"; page ID `{page_id}`" if page_id else ""
             lines.append(
