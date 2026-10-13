@@ -737,17 +737,19 @@ def _v6_paths_from_blocks(blocks: list, anchor_pos: Optional[dict] = None) -> Tu
     return paths, all_coords
 
 
-# reMarkable typed-text layout, in raw stroke units. Calibrated against
-# device-rendered page thumbnails (a reMarkable Paper Pro / "Ferrari", which
-# normalizes typed text into the same 1404x1872 coordinate space as the rM1/2).
-# These differ from the rmc exporter's constants (github.com/ricklupton/rmc):
-# rmc lays text out in a 72/226-DPI-scaled space and its plain font (7pt) and
-# top offset (-88) render text noticeably smaller and higher than the device
-# actually draws it. Values here are in the reference 1404x1872 space and are
-# scaled by the page's real height (see ``_TEXT_REF_PAGE_HEIGHT``) so they adapt
-# to other geometries (e.g. reMarkable Move) that normalize differently.
+# reMarkable typed-text layout, in raw stroke units. Paragraph k of the text
+# block is anchored at pos_y + _TEXT_TOP_Y + 70 * k and drawn with its baseline
+# one line height below that anchor; ink anchored to the top or bottom of the
+# text (the special anchor ids) sits at the first anchor or after the last
+# paragraph. The top offset is measured from a device-written notebook page:
+# the tablet's own highlight rectangle over a typed line, and the dot-grid
+# template visible in captures of the page, both place the first anchor at
+# pos_y + 63 (rmc uses -88 and an earlier calibration here used -39; both put
+# ink anchored to the text top above the page). Values are in the reference
+# 1404x1872 space and are scaled by the page's real height (see
+# ``_TEXT_REF_PAGE_HEIGHT``) so they adapt to other geometries.
 _TEXT_REF_PAGE_HEIGHT = 1872.0
-_TEXT_TOP_Y = -39.0
+_TEXT_TOP_Y = 63.0
 _TEXT_DEFAULT_LINE_HEIGHT = 70.0
 _TEXT_DEFAULT_FONT_SIZE = 30.0
 # Continuation lines of a wrapped paragraph are spaced tighter than the gap
