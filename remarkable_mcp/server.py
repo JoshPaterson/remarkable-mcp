@@ -115,6 +115,15 @@ def _build_instructions() -> str:
 3. Use `remarkable_read("Document", page=2)` to continue reading long documents
 4. Use `remarkable_read("Document", grep="pattern")` to search within a document
 
+### Reading Annotations
+`remarkable_read("Document", content_type="annotations")` lists each annotated
+page with:
+- highlights with their color, e.g. `[pink] passage text`
+- freehand highlighter strokes with color and `region` (page fractions)
+- the page's layers when it has several or a hidden one
+The response also returns `highlights`, `highlighter_strokes` and `layers` as
+structured data.
+
 ### Getting Page Images
 Use `remarkable_image` when you need visual context:
 - Hand-drawn diagrams, sketches, or UI mockups
