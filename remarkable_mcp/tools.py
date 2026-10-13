@@ -239,6 +239,9 @@ def _annotated_page_lines(ap: dict) -> List[str]:
     if strokes:
         colors = list(dict.fromkeys(str(h.get("color")) for h in strokes))
         marks.append(f"{_plural(len(strokes), 'highlighter stroke')} ({', '.join(colors)})")
+    images = ap.get("images") or []
+    if images:
+        marks.append(_plural(len(images), "pasted image"))
     lines = [f"Page {ap['page']}: " + (", ".join(marks) or "annotated")]
 
     if show_layers:
@@ -253,6 +256,8 @@ def _annotated_page_lines(ap: dict) -> List[str]:
                 parts.append(_plural(layer["highlights"], "highlight"))
             if layer.get("highlighter_strokes"):
                 parts.append(_plural(layer["highlighter_strokes"], "highlighter stroke"))
+            if layer.get("images"):
+                parts.append(_plural(layer["images"], "pasted image"))
             state = "" if layer.get("visible", True) else " [hidden]"
             lines.append(f"  {layer['name']}{state}: " + (", ".join(parts) or "empty"))
 
@@ -266,6 +271,9 @@ def _annotated_page_lines(ap: dict) -> List[str]:
     for h in strokes:
         location = f", region {h['region']}" if h.get("region") else ""
         lines.append(f"  ~ [{h.get('color')}] highlighter stroke{location}{on_layer(h)}")
+    for image in images:
+        location = f", region {image['region']}" if image.get("region") else ""
+        lines.append(f"  + pasted image{location}{on_layer(image)}")
     return lines
 
 
@@ -957,6 +965,9 @@ async def remarkable_read(
             highlighter_strokes = content.get("highlighter_strokes")
             if highlighter_strokes:
                 result["highlighter_strokes"] = highlighter_strokes
+            pasted = content.get("images")
+            if pasted:
+                result["images"] = pasted
         if content_type in ("text", "annotations") and content:
             page_layers = [
                 {"page": ap["page"], "layers": ap["layers"]}

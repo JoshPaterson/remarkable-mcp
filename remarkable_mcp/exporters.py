@@ -448,6 +448,9 @@ def write_markdown_export(
                         for layer in layers
                     )
                 )
+            images = entry.get("images") or []
+            if images:
+                marks.append(f"{len(images)} pasted image" + ("s" if len(images) != 1 else ""))
             page_id = entry.get("page_id")
             identity = f"; page ID `{page_id}`" if page_id else ""
             lines.append(

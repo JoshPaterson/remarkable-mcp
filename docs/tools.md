@@ -140,6 +140,14 @@ Page 3: handwritten notes
 
 The same data is returned as `layers: [{"page": 3, "layers": [...]}]`.
 
+Images pasted onto a page with the tablet's capture feature are listed per
+page, e.g. `Page 4: handwritten notes, 1 pasted image` followed by
+`+ pasted image, region [left, top, right, bottom]`, and returned as `images`
+with `page`, `file`, `layer`, `bbox_mm` and `region`. `remarkable_image` draws
+them in the tablet's stacking order: within a layer, items are drawn in the
+order they were placed, so ink written over an image covers it and an image
+that is moved comes to the top.
+
 ### Smart Features
 
 - **Auto-OCR**: If a notebook has no typed text and `include_ocr=False`, OCR is automatically enabled and you're notified via `_ocr_auto_enabled: true`

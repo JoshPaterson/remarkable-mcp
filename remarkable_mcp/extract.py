@@ -807,8 +807,111 @@ def _v6_group_offsets(blocks: list, anchor_pos: dict) -> dict:
     return offsets
 
 
+def _page_image_dir(rm_file_path: Path) -> Path:
+    """Folder holding a page's pasted images: ``<doc id>/<page id>/``."""
+    return rm_file_path.with_suffix("")
+
+
+def _v6_draw_order(blocks: list) -> Dict[Any, int]:
+    """Drawing rank of each scene item, bottom to top.
+
+    The tablet draws a page's layers in order, and within a layer (or nested
+    group) draws its items in their CRDT sequence order, so a stroke written
+    over an image covers it. Moving an item deletes it and inserts it again
+    at the end, which brings it to the top. Deleted items stay in the sequence
+    as placeholders so the order around them is kept. Items outside the scene
+    tree are not ranked.
+    """
+    try:
+        from rmscene.crdt_sequence import toposort_items
+        from rmscene.scene_stream import SceneGroupItemBlock, SceneItemBlock
+        from rmscene.tagged_block_common import CrdtId
+
+        from remarkable_mcp.images import image_sequence_items
+    except ImportError:
+        return {}
+
+    children: Dict[Any, Dict[Any, Any]] = {}
+    groups: Dict[Any, Any] = {}
+    for block in blocks:
+        if isinstance(block, SceneItemBlock):
+            children.setdefault(block.parent_id, {})[block.item.item_id] = block.item
+            if isinstance(block, SceneGroupItemBlock) and block.item.value is not None:
+                groups[block.item.item_id] = block.item.value
+    for parent_id, item in image_sequence_items(blocks):
+        children.setdefault(parent_id, {})[item.item_id] = item
+
+    rank: Dict[Any, int] = {}
+    visited: set = set()
+
+    def visit(node: Any) -> None:
+        if node in visited:
+            return
+        visited.add(node)
+        items = children.get(node, {})
+        for item_id in toposort_items(items.values()):
+            if items[item_id].value is None:
+                continue
+            if item_id in groups:
+                visit(groups[item_id])
+            else:
+                rank[item_id] = len(rank)
+
+    visit(CrdtId(0, 1))
+    return rank
+
+
+def _v6_image_elements(
+    blocks: list,
+    image_dir: Optional[Path],
+    draw_node: Optional[Callable[[Any], bool]],
+    group_offsets: dict,
+) -> List[Tuple[Any, list, list]]:
+    """``(item_id, elements, coords)`` for each image pasted on a page.
+
+    ``image_dir`` is the page's image folder (``<doc id>/<page id>``). Each
+    image is drawn as an SVG ``<image>`` by mapping its texture corners onto
+    the page, so scaled or rotated pastes land where the tablet shows them.
+    """
+    import base64
+
+    from remarkable_mcp.images import pasted_images
+
+    if image_dir is None:
+        return []
+    drawn: List[Tuple[Any, list, list]] = []
+    for image in pasted_images(blocks).values():
+        if draw_node is not None and not draw_node(image.parent_id):
+            continue
+        corners = image.corners()
+        if corners is None or not image.file_name:
+            continue
+        path = image_dir / Path(image.file_name).name
+        try:
+            data = path.read_bytes()
+        except OSError:
+            continue
+        dx, dy = group_offsets.get(image.parent_id, (0.0, 0.0))
+        (x0, y0), (x1, y1), (x2, y2) = corners
+        matrix = (
+            f"{x1 - x0:.3f} {y1 - y0:.3f} {x2 - x0:.3f} {y2 - y0:.3f} "
+            f"{x0 + dx:.3f} {y0 + dy:.3f}"
+        )
+        href = "data:image/png;base64," + base64.b64encode(data).decode("ascii")
+        element = (
+            f'<image width="1" height="1" preserveAspectRatio="none" '
+            f'transform="matrix({matrix})" href="{href}"/>'
+        )
+        coords = [(x + dx, y + dy) for x, y, _, _ in image.vertices]
+        drawn.append((image.item_id, [element], coords))
+    return drawn
+
+
 def _v6_paths_from_blocks(
-    blocks: list, anchor_pos: Optional[dict] = None, layers: Optional[str] = None
+    blocks: list,
+    anchor_pos: Optional[dict] = None,
+    layers: Optional[str] = None,
+    image_dir: Optional[Path] = None,
 ) -> Tuple[list, list]:
     """Build SVG ``<path>`` strings + a flat coordinate list from v6 blocks.
 
@@ -821,6 +924,10 @@ def _v6_paths_from_blocks(
     ``layers`` selects which layers to draw: ``"visible"`` (default) draws the
     layers shown on the tablet, ``"all"`` includes hidden layers, and any other
     value draws only the layer with that name (case-insensitive).
+
+    ``image_dir`` is the page's image folder; pasted images found there are
+    drawn too. Items are drawn in the tablet's stacking order (see
+    :func:`_v6_draw_order`); items it cannot rank follow in file order.
     """
     # Integer pen/color values (rmscene exposes ints on blocks).
     HIGHLIGHTER_PENS = {5, 18}  # HIGHLIGHTER_1, HIGHLIGHTER_2
@@ -829,13 +936,28 @@ def _v6_paths_from_blocks(
     group_offsets = _v6_group_offsets(blocks, anchor_pos) if anchor_pos else {}
     draw_node = _v6_layer_node_filter(blocks, layers)
 
-    paths: list = []
-    all_coords: list = []
+    draw_rank = _v6_draw_order(blocks)
+    # (sort key, svg elements, coordinates) per drawn item
+    drawn: list = []
+
+    def add(item_id: Any, elements: list, coords: list) -> None:
+        rank = draw_rank.get(item_id)
+        key = (0, rank) if rank is not None else (1, len(drawn))
+        drawn.append((key, elements, coords))
+
+    for item_id, elements, coords in _v6_image_elements(
+        blocks, image_dir, draw_node, group_offsets
+    ):
+        add(item_id, elements, coords)
+
     for block in blocks:
         if not hasattr(block, "item") or not hasattr(block.item, "value"):
             continue
         if draw_node is not None and not draw_node(getattr(block, "parent_id", None)):
             continue
+        paths: list = []
+        all_coords: list = []
+        add(getattr(block.item, "item_id", None), paths, all_coords)
         line = block.item.value
         dx, dy = group_offsets.get(getattr(block, "parent_id", None), (0.0, 0.0))
 
@@ -898,6 +1020,10 @@ def _v6_paths_from_blocks(
             f'fill="none" stroke-linecap="round" '
             f'stroke-linejoin="round"{opacity}/>'
         )
+
+    drawn.sort(key=lambda entry: entry[0])
+    paths = [element for _, elements, _ in drawn for element in elements]
+    all_coords = [point for _, _, coords in drawn for point in coords]
     return paths, all_coords
 
 
@@ -1092,7 +1218,9 @@ def _render_rm_v6_to_svg(rm_file_path: Path, layers: Optional[str] = None) -> Op
         return None
     try:
         text_elements, text_coords, anchor_pos = _v6_text_elements_with_bounds(blocks)
-        paths, all_coords = _v6_paths_from_blocks(blocks, anchor_pos, layers)
+        paths, all_coords = _v6_paths_from_blocks(
+            blocks, anchor_pos, layers, _page_image_dir(rm_file_path)
+        )
         # Typed text is drawn under strokes (handwriting layers on top), and its
         # extent is folded into the crop so a text-only page still renders.
         return _svg_from_paths(text_elements + paths, all_coords + text_coords)
@@ -1261,7 +1389,7 @@ def render_rm_file_full_page_png(
         return None
     try:
         text_elements, _, anchor_pos = _v6_text_elements_with_bounds(blocks)
-        paths, _ = _v6_paths_from_blocks(blocks, anchor_pos, layers)
+        paths, _ = _v6_paths_from_blocks(blocks, anchor_pos, layers, _page_image_dir(rm_file_path))
         paper_w, paper_h = _v6_paper_size(blocks)
     except Exception:
         return None
@@ -2265,14 +2393,17 @@ def _page_annotation_details(rm_file: Path) -> Dict[str, Any]:
     outside any layer). ``has_strokes`` covers pen strokes other than
     highlighters and erasers. ``layers`` lists the page's layers in tablet
     order as ``{"name", "visible", "pen_strokes", "pen_colors", "highlights",
-    "highlighter_strokes"}`` counts. Returns empty results if the file cannot
-    be parsed.
+    "highlighter_strokes", "images"}`` counts. ``images`` lists pasted images
+    (see :mod:`remarkable_mcp.images`) as ``{"file", "bbox", "layer"}``, top to
+    bottom, with ``bbox`` in stroke units. Returns empty results if the file
+    cannot be parsed.
     """
     details: Dict[str, Any] = {
         "highlights": [],
         "highlighter_strokes": [],
         "has_strokes": False,
         "layers": [],
+        "images": [],
     }
     scene = _v6_scene(rm_file)
     if scene is None:
@@ -2293,6 +2424,7 @@ def _page_annotation_details(rm_file: Path) -> Dict[str, Any]:
                 "pen_colors": [],
                 "highlights": 0,
                 "highlighter_strokes": 0,
+                "images": 0,
             }
             layer_stats.append(stats)
             layer_of_node[layer["group"].node_id] = stats
@@ -2346,6 +2478,20 @@ def _page_annotation_details(rm_file: Path) -> Dict[str, Any]:
     details["highlights"] = [t[2] for t in highlights]
     highlighter_strokes.sort(key=lambda h: (h["bbox"][1], h["bbox"][0]))
     details["highlighter_strokes"] = highlighter_strokes
+
+    from remarkable_mcp.images import pasted_images
+
+    images = []
+    for image in pasted_images(blocks).values():
+        bbox = image.bbox()
+        if bbox is None:
+            continue
+        stats = layer_of_node.get(image.parent_id) if details["layers"] else None
+        if stats:
+            stats["images"] += 1
+        images.append({"file": image.file_name, "bbox": bbox, "layer": stats and stats["name"]})
+    images.sort(key=lambda i: (i["bbox"][1], i["bbox"][0]))
+    details["images"] = images
     return details
 
 
@@ -2390,7 +2536,12 @@ def extract_text_from_document_zip(
                  "highlights": [str],  # highlighted text on the page
                  "highlight_details": [dict],  # text plus color, as above
                  "highlighter_strokes": [dict],  # as above, without "page"
-                 "layers": [dict]},    # name, visibility and per-layer counts
+                 "layers": [dict],     # name, visibility and per-layer counts
+                 "images": [dict]},    # pasted images, as below without "page"
+            ],
+            "images": [                # Images pasted onto pages (captures)
+                {"page": int, "file": str, "layer": str | None,
+                 "bbox_mm": [left, top, right, bottom], "region": [...]},
             ],
             "ocr_backend": str,        # Which OCR backend was used (if any)
         }
@@ -2411,6 +2562,7 @@ def extract_text_from_document_zip(
         "highlights": [],
         "highlight_details": [],
         "highlighter_strokes": [],
+        "images": [],
         "handwritten_text": None,
         "pages": 0,
         "page_ids": [],
@@ -2484,7 +2636,7 @@ def extract_text_from_document_zip(
             page_details = details["highlights"]
             page_strokes = details["highlighter_strokes"]
             has_strokes = details["has_strokes"]
-            if page_details or page_strokes or has_strokes:
+            if page_details or page_strokes or has_strokes or details["images"]:
                 page_highlights = [h["text"] for h in page_details]
                 result["annotated_pages"].append(
                     {
@@ -2495,6 +2647,7 @@ def extract_text_from_document_zip(
                         "highlight_details": page_details,
                         "highlighter_strokes": page_strokes,
                         "layers": details["layers"],
+                        "images": details["images"],
                     }
                 )
                 result["highlights"].extend(page_highlights)
@@ -2504,22 +2657,31 @@ def extract_text_from_document_zip(
             for ap in result["annotated_pages"]
             for h in ap["highlight_details"]
         ]
-        # Place highlighter strokes on the page as rendered
-        if any(ap["highlighter_strokes"] for ap in result["annotated_pages"]):
+
+        # Place highlighter strokes and pasted images on the page as rendered
+        def placed(ap: dict) -> list:
+            return ap["highlighter_strokes"] + ap.get("images", [])
+
+        if any(placed(ap) for ap in result["annotated_pages"]):
             pdf_sizes = _pdf_page_sizes(tmpdir_path)
             rm_by_stem = {f.stem: f for f in rm_files}
             for ap in result["annotated_pages"]:
-                if not ap["highlighter_strokes"]:
+                if not placed(ap):
                     continue
                 frame = _page_frame(
                     tmpdir_path, ap["page"], rm_by_stem.get(ap["page_id"]), pdf_sizes
                 )
-                for stroke in ap["highlighter_strokes"]:
-                    stroke["bbox_mm"], stroke["region"] = _locate_on_page(stroke.pop("bbox"), frame)
+                for entry in placed(ap):
+                    entry["bbox_mm"], entry["region"] = _locate_on_page(entry.pop("bbox"), frame)
         result["highlighter_strokes"] = [
             {"page": ap["page"], **h}
             for ap in result["annotated_pages"]
             for h in ap["highlighter_strokes"]
+        ]
+        result["images"] = [
+            {"page": ap["page"], **image}
+            for ap in result["annotated_pages"]
+            for image in ap.get("images", [])
         ]
 
         # Extract text from .txt and .md files
