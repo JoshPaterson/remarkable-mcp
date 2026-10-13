@@ -17,6 +17,12 @@ from xml.sax.saxutils import escape as _xml_escape
 from remarkable_mcp.colors import color_info, render_color
 from remarkable_mcp.pages import content_page_ids, deleted_page_ids, has_cpages, live_cpages_entries
 from remarkable_mcp.tags import page_tag_entries
+from remarkable_mcp.templates import (
+    BLANK_TEMPLATE,
+    content_page_templates,
+    page_template,
+    template_elements,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1303,9 +1309,11 @@ def _render_rm_v6_to_svg(rm_file_path: Path, layers: Optional[str] = None) -> Op
         paths, all_coords = _v6_paths_from_blocks(
             blocks, anchor_pos, layers, _page_image_dir(rm_file_path)
         )
-        # Typed text is drawn under strokes (handwriting layers on top), and its
-        # extent is folded into the crop so a text-only page still renders.
-        return _svg_from_paths(text_elements + paths, all_coords + text_coords)
+        background = template_elements(page_template(rm_file_path), *_v6_paper_size(blocks))
+        # The page template is drawn first, then typed text, then strokes
+        # (handwriting layers on top). The typed text extent is folded into the
+        # crop so a text-only page still renders.
+        return _svg_from_paths(background + text_elements + paths, all_coords + text_coords)
     except Exception:
         return None
 
@@ -1479,9 +1487,10 @@ def render_rm_file_full_page_png(
     except Exception:
         return None
 
-    # Typed text is drawn first so handwritten strokes layer on top of it,
-    # matching the device's compositing order.
-    svg = _svg_full_page(text_elements + paths, paper_w, paper_h)
+    # The page template is drawn first, then typed text, so handwritten
+    # strokes layer on top, matching the device's compositing order.
+    background = template_elements(page_template(rm_file_path), paper_w, paper_h)
+    svg = _svg_full_page(background + text_elements + paths, paper_w, paper_h)
     scale = _full_page_scale(paper_w, paper_h, dpi)
     output_width = max(1, round(paper_w * scale))
     output_height = max(1, round(paper_h * scale))
@@ -2469,6 +2478,24 @@ def _place_highlight(highlight: Dict[str, Any], frame: Tuple[float, float, float
     highlight["bbox_mm"], highlight["region"] = _locate_on_page(union, frame)
 
 
+def _v6_anchor_offsets(rm_file: Path) -> dict:
+    """Group node id -> ``(dx, dy)`` text-anchor translation for a page.
+
+    The same translation the renderer applies (see :func:`_v6_group_offsets`),
+    so positions reported for marks match where they are drawn. Ink on
+    notebook pages with typed text is stored relative to the text it is
+    anchored to.
+    """
+    blocks = _v6_blocks(rm_file)
+    if not blocks:
+        return {}
+    try:
+        _, _, anchor_pos = _v6_text_elements_with_bounds(blocks)
+        return _v6_group_offsets(blocks, anchor_pos) if anchor_pos else {}
+    except Exception:
+        return {}
+
+
 def _page_annotation_details(rm_file: Path) -> Dict[str, Any]:
     """Extract a page's highlights, highlighter strokes and pen-stroke presence.
 
@@ -2505,6 +2532,7 @@ def _page_annotation_details(rm_file: Path) -> Dict[str, Any]:
         return details
     blocks, tree = scene
 
+    offsets = _v6_anchor_offsets(rm_file)
     highlights: list = []
     highlighter_strokes: list = []
     try:
@@ -2547,6 +2575,8 @@ def _page_annotation_details(rm_file: Path) -> Dict[str, Any]:
                 bbox = _stroke_bbox(getattr(item, "points", None) or [])
                 if bbox is None:
                     continue
+                dx, dy = offsets.get(node_id, (0.0, 0.0))
+                bbox = [bbox[0] + dx, bbox[1] + dy, bbox[2] + dx, bbox[3] + dy]
                 entry = dict(color, bbox=bbox, layer=layer_name)
                 highlighter_strokes.append(entry)
                 if stats:
@@ -2563,8 +2593,14 @@ def _page_annotation_details(rm_file: Path) -> Dict[str, Any]:
                     color_info(getattr(item, "color", None), getattr(item, "color_rgba", None))
                 )
                 entry["layer"] = layer_name
+                dx, dy = offsets.get(node_id, (0.0, 0.0))
                 entry["rects"] = [
-                    [r.x, r.y, r.x + getattr(r, "w", 0.0), r.y + getattr(r, "h", 0.0)]
+                    [
+                        r.x + dx,
+                        r.y + dy,
+                        r.x + dx + getattr(r, "w", 0.0),
+                        r.y + dy + getattr(r, "h", 0.0),
+                    ]
                     for r in rects
                 ]
                 highlights.append((y, x, entry))
@@ -2585,6 +2621,8 @@ def _page_annotation_details(rm_file: Path) -> Dict[str, Any]:
         bbox = image.bbox()
         if bbox is None:
             continue
+        dx, dy = offsets.get(image.parent_id, (0.0, 0.0))
+        bbox = [bbox[0] + dx, bbox[1] + dy, bbox[2] + dx, bbox[3] + dy]
         stats = layer_of_node.get(image.parent_id) if details["layers"] else None
         if stats:
             stats["images"] += 1
@@ -2650,6 +2688,9 @@ def extract_text_from_document_zip(
             ],
             "page_tags": [{"page": int, "name": str}],  # .content pageTags
             "ocr_backend": str,        # Which OCR backend was used (if any)
+            "page_templates": [        # Non-blank notebook page templates
+                {"page": int, "template": str},
+            ],
         }
     """
     cache_token = None
@@ -2680,6 +2721,7 @@ def extract_text_from_document_zip(
         "ocr_backend": None,
         "tags": [],
         "page_tags": [],
+        "page_templates": [],
     }
 
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -2692,6 +2734,12 @@ def extract_text_from_document_zip(
         content_data = _read_content_json(tmpdir_path)
         page_order = content_page_ids(content_data)
         deleted = deleted_page_ids(content_data)
+        templates = content_page_templates(content_data)
+        result["page_templates"] = [
+            {"page": i + 1, "template": templates[page_id]}
+            for i, page_id in enumerate(page_order)
+            if templates.get(page_id, BLANK_TEMPLATE) != BLANK_TEMPLATE
+        ]
 
         rm_files = [f for f in tmpdir_path.glob("**/*.rm") if f.stem not in deleted]
 

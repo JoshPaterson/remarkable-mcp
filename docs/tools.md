@@ -166,6 +166,14 @@ them in the tablet's stacking order: within a layer, items are drawn in the
 order they were placed, so ink written over an image covers it and an image
 that is moved comes to the top.
 
+### Page templates
+
+Notebook pages name their template (page background) in the document's
+`.content` file. Non-blank templates are listed under `--- Page templates ---`
+and returned as `page_templates: [{"page": 1, "template": "P Dots S"}]`.
+`remarkable_image` draws the small dot grid (`P Dots S`) under the page's
+content; other templates are reported but not drawn.
+
 ### Smart Features
 
 - **Auto-OCR**: If a notebook has no typed text and `include_ocr=False`, OCR is automatically enabled and you're notified via `_ocr_auto_enabled: true`
