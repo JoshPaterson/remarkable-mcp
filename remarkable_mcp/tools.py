@@ -54,6 +54,7 @@ from remarkable_mcp.extract import (
     get_document_file_type,
     get_document_page_count,
     get_ocr_backend,
+    get_page_layers_from_document_zip,
     render_mapped_pdf_page_from_document_zip,
     render_merged_page_from_document_zip,
     render_page_from_document_zip,
@@ -225,6 +226,81 @@ def _matches_item_tags(item, wanted: List[str]) -> bool:
     return matches_tags(_item_tags(item), wanted) or matches_tags(_item_page_tags(item), wanted)
 
 
+def _plural(count: int, noun: str) -> str:
+    return f"{count} {noun}" + ("s" if count != 1 else "")
+
+
+def _page_shows_layers(layers: list) -> bool:
+    """Layer detail is worth showing when a page has several or hidden layers."""
+    return len(layers) > 1 or any(not la.get("visible", True) for la in layers)
+
+
+def _annotated_page_lines(ap: dict) -> List[str]:
+    """Text lines describing one annotated page for remarkable_read."""
+    layers = ap.get("layers") or []
+    show_layers = _page_shows_layers(layers)
+    hidden = {la["name"] for la in layers if not la.get("visible", True)}
+
+    def on_layer(entry: dict) -> str:
+        layer = entry.get("layer")
+        if not show_layers or not layer:
+            return ""
+        return f" ({layer}{', hidden' if layer in hidden else ''})"
+
+    marks = []
+    if ap.get("has_handwriting"):
+        marks.append("handwritten notes")
+    n_hl = len(ap.get("highlights") or [])
+    if n_hl:
+        marks.append(_plural(n_hl, "highlight"))
+    strokes = ap.get("highlighter_strokes") or []
+    if strokes:
+        colors = list(dict.fromkeys(str(h.get("color")) for h in strokes))
+        marks.append(f"{_plural(len(strokes), 'highlighter stroke')} ({', '.join(colors)})")
+    images = ap.get("images") or []
+    if images:
+        marks.append(_plural(len(images), "pasted image"))
+    summary = ", ".join(marks)
+    page_tags = ap.get("page_tags") or []
+    if page_tags:
+        tag_text = "page tags: " + ", ".join(page_tags)
+        summary = f"{summary}; {tag_text}" if summary else tag_text
+    lines = [f"Page {ap['page']}: " + (summary or "annotated")]
+
+    if show_layers:
+        for layer in layers:
+            parts = []
+            if layer.get("pen_strokes"):
+                parts.append(
+                    f"{_plural(layer['pen_strokes'], 'pen stroke')} "
+                    f"({', '.join(layer.get('pen_colors') or [])})"
+                )
+            if layer.get("highlights"):
+                parts.append(_plural(layer["highlights"], "highlight"))
+            if layer.get("highlighter_strokes"):
+                parts.append(_plural(layer["highlighter_strokes"], "highlighter stroke"))
+            if layer.get("images"):
+                parts.append(_plural(layer["images"], "pasted image"))
+            state = "" if layer.get("visible", True) else " [hidden]"
+            lines.append(f"  {layer['name']}{state}: " + (", ".join(parts) or "empty"))
+
+    details = ap.get("highlight_details")
+    if details is None:
+        details = [{"text": h} for h in ap.get("highlights") or []]
+    for h in details:
+        color = h.get("color")
+        prefix = f"[{color}] " if color else ""
+        location = f"   region {h['region']}" if h.get("region") else ""
+        lines.append(f"  • {prefix}{h['text']}{on_layer(h)}{location}")
+    for h in strokes:
+        location = f", region {h['region']}" if h.get("region") else ""
+        lines.append(f"  ~ [{h.get('color')}] highlighter stroke{location}{on_layer(h)}")
+    for image in images:
+        location = f", region {image['region']}" if image.get("region") else ""
+        lines.append(f"  + pasted image{location}{on_layer(image)}")
+    return lines
+
+
 def _descendant_items(items_by_parent: dict, parent_id: str) -> List:
     """All items below ``parent_id`` in the folder tree, depth-first."""
     found = []
@@ -382,6 +458,10 @@ async def remarkable_read(
       transport, as long as the source file is present (very large PDFs/EPUBs
       may not be synced to the cloud).
     - "annotations": Only annotations, highlights, and handwritten notes
+
+    Highlight text comes from the PDF's text layer and often misses mathematical
+    symbols and equations. When the exact highlighted content matters, render the
+    highlight's region with remarkable_image(document, page, region=...).
 
     Use pagination to read large documents without overwhelming context:
     - Start with page=1 (default)
@@ -639,21 +719,8 @@ async def remarkable_read(
                 if annotated_pages:
                     annotation_parts.append("\n--- Annotated pages ---")
                     for ap in annotated_pages:
-                        marks = []
-                        if ap.get("has_handwriting"):
-                            marks.append("handwritten notes")
-                        n_hl = len(ap.get("highlights") or [])
-                        if n_hl:
-                            marks.append(f"{n_hl} highlight" + ("s" if n_hl != 1 else ""))
-                        summary = ", ".join(marks)
-                        page_tags = ap.get("page_tags") or []
-                        if page_tags:
-                            tag_text = "page tags: " + ", ".join(page_tags)
-                            summary = f"{summary}; {tag_text}" if summary else tag_text
-                        annotation_parts.append(f"Page {ap['page']}: " + (summary or "annotated"))
-                        for h in ap.get("highlights") or []:
-                            annotation_parts.append(f"  • {h}")
-                            shown_highlights.add(h)
+                        annotation_parts.extend(_annotated_page_lines(ap))
+                        shown_highlights.update(ap.get("highlights") or [])
                 # Highlights not covered by the per-page index above — e.g. from
                 # the legacy .highlights JSON (older firmware), which has no page
                 # attribution. Without this, a doc whose pages carry pen strokes
@@ -934,8 +1001,28 @@ async def remarkable_read(
         tags = (content.get("tags") if content else None) or _item_tags(target_doc)
         if tags:
             result["tags"] = tags
+
+        # Highlights with their colors, in page order
+        if content_type in ("text", "annotations") and content:
+            highlight_details = content.get("highlight_details")
+            if highlight_details:
+                result["highlights"] = highlight_details
+            highlighter_strokes = content.get("highlighter_strokes")
+            if highlighter_strokes:
+                result["highlighter_strokes"] = highlighter_strokes
+            pasted = content.get("images")
+            if pasted:
+                result["images"] = pasted
         if content and content.get("page_tags"):
             result["page_tags"] = content["page_tags"]
+        if content_type in ("text", "annotations") and content:
+            page_layers = [
+                {"page": ap["page"], "layers": ap["layers"]}
+                for ap in content.get("annotated_pages") or []
+                if _page_shows_layers(ap.get("layers") or [])
+            ]
+            if page_layers:
+                result["layers"] = page_layers
 
         if has_more:
             result["next_page"] = page + 1
@@ -1813,6 +1900,7 @@ async def _render_png_page(
     background: str,
     render_merged: bool,
     allow_pdf_fallback: bool,
+    layers: Optional[str] = None,
     dpi: Optional[float] = None,
     full_page: bool = False,
 ) -> tuple[Optional[bytes], Optional[str], bool, bool]:
@@ -1829,6 +1917,7 @@ async def _render_png_page(
             tmp_path,
             page,
             background_color=background,
+            layers=layers,
             dpi=dpi,
         )
         is_merged = png_data is not None and merged_note is None
@@ -1838,6 +1927,7 @@ async def _render_png_page(
             tmp_path,
             page,
             background_color=background,
+            layers=layers,
             dpi=dpi,
         )
         png_data = full[0] if full is not None else None
@@ -1847,6 +1937,7 @@ async def _render_png_page(
             tmp_path,
             page,
             background_color=background,
+            layers=layers,
         )
 
     rendered_via_pdf = False
@@ -1869,6 +1960,7 @@ async def _render_png_page(
             tmp_path,
             page,
             background_color=background,
+            layers=layers,
             dpi=dpi,
         )
         if full is not None:
@@ -1895,6 +1987,7 @@ async def remarkable_image(
     compatibility: bool = False,
     include_ocr: bool = False,
     render_merged: Optional[bool] = None,
+    layers: str = "visible",
     dpi: Optional[int] = None,
     region: Optional[List[float]] = None,
 ):
@@ -1946,6 +2039,9 @@ async def remarkable_image(
     - render_merged: PDF compositing mode for PNG: None (default) automatically
       merges PDF-backed pages, True explicitly requests merging, and False returns
       the annotation-only layer. SVG output remains annotation-only.
+    - layers: Which page layers to draw: "visible" (default) draws what the tablet
+      shows, "all" includes hidden layers, or a layer name (e.g. "Layer 3") draws
+      only that layer. remarkable_read(content_type="annotations") lists layers.
     - dpi: PNG resolution in dots per inch of the physical page (36-600). Renders
       the whole page rather than cropping to the ink. Use 300 to read small
       handwriting. Default: about 1872 px on the long edge (notebooks) or 144 dpi
@@ -1964,6 +2060,8 @@ async def remarkable_image(
     - remarkable_image("Notes", include_ocr=True)  # Get image with OCR text extraction
     - remarkable_image("Annotated PDF")  # PDF + annotations composited automatically
     - remarkable_image("Annotated PDF", render_merged=False)  # Annotation layer only
+    - remarkable_image("Notes", page=3, layers="all")  # Include hidden layers
+    - remarkable_image("Notes", page=3, layers="Layer 3")  # One named layer
     - remarkable_image("Worksheet", page=2, dpi=300)  # Full page at 300 dpi
     - remarkable_image("Worksheet", page=2, dpi=300, region=[0, 0.4, 1, 0.6])  # One band
     </examples>
@@ -2065,6 +2163,22 @@ async def remarkable_image(
                     suggestion=f"Use page=1 to {total_pages} to view different pages.",
                 )
 
+            layer_selection = (layers or "visible").strip()
+            if layer_selection.lower() not in ("visible", "all") and tmp_path is not None:
+                page_layers = await run_blocking(get_page_layers_from_document_zip, tmp_path, page)
+                names = [la["name"] for la in page_layers]
+                if layer_selection.lower() not in (n.lower() for n in names):
+                    return make_error(
+                        error_type="layer_not_found",
+                        message=f"Page {page} has no layer named '{layer_selection}'.",
+                        suggestion=(
+                            f"Layers on this page: {', '.join(names)}."
+                            if names
+                            else "This page has no named layers; use layers='visible'."
+                        ),
+                        did_you_mean=names or None,
+                    )
+
             # Build resource URI for this page
             doc_path = _apply_root_filter(get_item_path(target_doc, items_by_id))
             uri_path = doc_path.lstrip("/")
@@ -2094,6 +2208,7 @@ async def remarkable_image(
                     tmp_path,
                     page,
                     background_color=background,
+                    layers=layer_selection,
                 )
 
                 if svg_content is None:
@@ -2179,6 +2294,7 @@ async def remarkable_image(
                         background,
                         use_merged,
                         render_merged is not False,
+                        layer_selection,
                         dpi,
                         dpi is not None or region is not None,
                     )

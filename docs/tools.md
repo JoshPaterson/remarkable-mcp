@@ -101,11 +101,70 @@ remarkable_read("/Work/Projects/Q4 Planning")
 }
 ```
 
-### Page tags
+### Highlight colors
+
+Text highlights are listed per page with their highlighter color, e.g.
+`• [pink] The line of apsides advances...`. For `text` and `annotations`
+reads, the response also carries a `highlights` list:
+
+```json
+"highlights": [
+  {"page": 1, "text": "...", "color": "blue", "color_id": 9, "color_hex": "#beeafe"}
+]
+```
+
+`color` is a name (yellow, green, pink, gray, blue, orange, ...). Color id 9
+is a custom color named from the stored ARGB value, or `#rrggbb` when the value
+is not a known highlighter color. `color_hex` is set only when the tablet stores
+an ARGB value.
+
+Each highlight also gives its position, as `[left, top, right, bottom]` from
+the page's top-left corner: `rects_mm`, one box per line or piece; `bbox_mm`,
+the box around all of them; and `region`, that box as fractions of the page,
+which can be passed to `remarkable_image(region=...)`. The text output shows
+the region after the text:
+
+```
+  • [pink] Estimate the remainder for a Taylor series   region [0.177, 0.206, 0.479, 0.219]
+```
+
+Highlight text comes from the PDF's text layer and often misses mathematical
+symbols and equations. When the exact highlighted content matters, render the
+highlight's `region` with `remarkable_image`.
+
+Highlighter strokes that did not snap to text (freehand highlighter ink) are
+summarized per page, e.g. `Page 2: 2 highlighter strokes (pink, yellow)`, and
+returned as `highlighter_strokes` with `page`, the same color fields, and the
+stroke's extent including the pen width, as `[left, top, right, bottom]` from
+the page's top-left corner: `bbox_mm` in millimetres and `region` as fractions
+of the page. `region` can be passed to `remarkable_image(region=...)` to view
+the marked area. PDF-backed pages are measured on their PDF page. Other pen
+strokes are summarized as "handwritten notes".
 
 Page tags from the document's `.content` file are shown on their page, e.g.
 `Page 3: handwritten notes; page tags: test-page`, and returned as
 `page_tags: [{"page": 3, "name": "test-page"}]`.
+
+Pages with more than one layer, or a hidden layer, list each layer with its
+visibility and contents, and highlights and highlighter strokes name their
+layer:
+
+```
+Page 3: handwritten notes; page tags: test-page
+  Layer 1: 2 pen strokes (black, blue)
+  Layer 2: 1 pen stroke (red)
+  Layer 3 [hidden]: 1 pen stroke (green)
+```
+
+The same data is returned as `layers: [{"page": 3, "layers": [...]}]`.
+
+Images pasted onto a page with the tablet's capture feature are listed per
+page, e.g. `Page 4: handwritten notes, 1 pasted image` followed by
+`+ pasted image, region [left, top, right, bottom]`, and returned as `images`
+with `page`, `file`, `layer`, `bbox_mm` and `region`. `remarkable_image` draws
+them in the tablet's stacking order: within a layer, items are drawn in the
+order they were placed, so ink written over an image covers it and an image
+that is moved comes to the top.
 
 ### Smart Features
 
@@ -361,6 +420,7 @@ remarkable_status()
 | `include_ocr` | bool | `False` | Enable OCR on the image |
 | `compatibility` | bool | `False` | Return resource URI instead of embedded resource |
 | `render_merged` | bool \| null | `None` (auto) | PNG compositing mode: auto-merge PDF-backed pages, `True` to request merging explicitly, or `False` for annotations only |
+| `layers` | string | `"visible"` | Layers to draw: `"visible"` (what the tablet shows), `"all"` (include hidden layers), or one layer's name, e.g. `"Layer 3"` |
 | `dpi` | int \| null | `None` | PNG resolution (36-600 dots per inch of the physical page). Renders the whole page instead of cropping to the ink; use 300 to read small handwriting |
 | `region` | list[float] \| null | `None` | PNG crop box `[left, top, right, bottom]` as fractions of the page, e.g. `[0, 0.5, 1, 0.75]` |
 

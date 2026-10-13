@@ -334,6 +334,28 @@ def _heading_text(value: str) -> str:
     return re.sub(r"\s+", " ", value).strip() or "Untitled reMarkable document"
 
 
+def _export_highlights(content: dict) -> list[tuple[str, str]]:
+    """Highlights as ``(text, label)``; the label gives color and page when known."""
+    entries: list[tuple[str, str]] = []
+    covered: set[str] = set()
+    for detail in content.get("highlight_details") or []:
+        text = str(detail.get("text") or "")
+        if not text.strip():
+            continue
+        parts = []
+        if detail.get("color"):
+            parts.append(str(detail["color"]))
+        if detail.get("page"):
+            parts.append(f"page {detail['page']}")
+        entries.append((text, ", ".join(parts)))
+        covered.add(text)
+    for value in content.get("highlights") or []:
+        text = str(value)
+        if text.strip() and text not in covered:
+            entries.append((text, ""))
+    return entries
+
+
 def write_markdown_export(
     destination: Path,
     metadata: ExportMetadata,
@@ -401,7 +423,34 @@ def write_markdown_export(
                 marks.append("handwriting")
             highlight_count = len(entry.get("highlights") or [])
             if highlight_count:
-                marks.append(f"{highlight_count} highlight" + ("s" if highlight_count != 1 else ""))
+                mark = f"{highlight_count} highlight" + ("s" if highlight_count != 1 else "")
+                colors = _unique_strings(
+                    str(h.get("color"))
+                    for h in entry.get("highlight_details") or []
+                    if h.get("color")
+                )
+                if colors:
+                    mark += f" ({', '.join(colors)})"
+                marks.append(mark)
+            strokes = entry.get("highlighter_strokes") or []
+            if strokes:
+                colors = _unique_strings(str(h.get("color")) for h in strokes if h.get("color"))
+                mark = f"{len(strokes)} highlighter stroke" + ("s" if len(strokes) != 1 else "")
+                if colors:
+                    mark += f" ({', '.join(colors)})"
+                marks.append(mark)
+            layers = entry.get("layers") or []
+            if len(layers) > 1 or any(not layer.get("visible", True) for layer in layers):
+                marks.append(
+                    "layers: "
+                    + ", ".join(
+                        str(layer.get("name")) + ("" if layer.get("visible", True) else " (hidden)")
+                        for layer in layers
+                    )
+                )
+            images = entry.get("images") or []
+            if images:
+                marks.append(f"{len(images)} pasted image" + ("s" if len(images) != 1 else ""))
             page_tags = [str(t) for t in entry.get("page_tags") or []]
             if page_tags:
                 marks.append("page tags: " + ", ".join(page_tags))
@@ -416,10 +465,11 @@ def write_markdown_export(
     lines.append("")
 
     lines.extend(["## Highlights", ""])
-    highlights = [str(value) for value in content.get("highlights") or [] if str(value).strip()]
+    highlights = _export_highlights(content)
     if highlights:
-        for index, value in enumerate(highlights, 1):
-            lines.extend([f"### Highlight {index}", ""])
+        for index, (value, label) in enumerate(highlights, 1):
+            heading = f"### Highlight {index}" + (f" ({label})" if label else "")
+            lines.extend([heading, ""])
             lines.extend(_verbatim_block(value))
             lines.append("")
     else:
