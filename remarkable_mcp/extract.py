@@ -14,6 +14,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from xml.sax.saxutils import escape as _xml_escape
 
+from remarkable_mcp.pages import content_page_ids, deleted_page_ids, has_cpages, live_cpages_entries
+
 logger = logging.getLogger(__name__)
 
 
@@ -1257,6 +1259,17 @@ def _add_svg_background(svg_content: str, background_color: str) -> str:
     return svg_content[:insert_pos] + bg_rect + svg_content[insert_pos:]
 
 
+def _read_content_json(tmpdir_path: Path) -> Optional[dict]:
+    """Parse the first ``.content`` file in an extracted document, or None."""
+    for content_file in tmpdir_path.glob("*.content"):
+        try:
+            data = json.loads(content_file.read_text())
+        except Exception:
+            return None
+        return data if isinstance(data, dict) else None
+    return None
+
+
 def _get_ordered_rm_files(tmpdir_path: Path) -> List[Path]:
     """Extract and order .rm files from an extracted document directory.
 
@@ -1270,22 +1283,11 @@ def _get_ordered_rm_files(tmpdir_path: Path) -> List[Path]:
         List of .rm file paths in correct page order
     """
     # Get page order from .content file
-    page_order = []
-    for content_file in tmpdir_path.glob("*.content"):
-        try:
-            data = json.loads(content_file.read_text())
-            # New format: cPages.pages array
-            if "cPages" in data and "pages" in data["cPages"]:
-                page_order = [p["id"] for p in data["cPages"]["pages"]]
-            # Fallback: pages array directly
-            elif "pages" in data and isinstance(data["pages"], list):
-                page_order = data["pages"]
-        except Exception:
-            # Ignore errors reading/parsing .content file; fallback to default page order
-            pass
-        break
+    data = _read_content_json(tmpdir_path)
+    page_order = content_page_ids(data)
+    deleted = deleted_page_ids(data)
 
-    rm_files = list(tmpdir_path.glob("**/*.rm"))
+    rm_files = [f for f in tmpdir_path.glob("**/*.rm") if f.stem not in deleted]
 
     # Sort rm_files by page order if available
     if page_order:
@@ -1311,21 +1313,12 @@ def _get_page_order(tmpdir_path: Path) -> List[str]:
     """Return the ordered list of page ids from the .content file.
 
     formatVersion 2 stores them under ``cPages.pages[].id``; formatVersion 1 as
-    a flat ``pages`` list of ids. Returns an empty list if unavailable. This is
-    the full page order (including pages that have no strokes), unlike
+    a flat ``pages`` list of ids. Pages deleted on the tablet are skipped.
+    Returns an empty list if unavailable. This is the full page order
+    (including pages that have no strokes), unlike
     ``_get_ordered_rm_files`` which is compacted to pages that do.
     """
-    for content_file in tmpdir_path.glob("*.content"):
-        try:
-            data = json.loads(content_file.read_text())
-            if "cPages" in data and "pages" in data["cPages"]:
-                return [p.get("id") for p in data["cPages"]["pages"] if p.get("id")]
-            if isinstance(data.get("pages"), list):
-                return [p for p in data["pages"] if isinstance(p, str)]
-        except Exception:
-            pass
-        break
-    return []
+    return content_page_ids(_read_content_json(tmpdir_path))
 
 
 def _select_rm_file_for_page(tmpdir_path: Path, rm_files: List[Path], page: int) -> Optional[Path]:
@@ -1515,18 +1508,10 @@ def _read_cpages_entries(tmpdir_path: Path) -> List[Dict[str, Any]]:
         tmpdir_path: Path to the extracted document directory
 
     Returns:
-        List of cPages page entries, or empty list if not found
+        List of cPages page entries for pages the tablet shows (deleted pages
+        skipped), or empty list if not found
     """
-    content_file = next(tmpdir_path.glob("*.content"), None)
-    if content_file is None:
-        return []
-    try:
-        data = json.loads(content_file.read_text())
-        if "cPages" in data and "pages" in data["cPages"]:
-            return data["cPages"]["pages"]
-    except Exception:
-        pass
-    return []
+    return live_cpages_entries(_read_content_json(tmpdir_path))
 
 
 def _pdf_page_index_for_cpages_entry(entry: Dict[str, Any]) -> Optional[int]:
@@ -1968,16 +1953,9 @@ def get_document_page_count(zip_path: Path) -> int:
             zf.extractall(tmpdir_path)
 
         # Try .content metadata first — it's the authoritative page list
-        for content_file in tmpdir_path.glob("*.content"):
-            try:
-                data = json.loads(content_file.read_text())
-                if "cPages" in data and "pages" in data["cPages"]:
-                    return len(data["cPages"]["pages"])
-                if "pages" in data and isinstance(data["pages"], list):
-                    return len(data["pages"])
-            except Exception:
-                pass
-            break
+        data = _read_content_json(tmpdir_path)
+        if has_cpages(data) or isinstance((data or {}).get("pages"), list):
+            return len(content_page_ids(data))
 
         # Fallback to counting .rm files
         return len(list(tmpdir_path.glob("**/*.rm")))
@@ -2104,23 +2082,12 @@ def extract_text_from_document_zip(
         with zipfile.ZipFile(zip_path, "r") as zf:
             zf.extractall(tmpdir_path)
 
-        # Get page order from .content file
-        page_order = []
-        for content_file in tmpdir_path.glob("*.content"):
-            try:
-                data = json.loads(content_file.read_text())
-                # New format: cPages.pages array
-                if "cPages" in data and "pages" in data["cPages"]:
-                    page_order = [p["id"] for p in data["cPages"]["pages"]]
-                # Fallback: pages array directly
-                elif "pages" in data and isinstance(data["pages"], list):
-                    page_order = data["pages"]
-            except Exception:
-                # Malformed .content file - continue without page order
-                pass
-            break  # Only process first .content file
+        # Get page order from .content file (pages deleted on the tablet skipped)
+        content_data = _read_content_json(tmpdir_path)
+        page_order = content_page_ids(content_data)
+        deleted = deleted_page_ids(content_data)
 
-        rm_files = list(tmpdir_path.glob("**/*.rm"))
+        rm_files = [f for f in tmpdir_path.glob("**/*.rm") if f.stem not in deleted]
 
         # If we have page order, sort rm_files accordingly
         if page_order:
