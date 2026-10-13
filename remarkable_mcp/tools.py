@@ -54,6 +54,7 @@ from remarkable_mcp.extract import (
     get_document_file_type,
     get_document_page_count,
     get_ocr_backend,
+    get_page_layers_from_document_zip,
     render_mapped_pdf_page_from_document_zip,
     render_merged_page_from_document_zip,
     render_page_from_document_zip,
@@ -1731,6 +1732,7 @@ async def _render_png_page(
     background: str,
     render_merged: bool,
     allow_pdf_fallback: bool,
+    layers: Optional[str] = None,
 ) -> tuple[Optional[bytes], Optional[str], bool, bool]:
     """Render a PNG with the same fallbacks used by remarkable_image."""
     merged_note = None
@@ -1741,6 +1743,7 @@ async def _render_png_page(
             tmp_path,
             page,
             background_color=background,
+            layers=layers,
         )
         is_merged = png_data is not None and merged_note is None
     else:
@@ -1749,6 +1752,7 @@ async def _render_png_page(
             tmp_path,
             page,
             background_color=background,
+            layers=layers,
         )
 
     rendered_via_pdf = False
@@ -1769,6 +1773,7 @@ async def _render_png_page(
             tmp_path,
             page,
             background_color=background,
+            layers=layers,
         )
         if full is not None:
             png_data = full[0]
@@ -1785,6 +1790,7 @@ async def remarkable_image(
     compatibility: bool = False,
     include_ocr: bool = False,
     render_merged: Optional[bool] = None,
+    layers: str = "visible",
 ):
     """
     <usecase>Get an image of a specific page from a reMarkable document.</usecase>
@@ -1833,6 +1839,9 @@ async def remarkable_image(
     - render_merged: PDF compositing mode for PNG: None (default) automatically
       merges PDF-backed pages, True explicitly requests merging, and False returns
       the annotation-only layer. SVG output remains annotation-only.
+    - layers: Which page layers to draw: "visible" (default) draws what the tablet
+      shows, "all" includes hidden layers, or a layer name (e.g. "Layer 3") draws
+      only that layer. remarkable_read(content_type="annotations") lists layers.
     </parameters>
     <examples>
     - remarkable_image("UI Mockup")  # Get first page as embedded PNG resource
@@ -1844,6 +1853,8 @@ async def remarkable_image(
     - remarkable_image("Notes", include_ocr=True)  # Get image with OCR text extraction
     - remarkable_image("Annotated PDF")  # PDF + annotations composited automatically
     - remarkable_image("Annotated PDF", render_merged=False)  # Annotation layer only
+    - remarkable_image("Notes", page=3, layers="all")  # Include hidden layers
+    - remarkable_image("Notes", page=3, layers="Layer 3")  # One named layer
     </examples>
     """
     try:
@@ -1922,6 +1933,22 @@ async def remarkable_image(
                     suggestion=f"Use page=1 to {total_pages} to view different pages.",
                 )
 
+            layer_selection = (layers or "visible").strip()
+            if layer_selection.lower() not in ("visible", "all") and tmp_path is not None:
+                page_layers = await run_blocking(get_page_layers_from_document_zip, tmp_path, page)
+                names = [la["name"] for la in page_layers]
+                if layer_selection.lower() not in (n.lower() for n in names):
+                    return make_error(
+                        error_type="layer_not_found",
+                        message=f"Page {page} has no layer named '{layer_selection}'.",
+                        suggestion=(
+                            f"Layers on this page: {', '.join(names)}."
+                            if names
+                            else "This page has no named layers; use layers='visible'."
+                        ),
+                        did_you_mean=names or None,
+                    )
+
             # Build resource URI for this page
             doc_path = _apply_root_filter(get_item_path(target_doc, items_by_id))
             uri_path = doc_path.lstrip("/")
@@ -1951,6 +1978,7 @@ async def remarkable_image(
                     tmp_path,
                     page,
                     background_color=background,
+                    layers=layer_selection,
                 )
 
                 if svg_content is None:
@@ -2035,6 +2063,7 @@ async def remarkable_image(
                         background,
                         use_merged,
                         render_merged is not False,
+                        layer_selection,
                     )
 
                 if png_data is None:

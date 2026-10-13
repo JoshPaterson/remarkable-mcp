@@ -27,6 +27,7 @@ from remarkable_mcp.extract import (
     _page_annotation_details,
     _render_rm_v6_to_svg,
     extract_text_from_document_zip,
+    get_page_layers_from_document_zip,
 )
 
 ROOT_ID = CrdtId(0, 1)
@@ -434,3 +435,232 @@ async def test_read_annotations_summarizes_highlighter_strokes():
     assert "Page 2: handwritten notes, 2 highlighter strokes (pink, yellow)" in data["content"]
     assert "  ~ [yellow] highlighter stroke, region [0.1, 0.4, 0.4, 0.45]" in data["content"]
     assert [h["color"] for h in data["highlighter_strokes"]] == ["pink", "yellow"]
+
+
+# --- layers -----------------------------------------------------------------
+
+BALLPOINT = 15  # Pen.BALLPOINT_2
+
+
+def three_layer_page() -> bytes:
+    """Like S0.2-06 page 3: layers 1 and 2 visible, layer 3 hidden."""
+    return build_rm(
+        [
+            (
+                "Layer 1",
+                True,
+                [
+                    stroke(0, BALLPOINT, [(0, 100), (100, 100)]),
+                    stroke(6, BALLPOINT, [(0, 200), (100, 200)]),
+                    glyph("layer one passage", 3, 0xFF000000, y=500),
+                ],
+            ),
+            ("Layer 2", True, [stroke(7, BALLPOINT, [(0, 300), (100, 300)])]),
+            (
+                "Layer 3",
+                False,
+                [
+                    stroke(4, BALLPOINT, [(0, 400), (100, 400)]),
+                    stroke(5, HIGHLIGHTER, [(0, 600), (100, 610)]),
+                ],
+            ),
+        ]
+    )
+
+
+def test_page_layers_listed_with_visibility_and_contents(tmp_path):
+    rm_file = tmp_path / "page.rm"
+    rm_file.write_bytes(three_layer_page())
+
+    details = _page_annotation_details(rm_file)
+
+    assert [(la["name"], la["visible"]) for la in details["layers"]] == [
+        ("Layer 1", True),
+        ("Layer 2", True),
+        ("Layer 3", False),
+    ]
+    assert [la["pen_colors"] for la in details["layers"]] == [
+        ["black", "blue"],
+        ["red"],
+        ["green"],
+    ]
+    assert details["layers"][0]["highlights"] == 1
+    assert details["highlights"][0]["layer"] == "Layer 1"
+    assert details["highlighter_strokes"][0]["layer"] == "Layer 3"
+
+
+def test_unlabelled_layers_named_by_position(tmp_path):
+    rm_file = tmp_path / "page.rm"
+    rm_file.write_bytes(
+        build_rm(
+            [
+                ("", True, [stroke(0, BALLPOINT, [(0, 0), (1, 1)])]),
+                ("Notes", True, []),
+                ("", True, []),
+            ]
+        )
+    )
+
+    names = [la["name"] for la in _page_annotation_details(rm_file)["layers"]]
+
+    assert names == ["Layer 1", "Notes", "Layer 3"]
+
+
+def test_render_draws_visible_layers_by_default(tmp_path):
+    rm_file = tmp_path / "page.rm"
+    rm_file.write_bytes(three_layer_page())
+
+    visible = _render_rm_v6_to_svg(rm_file)
+    everything = _render_rm_v6_to_svg(rm_file, layers="all")
+    only_two = _render_rm_v6_to_svg(rm_file, layers="layer 2")
+
+    green = 'stroke="#00A000"'
+    red = 'stroke="#E00000"'
+    assert red in visible and 'stroke="black"' in visible
+    assert green not in visible
+    assert 'stroke="#FF69B4"' not in visible  # highlighter on hidden layer
+    assert green in everything
+    assert red in only_two
+    assert 'stroke="black"' not in only_two and green not in only_two
+
+
+def test_get_page_layers_from_document_zip(tmp_path):
+    zip_path = write_document_zip(
+        tmp_path / "doc.zip",
+        {"p3": three_layer_page()},
+        {"cPages": {"pages": [{"id": "p1"}, {"id": "p2"}, {"id": "p3"}]}},
+    )
+
+    assert get_page_layers_from_document_zip(zip_path, 3) == [
+        {"name": "Layer 1", "visible": True},
+        {"name": "Layer 2", "visible": True},
+        {"name": "Layer 3", "visible": False},
+    ]
+    assert get_page_layers_from_document_zip(zip_path, 1) == []
+
+
+async def test_read_annotations_lists_layers():
+    page = {
+        "page": 3,
+        "page_id": "p3",
+        "has_handwriting": True,
+        "highlights": ["layer one passage"],
+        "highlight_details": [{"text": "layer one passage", "color": "yellow", "layer": "Layer 1"}],
+        "highlighter_strokes": [
+            {"color": "pink", "region": [0.5, 0.32, 0.57, 0.33], "layer": "Layer 3"}
+        ],
+        "layers": [
+            {
+                "name": "Layer 1",
+                "visible": True,
+                "pen_strokes": 2,
+                "pen_colors": ["black", "blue"],
+                "highlights": 1,
+                "highlighter_strokes": 0,
+            },
+            {
+                "name": "Layer 2",
+                "visible": True,
+                "pen_strokes": 1,
+                "pen_colors": ["red"],
+                "highlights": 0,
+                "highlighter_strokes": 0,
+            },
+            {
+                "name": "Layer 3",
+                "visible": False,
+                "pen_strokes": 1,
+                "pen_colors": ["green"],
+                "highlights": 0,
+                "highlighter_strokes": 1,
+            },
+        ],
+    }
+    data = await _read_annotations(
+        {
+            "typed_text": [],
+            "highlights": ["layer one passage"],
+            "handwritten_text": None,
+            "pages": 3,
+            "page_ids": ["p1", "p2", "p3"],
+            "annotated_pages": [page],
+            "ocr_backend": None,
+            "tags": [],
+        }
+    )
+
+    content = data["content"]
+    assert "  Layer 1: 2 pen strokes (black, blue), 1 highlight" in content
+    assert "  Layer 2: 1 pen stroke (red)" in content
+    assert "  Layer 3 [hidden]: 1 pen stroke (green), 1 highlighter stroke" in content
+    assert "  • [yellow] layer one passage (Layer 1)" in content
+    assert "region [0.5, 0.32, 0.57, 0.33] (Layer 3, hidden)" in content
+    assert data["layers"] == [{"page": 3, "layers": page["layers"]}]
+
+
+async def test_read_annotations_omits_single_default_layer():
+    data = await _read_annotations(
+        {
+            "typed_text": [],
+            "highlights": ["x"],
+            "handwritten_text": None,
+            "pages": 1,
+            "page_ids": ["p1"],
+            "annotated_pages": [
+                {
+                    "page": 1,
+                    "page_id": "p1",
+                    "has_handwriting": False,
+                    "highlights": ["x"],
+                    "highlight_details": [{"text": "x", "color": "pink", "layer": "Layer 1"}],
+                    "layers": [{"name": "Layer 1", "visible": True, "highlights": 1}],
+                }
+            ],
+            "ocr_backend": None,
+            "tags": [],
+        }
+    )
+
+    assert "  • [pink] x\n" in data["content"] + "\n"
+    assert "Layer 1:" not in data["content"]
+    assert "layers" not in data
+
+
+async def _image(zip_bytes: bytes, **arguments) -> dict:
+    from unittest.mock import Mock, patch
+
+    from remarkable_mcp.server import mcp
+
+    client = Mock()
+    doc = Mock()
+    doc.VissibleName = "Layers"
+    doc.ID = "doc"
+    doc.Parent = ""
+    doc.ModifiedClient = None
+    doc.is_folder = False
+    doc.tags = []
+    client.get_meta_items.return_value = [doc]
+    client.download.return_value = zip_bytes
+    with patch("remarkable_mcp.tools.get_rmapi", return_value=client):
+        result = await mcp.call_tool(
+            "remarkable_image",
+            {"document": "Layers", "output_format": "svg", "compatibility": True, **arguments},
+        )
+    return json.loads(result.content[0].text)
+
+
+async def test_image_layers_parameter(tmp_path):
+    zip_bytes = write_document_zip(
+        tmp_path / "doc.zip",
+        {"p1": three_layer_page()},
+        {"fileType": "notebook", "cPages": {"pages": [{"id": "p1"}]}},
+    ).read_bytes()
+
+    default = await _image(zip_bytes)
+    everything = await _image(zip_bytes, layers="all")
+    missing = await _image(zip_bytes, layers="Layer 9")
+
+    assert 'stroke="#00A000"' not in default["svg"]
+    assert 'stroke="#00A000"' in everything["svg"]
+    assert missing["_error"]["type"] == "layer_not_found"
+    assert "Layer 3" in missing["_error"]["suggestion"]
