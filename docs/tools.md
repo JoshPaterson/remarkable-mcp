@@ -127,6 +127,19 @@ of the page. `region` can be passed to `remarkable_image(region=...)` to view
 the marked area. PDF-backed pages are measured on their PDF page. Other pen
 strokes are summarized as "handwritten notes".
 
+Pages with more than one layer, or a hidden layer, list each layer with its
+visibility and contents, and highlights and highlighter strokes name their
+layer:
+
+```
+Page 3: handwritten notes
+  Layer 1: 2 pen strokes (black, blue)
+  Layer 2: 1 pen stroke (red)
+  Layer 3 [hidden]: 1 pen stroke (green)
+```
+
+The same data is returned as `layers: [{"page": 3, "layers": [...]}]`.
+
 ### Smart Features
 
 - **Auto-OCR**: If a notebook has no typed text and `include_ocr=False`, OCR is automatically enabled and you're notified via `_ocr_auto_enabled: true`

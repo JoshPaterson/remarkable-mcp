@@ -208,6 +208,67 @@ def _is_cloud_archived(item) -> bool:
     return parent == "trash"
 
 
+def _plural(count: int, noun: str) -> str:
+    return f"{count} {noun}" + ("s" if count != 1 else "")
+
+
+def _page_shows_layers(layers: list) -> bool:
+    """Layer detail is worth showing when a page has several or hidden layers."""
+    return len(layers) > 1 or any(not la.get("visible", True) for la in layers)
+
+
+def _annotated_page_lines(ap: dict) -> List[str]:
+    """Text lines describing one annotated page for remarkable_read."""
+    layers = ap.get("layers") or []
+    show_layers = _page_shows_layers(layers)
+    hidden = {la["name"] for la in layers if not la.get("visible", True)}
+
+    def on_layer(entry: dict) -> str:
+        layer = entry.get("layer")
+        if not show_layers or not layer:
+            return ""
+        return f" ({layer}{', hidden' if layer in hidden else ''})"
+
+    marks = []
+    if ap.get("has_handwriting"):
+        marks.append("handwritten notes")
+    n_hl = len(ap.get("highlights") or [])
+    if n_hl:
+        marks.append(_plural(n_hl, "highlight"))
+    strokes = ap.get("highlighter_strokes") or []
+    if strokes:
+        colors = list(dict.fromkeys(str(h.get("color")) for h in strokes))
+        marks.append(f"{_plural(len(strokes), 'highlighter stroke')} ({', '.join(colors)})")
+    lines = [f"Page {ap['page']}: " + (", ".join(marks) or "annotated")]
+
+    if show_layers:
+        for layer in layers:
+            parts = []
+            if layer.get("pen_strokes"):
+                parts.append(
+                    f"{_plural(layer['pen_strokes'], 'pen stroke')} "
+                    f"({', '.join(layer.get('pen_colors') or [])})"
+                )
+            if layer.get("highlights"):
+                parts.append(_plural(layer["highlights"], "highlight"))
+            if layer.get("highlighter_strokes"):
+                parts.append(_plural(layer["highlighter_strokes"], "highlighter stroke"))
+            state = "" if layer.get("visible", True) else " [hidden]"
+            lines.append(f"  {layer['name']}{state}: " + (", ".join(parts) or "empty"))
+
+    details = ap.get("highlight_details")
+    if details is None:
+        details = [{"text": h} for h in ap.get("highlights") or []]
+    for h in details:
+        color = h.get("color")
+        prefix = f"[{color}] " if color else ""
+        lines.append(f"  • {prefix}{h['text']}{on_layer(h)}")
+    for h in strokes:
+        location = f", region {h['region']}" if h.get("region") else ""
+        lines.append(f"  ~ [{h.get('color')}] highlighter stroke{location}{on_layer(h)}")
+    return lines
+
+
 def _modified_sort_key(item) -> float:
     """Return a sortable timestamp for an item's modified date.
 
@@ -605,36 +666,8 @@ async def remarkable_read(
                 if annotated_pages:
                     annotation_parts.append("\n--- Annotated pages ---")
                     for ap in annotated_pages:
-                        marks = []
-                        if ap.get("has_handwriting"):
-                            marks.append("handwritten notes")
-                        n_hl = len(ap.get("highlights") or [])
-                        if n_hl:
-                            marks.append(f"{n_hl} highlight" + ("s" if n_hl != 1 else ""))
-                        strokes = ap.get("highlighter_strokes") or []
-                        if strokes:
-                            colors = list(dict.fromkeys(h.get("color") for h in strokes))
-                            marks.append(
-                                f"{len(strokes)} highlighter stroke"
-                                + ("s" if len(strokes) != 1 else "")
-                                + f" ({', '.join(str(c) for c in colors)})"
-                            )
-                        annotation_parts.append(
-                            f"Page {ap['page']}: " + (", ".join(marks) or "annotated")
-                        )
-                        details = ap.get("highlight_details")
-                        if details is None:
-                            details = [{"text": h} for h in ap.get("highlights") or []]
-                        for h in details:
-                            color = h.get("color")
-                            prefix = f"[{color}] " if color else ""
-                            annotation_parts.append(f"  • {prefix}{h['text']}")
-                            shown_highlights.add(h["text"])
-                        for h in strokes:
-                            location = f", region {h['region']}" if h.get("region") else ""
-                            annotation_parts.append(
-                                f"  ~ [{h.get('color')}] highlighter stroke{location}"
-                            )
+                        annotation_parts.extend(_annotated_page_lines(ap))
+                        shown_highlights.update(ap.get("highlights") or [])
                 # Highlights not covered by the per-page index above — e.g. from
                 # the legacy .highlights JSON (older firmware), which has no page
                 # attribution. Without this, a doc whose pages carry pen strokes
@@ -924,6 +957,14 @@ async def remarkable_read(
             highlighter_strokes = content.get("highlighter_strokes")
             if highlighter_strokes:
                 result["highlighter_strokes"] = highlighter_strokes
+        if content_type in ("text", "annotations") and content:
+            page_layers = [
+                {"page": ap["page"], "layers": ap["layers"]}
+                for ap in content.get("annotated_pages") or []
+                if _page_shows_layers(ap.get("layers") or [])
+            ]
+            if page_layers:
+                result["layers"] = page_layers
 
         if has_more:
             result["next_page"] = page + 1

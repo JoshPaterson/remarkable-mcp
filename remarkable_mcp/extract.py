@@ -683,6 +683,16 @@ def _scene_layers(tree: Any, blocks: list) -> List[Dict[str, Any]]:
     return layers
 
 
+def _page_scene_items(tree: Any, layers: List[Dict[str, Any]]):
+    """Yield ``(item, group_node_id)`` for items on live layers or at the root."""
+    for layer in layers:
+        yield from _scene_items(layer["group"])
+    root = tree.root
+    for child in root.children.values():
+        if not _is_scene_group(child):
+            yield child, root.node_id
+
+
 # Layer selections for rendering: visible layers only (the default), every
 # layer, or a single layer given by name.
 LAYERS_VISIBLE = "visible"
@@ -2247,43 +2257,73 @@ def _page_annotation_details(rm_file: Path) -> Dict[str, Any]:
     cover current firmware, so read them here.
 
     Returns ``{"highlights": [...], "highlighter_strokes": [...], "has_strokes":
-    bool}``. Each highlight is ``{"text", "color", "color_id", "color_hex"}`` in
-    reading order; each highlighter stroke is ``{"color", "color_id",
-    "color_hex", "bbox"}`` ordered top to bottom, with ``bbox`` as ``[x0, y0,
-    x1, y1]`` in stroke units, padded by the pen width. ``has_strokes`` covers
-    pen strokes other than highlighters and erasers. Returns empty results if
-    the file cannot be parsed.
+    bool, "layers": [...]}``. Each highlight is ``{"text", "color", "color_id",
+    "color_hex", "layer"}`` in reading order; each highlighter stroke is
+    ``{"color", "color_id", "color_hex", "bbox", "layer"}`` ordered top to
+    bottom, with ``bbox`` as ``[x0, y0, x1, y1]`` in stroke units, padded by
+    the pen width. ``layer`` is the name of the layer the item is on (None
+    outside any layer). ``has_strokes`` covers pen strokes other than
+    highlighters and erasers. ``layers`` lists the page's layers in tablet
+    order as ``{"name", "visible", "pen_strokes", "pen_colors", "highlights",
+    "highlighter_strokes"}`` counts. Returns empty results if the file cannot
+    be parsed.
     """
-    details: Dict[str, Any] = {"highlights": [], "highlighter_strokes": [], "has_strokes": False}
-    try:
-        import rmscene
-    except Exception:
+    details: Dict[str, Any] = {
+        "highlights": [],
+        "highlighter_strokes": [],
+        "has_strokes": False,
+        "layers": [],
+    }
+    scene = _v6_scene(rm_file)
+    if scene is None:
         return details
-    try:
-        with rm_file.open("rb") as fh:
-            tree = rmscene.read_tree(fh)
-    except Exception:
-        return details
+    blocks, tree = scene
 
     highlights: list = []
     highlighter_strokes: list = []
     try:
-        for item in tree.walk():
+        page_layers = _scene_layers(tree, blocks)
+        layer_of_node: Dict[Any, Dict[str, Any]] = {}
+        layer_stats = []
+        for layer in page_layers:
+            stats = {
+                "name": layer["name"],
+                "visible": layer["visible"],
+                "pen_strokes": 0,
+                "pen_colors": [],
+                "highlights": 0,
+                "highlighter_strokes": 0,
+            }
+            layer_stats.append(stats)
+            layer_of_node[layer["group"].node_id] = stats
+            for _, node_id in _scene_items(layer["group"]):
+                layer_of_node[node_id] = stats
+        details["layers"] = layer_stats
+
+        for item, node_id in _page_scene_items(tree, page_layers):
             kind = type(item).__name__
+            stats = layer_of_node.get(node_id)
+            layer_name = stats["name"] if stats else None
             if kind == "Line":
                 tool = getattr(item, "tool", None)
                 tool = getattr(tool, "value", tool)
                 if tool in _ERASER_PENS:
                     continue
+                color = color_info(getattr(item, "color", None), getattr(item, "color_rgba", None))
                 if tool not in _HIGHLIGHTER_PENS:
                     details["has_strokes"] = True
+                    if stats:
+                        stats["pen_strokes"] += 1
+                        if color["color"] not in stats["pen_colors"]:
+                            stats["pen_colors"].append(color["color"])
                     continue
                 bbox = _stroke_bbox(getattr(item, "points", None) or [])
                 if bbox is None:
                     continue
-                entry = color_info(getattr(item, "color", None), getattr(item, "color_rgba", None))
-                entry["bbox"] = bbox
+                entry = dict(color, bbox=bbox, layer=layer_name)
                 highlighter_strokes.append(entry)
+                if stats:
+                    stats["highlighter_strokes"] += 1
             elif kind == "GlyphRange":
                 text = getattr(item, "text", None)
                 if not text:
@@ -2295,7 +2335,10 @@ def _page_annotation_details(rm_file: Path) -> Dict[str, Any]:
                 entry.update(
                     color_info(getattr(item, "color", None), getattr(item, "color_rgba", None))
                 )
+                entry["layer"] = layer_name
                 highlights.append((y, x, entry))
+                if stats:
+                    stats["highlights"] += 1
     except Exception:
         pass
 
@@ -2346,7 +2389,8 @@ def extract_text_from_document_zip(
                  "has_handwriting": bool,   # page has pen strokes
                  "highlights": [str],  # highlighted text on the page
                  "highlight_details": [dict],  # text plus color, as above
-                 "highlighter_strokes": [dict]},  # as above, without "page"
+                 "highlighter_strokes": [dict],  # as above, without "page"
+                 "layers": [dict]},    # name, visibility and per-layer counts
             ],
             "ocr_backend": str,        # Which OCR backend was used (if any)
         }
@@ -2450,6 +2494,7 @@ def extract_text_from_document_zip(
                         "highlights": page_highlights,
                         "highlight_details": page_details,
                         "highlighter_strokes": page_strokes,
+                        "layers": details["layers"],
                     }
                 )
                 result["highlights"].extend(page_highlights)

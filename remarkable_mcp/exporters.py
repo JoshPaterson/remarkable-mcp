@@ -439,6 +439,15 @@ def write_markdown_export(
                 if colors:
                     mark += f" ({', '.join(colors)})"
                 marks.append(mark)
+            layers = entry.get("layers") or []
+            if len(layers) > 1 or any(not layer.get("visible", True) for layer in layers):
+                marks.append(
+                    "layers: "
+                    + ", ".join(
+                        str(layer.get("name")) + ("" if layer.get("visible", True) else " (hidden)")
+                        for layer in layers
+                    )
+                )
             page_id = entry.get("page_id")
             identity = f"; page ID `{page_id}`" if page_id else ""
             lines.append(
