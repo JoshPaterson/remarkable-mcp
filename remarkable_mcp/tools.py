@@ -1768,6 +1768,43 @@ async def remarkable_status() -> str:
         return make_response(result, hint)
 
 
+MIN_IMAGE_DPI = 36
+MAX_IMAGE_DPI = 600
+
+
+def _image_region_error(region: List[float]) -> Optional[str]:
+    """Why ``region`` is not a valid page-fraction crop box, or None."""
+    if len(region) != 4:
+        return "region needs four numbers: [left, top, right, bottom]."
+    left, top, right, bottom = region
+    if not (0.0 <= left < right <= 1.0 and 0.0 <= top < bottom <= 1.0):
+        return (
+            "region values are fractions of the page width and height and need "
+            "0 <= left < right <= 1 and 0 <= top < bottom <= 1."
+        )
+    return None
+
+
+def _crop_png(png_data: bytes, region: List[float]) -> bytes:
+    """Crop a PNG to ``[left, top, right, bottom]`` fractions of its size."""
+    import io
+
+    from PIL import Image as PILImage
+
+    image = PILImage.open(io.BytesIO(png_data))
+    width, height = image.size
+    left, top, right, bottom = region
+    box = (
+        int(round(left * width)),
+        int(round(top * height)),
+        max(int(round(right * width)), int(round(left * width)) + 1),
+        max(int(round(bottom * height)), int(round(top * height)) + 1),
+    )
+    output = io.BytesIO()
+    image.crop(box).save(output, format="PNG")
+    return output.getvalue()
+
+
 async def _render_png_page(
     client,
     target_doc,
@@ -1776,8 +1813,14 @@ async def _render_png_page(
     background: str,
     render_merged: bool,
     allow_pdf_fallback: bool,
+    dpi: Optional[float] = None,
+    full_page: bool = False,
 ) -> tuple[Optional[bytes], Optional[str], bool, bool]:
-    """Render a PNG with the same fallbacks used by remarkable_image."""
+    """Render a PNG with the same fallbacks used by remarkable_image.
+
+    ``full_page`` renders annotation-only pages over the whole page instead of
+    cropping to the ink, so page coordinates (and ``dpi``) apply.
+    """
     merged_note = None
     is_merged = False
     if render_merged:
@@ -1786,8 +1829,18 @@ async def _render_png_page(
             tmp_path,
             page,
             background_color=background,
+            dpi=dpi,
         )
         is_merged = png_data is not None and merged_note is None
+    elif full_page:
+        full = await run_blocking(
+            render_page_full_page_from_document_zip,
+            tmp_path,
+            page,
+            background_color=background,
+            dpi=dpi,
+        )
+        png_data = full[0] if full is not None else None
     else:
         png_data = await run_blocking(
             render_page_from_document_zip,
@@ -1805,7 +1858,9 @@ async def _render_png_page(
         if png_data is None and not has_source_pdf:
             pdf_bytes = await run_blocking(download_raw_file, client, target_doc, "pdf")
             if pdf_bytes:
-                png_data = await run_blocking(render_tablet_pdf_page_to_png, pdf_bytes, page)
+                png_data = await run_blocking(
+                    render_tablet_pdf_page_to_png, pdf_bytes, page, dpi=dpi
+                )
                 rendered_via_pdf = png_data is not None
 
     if png_data is None:
@@ -1814,6 +1869,7 @@ async def _render_png_page(
             tmp_path,
             page,
             background_color=background,
+            dpi=dpi,
         )
         if full is not None:
             png_data = full[0]
@@ -1839,6 +1895,8 @@ async def remarkable_image(
     compatibility: bool = False,
     include_ocr: bool = False,
     render_merged: Optional[bool] = None,
+    dpi: Optional[int] = None,
+    region: Optional[List[float]] = None,
 ):
     """
     <usecase>Get an image of a specific page from a reMarkable document.</usecase>
@@ -1888,6 +1946,13 @@ async def remarkable_image(
     - render_merged: PDF compositing mode for PNG: None (default) automatically
       merges PDF-backed pages, True explicitly requests merging, and False returns
       the annotation-only layer. SVG output remains annotation-only.
+    - dpi: PNG resolution in dots per inch of the physical page (36-600). Renders
+      the whole page rather than cropping to the ink. Use 300 to read small
+      handwriting. Default: about 1872 px on the long edge (notebooks) or 144 dpi
+      (PDF-backed pages).
+    - region: PNG crop box [left, top, right, bottom] as fractions of the page
+      (0-1), e.g. [0, 0.5, 1, 0.75] for the third quarter of the page. Combine
+      with dpi to inspect one area closely without a huge image.
     </parameters>
     <examples>
     - remarkable_image("UI Mockup")  # Get first page as embedded PNG resource
@@ -1899,6 +1964,8 @@ async def remarkable_image(
     - remarkable_image("Notes", include_ocr=True)  # Get image with OCR text extraction
     - remarkable_image("Annotated PDF")  # PDF + annotations composited automatically
     - remarkable_image("Annotated PDF", render_merged=False)  # Annotation layer only
+    - remarkable_image("Worksheet", page=2, dpi=300)  # Full page at 300 dpi
+    - remarkable_image("Worksheet", page=2, dpi=300, region=[0, 0.4, 1, 0.6])  # One band
     </examples>
     """
     try:
@@ -1940,6 +2007,27 @@ async def remarkable_image(
                 message=f"Invalid format: '{output_format}'. Supported formats: png, svg",
                 suggestion="Use output_format='png' for raster or 'svg' for vectors.",
             )
+
+        if (dpi is not None or region is not None) and format_lower != "png":
+            return make_error(
+                error_type="invalid_parameter",
+                message="dpi and region apply to PNG output only.",
+                suggestion="Use output_format='png' with dpi or region.",
+            )
+        if dpi is not None and not (MIN_IMAGE_DPI <= dpi <= MAX_IMAGE_DPI):
+            return make_error(
+                error_type="invalid_parameter",
+                message=f"dpi must be between {MIN_IMAGE_DPI} and {MAX_IMAGE_DPI}.",
+                suggestion="Use dpi=300 to read handwriting; add region to keep images small.",
+            )
+        if region is not None:
+            region_error = _image_region_error(region)
+            if region_error:
+                return make_error(
+                    error_type="invalid_parameter",
+                    message=region_error,
+                    suggestion="Example: region=[0, 0.5, 1, 0.75] for the third quarter.",
+                )
 
         raw_doc = await run_blocking(client.download, target_doc)
         native_pdf = raw_doc if _is_pdf_payload(raw_doc) else None
@@ -2074,6 +2162,7 @@ async def remarkable_image(
                         render_tablet_pdf_page_to_png,
                         native_pdf,
                         page,
+                        dpi=dpi,
                     )
                     rendered_via_pdf = png_data is not None
                 else:
@@ -2090,6 +2179,8 @@ async def remarkable_image(
                         background,
                         use_merged,
                         render_merged is not False,
+                        dpi,
+                        dpi is not None or region is not None,
                     )
 
                 if png_data is None:
@@ -2104,6 +2195,14 @@ async def remarkable_image(
                             "remarkable_read() to extract text instead."
                         ),
                     )
+
+                if region is not None:
+                    png_data = await run_blocking(_crop_png, png_data, region)
+                render_info = {}
+                if dpi is not None:
+                    render_info["dpi"] = dpi
+                if region is not None:
+                    render_info["region"] = region
 
                 # Handle OCR if requested - extract text from the image
                 ocr_text = None
@@ -2179,6 +2278,7 @@ async def remarkable_image(
                         "expires_at": image_resource.expires_at.isoformat(),
                         "merged": is_merged,
                         "render_source": "tablet_pdf" if rendered_via_pdf else "strokes",
+                        **render_info,
                         **ocr_info,
                     }
                     return make_response(response_data, hint)
@@ -2194,6 +2294,10 @@ async def remarkable_image(
 
                     info_text = f"Page {page}/{total_pages} of '{target_doc.VissibleName}' as PNG. "
                     info_text += f"Resource URI: {resource_uri}"
+                    if dpi is not None:
+                        info_text += f"\nRendered at {dpi} dpi."
+                    if region is not None:
+                        info_text += f"\nCropped to region {region} (fractions of the page)."
                     if is_merged:
                         info_text += "\nRendered with PDF + annotation compositing."
                     if rendered_via_pdf:
