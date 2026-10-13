@@ -51,22 +51,25 @@ def test_typed_text_drawn_as_outlines_at_text_box_origin():
     assert stretch == 1.0
 
 
-def test_line_shifted_so_highlight_starts_at_its_box():
+def test_highlighted_words_centered_and_resting_on_box_bottom():
     blocks = _blocks()
     text = next(b.value for b in blocks if type(b).__name__ == "RootTextBlock")
     _, baseline, _ = _line(_v6_text_elements_with_bounds(blocks)[0])
     words_start = text.pos_x + _typed_text_width("Test Text testing ", 30, False)
     words_width = _typed_text_width("highlighted text", 30, False)
 
-    # The tablet's box starts 3 units later than Noto Sans puts the words and
-    # extends past their end, as it does on the tablet.
+    # The tablet's box is padded around the words: 8 units each side here,
+    # starting 3 units later than Noto Sans puts them.
+    box_x = words_start + 3 - 8
     elements, _, _ = _v6_text_elements_with_bounds(
-        _with_highlight(blocks, words_start + 3, words_width + 16, baseline)
+        _with_highlight(blocks, box_x, words_width + 16, baseline)
     )
 
-    x, _, stretch = _line(elements)
+    x, new_baseline, stretch = _line(elements)
     assert stretch == 1.0
     assert abs(x - (text.pos_x + 3)) < 0.1
+    # Descenders reach the box's bottom edge (box bottom is baseline + 7).
+    assert abs(new_baseline + 0.24 * 30 - (baseline + 7)) < 0.1
 
 
 def test_line_squeezed_when_words_overrun_their_box():
@@ -83,8 +86,8 @@ def test_line_squeezed_when_words_overrun_their_box():
 
     x, _, stretch = _line(elements)
     assert abs(stretch - 0.9) < 1e-3
-    # The highlighted words start at the box's left edge after squeezing.
-    assert abs(x + stretch * prefix - box_x) < 0.1
+    # The squeezed words fill the box, centered.
+    assert abs(x + stretch * (prefix + words_width / 2) - (box_x + words_width * 0.45)) < 0.1
 
 
 def test_highlight_on_another_line_leaves_text_alone():

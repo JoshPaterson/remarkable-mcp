@@ -179,8 +179,9 @@ them: notebook pages render on a plain background.
 Typed text on notebook pages is drawn in Noto Sans. The tablet uses its own
 font, reMarkable Sans, which cannot be included; Noto Sans has nearly the same
 letter widths, so words land within about 2% of where the tablet puts them.
-Where typed text is highlighted, the line is shifted (and squeezed if needed)
-so the highlighted words sit in the tablet's highlight box.
+Where typed text is highlighted, the line is moved (and squeezed if needed) so
+the highlighted words sit in the tablet's highlight box as they do on the
+tablet: centered across it, with descenders touching its bottom edge.
 
 ### Smart Features
 
