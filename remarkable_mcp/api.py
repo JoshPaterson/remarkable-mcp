@@ -6,8 +6,9 @@ import json as json_module
 import logging
 import os
 import threading
+from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -296,6 +297,21 @@ def register_and_get_token(one_time_code: str) -> str:
         return token_json
     except Exception as e:
         raise RuntimeError(str(e))
+
+
+def document_version(doc) -> Optional[str]:
+    """A string that changes whenever a document's stored content changes.
+
+    Cloud documents carry the hash of their blob index, which changes when the
+    tablet uploads any file, even when the tablet's ``modified`` time stays the
+    same. Other transports fall back to the modified time.
+    """
+    parts = [
+        str(value)
+        for value in (getattr(doc, "hash", None), getattr(doc, "ModifiedClient", None))
+        if isinstance(value, (str, int, float, datetime)) and value
+    ]
+    return "|".join(parts) or None
 
 
 def get_items_by_id(collection) -> Dict[str, Any]:

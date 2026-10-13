@@ -27,6 +27,7 @@ from mcp.types import (
 
 from remarkable_mcp.api import (
     REMARKABLE_TOKEN,
+    document_version,
     download_raw_file,
     get_file_type,
     get_item_path,
@@ -653,6 +654,7 @@ async def remarkable_read(
                     target_doc.ID,
                     include_ocr=True,
                     ocr_backend=None,
+                    version=document_version(target_doc),
                 )
                 if cached and cached.get("handwritten_text"):
                     notebook_pages = cached["handwritten_text"]
@@ -677,6 +679,7 @@ async def remarkable_read(
                             tmp_path,
                             include_ocr=include_ocr,
                             doc_id=target_doc.ID,
+                            version=document_version(target_doc),
                         )
                         if content.get("handwritten_text"):
                             notebook_pages = content["handwritten_text"]
@@ -703,6 +706,7 @@ async def remarkable_read(
                                 tmp_path,
                                 include_ocr=include_ocr,
                                 doc_id=target_doc.ID,
+                                version=document_version(target_doc),
                             )
                         finally:
                             tmp_path.unlink(missing_ok=True)
@@ -1423,6 +1427,7 @@ async def remarkable_recent(limit: int = 10, include_preview: bool = False) -> s
                                 tmp_path,
                                 include_ocr=False,
                                 doc_id=doc.ID,
+                                version=document_version(doc),
                             )
                             preview_text = "\n".join(content["typed_text"])[:200]
                             if preview_text:
@@ -2615,6 +2620,7 @@ def _publish_document_export(
                     archive_path,
                     include_ocr=include_ocr,
                     doc_id=resolved.document_id,
+                    version=document_version(target_doc),
                 )
                 if resolved.page_count is None:
                     extracted_pages = int(extraction.get("pages") or 0)
