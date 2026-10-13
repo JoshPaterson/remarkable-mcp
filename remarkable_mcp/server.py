@@ -122,6 +122,9 @@ Use `remarkable_image` when you need visual context:
 
 Example: `remarkable_image("UI Mockup", page=1)` returns a PNG image
 Example: `remarkable_image("Notes", include_ocr=True)` returns image with extracted text
+Notebook page templates (dots, lines, grids) are not part of the document and are
+not drawn; pages render on a plain background. remarkable_read lists each page's
+template.
 
 ### Exporting a Document
 Use `remarkable_export` for a complete PDF or structured Markdown artifact.

@@ -63,6 +63,7 @@ from remarkable_mcp.extract import (
 )
 from remarkable_mcp.responses import make_error, make_response
 from remarkable_mcp.server import mcp
+from remarkable_mcp.templates import group_pages
 
 logger = logging.getLogger(__name__)
 
@@ -626,6 +627,14 @@ async def remarkable_read(
                 if other_highlights:
                     annotation_parts.append("\n--- Highlights ---")
                     annotation_parts.extend(other_highlights)
+                page_templates = content.get("page_templates") or []
+                if page_templates:
+                    annotation_parts.append("\n--- Page templates ---")
+                    for first, last, name in group_pages(
+                        [(t["page"], t["template"]) for t in page_templates]
+                    ):
+                        pages = f"Page {first}" if first == last else f"Pages {first}-{last}"
+                        annotation_parts.append(f"{pages}: {name}")
                 if content.get("handwritten_text"):
                     annotation_parts.append("\n--- Handwritten (OCR) ---")
                     annotation_parts.extend(content["handwritten_text"])
@@ -896,6 +905,8 @@ async def remarkable_read(
         tags = getattr(target_doc, "tags", None) or (content.get("tags") if content else None)
         if tags:
             result["tags"] = tags
+        if content and content.get("page_templates"):
+            result["page_templates"] = content["page_templates"]
 
         if has_more:
             result["next_page"] = page + 1

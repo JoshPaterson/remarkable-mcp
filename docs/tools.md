@@ -101,6 +101,14 @@ remarkable_read("/Work/Projects/Q4 Planning")
 }
 ```
 
+### Page templates
+
+Notebook pages name their template (page background) in the document's
+`.content` file. Non-blank templates are listed under `--- Page templates ---`
+and returned as `page_templates: [{"page": 1, "template": "P Dots S"}]`.
+Templates are not part of the document, so `remarkable_image` does not draw
+them: notebook pages render on a plain background.
+
 ### Smart Features
 
 - **Auto-OCR**: If a notebook has no typed text and `include_ocr=False`, OCR is automatically enabled and you're notified via `_ocr_auto_enabled: true`

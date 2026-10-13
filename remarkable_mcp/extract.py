@@ -14,6 +14,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from xml.sax.saxutils import escape as _xml_escape
 
+from remarkable_mcp.templates import BLANK_TEMPLATE, content_page_templates
+
 logger = logging.getLogger(__name__)
 
 
@@ -2024,6 +2026,9 @@ def extract_text_from_document_zip(
                  "highlights": [str]}, # highlighted text on the page
             ],
             "ocr_backend": str,        # Which OCR backend was used (if any)
+            "page_templates": [        # Non-blank notebook page templates
+                {"page": int, "template": str},
+            ],
         }
     """
     cache_token = None
@@ -2046,6 +2051,7 @@ def extract_text_from_document_zip(
         "annotated_pages": [],
         "ocr_backend": None,
         "tags": [],
+        "page_templates": [],
     }
 
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -2065,6 +2071,12 @@ def extract_text_from_document_zip(
                 # Fallback: pages array directly
                 elif "pages" in data and isinstance(data["pages"], list):
                     page_order = data["pages"]
+                templates = content_page_templates(data)
+                result["page_templates"] = [
+                    {"page": i + 1, "template": templates[page_id]}
+                    for i, page_id in enumerate(page_order)
+                    if templates.get(page_id, BLANK_TEMPLATE) != BLANK_TEMPLATE
+                ]
             except Exception:
                 # Malformed .content file - continue without page order
                 pass
