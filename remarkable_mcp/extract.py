@@ -17,12 +17,7 @@ from xml.sax.saxutils import escape as _xml_escape
 from remarkable_mcp.colors import color_info, render_color
 from remarkable_mcp.pages import content_page_ids, deleted_page_ids, has_cpages, live_cpages_entries
 from remarkable_mcp.tags import page_tag_entries
-from remarkable_mcp.templates import (
-    BLANK_TEMPLATE,
-    content_page_templates,
-    page_template,
-    template_elements,
-)
+from remarkable_mcp.templates import BLANK_TEMPLATE, content_page_templates
 
 logger = logging.getLogger(__name__)
 
@@ -1309,11 +1304,9 @@ def _render_rm_v6_to_svg(rm_file_path: Path, layers: Optional[str] = None) -> Op
         paths, all_coords = _v6_paths_from_blocks(
             blocks, anchor_pos, layers, _page_image_dir(rm_file_path)
         )
-        background = template_elements(page_template(rm_file_path), *_v6_paper_size(blocks))
-        # The page template is drawn first, then typed text, then strokes
-        # (handwriting layers on top). The typed text extent is folded into the
-        # crop so a text-only page still renders.
-        return _svg_from_paths(background + text_elements + paths, all_coords + text_coords)
+        # Typed text is drawn under strokes (handwriting layers on top), and its
+        # extent is folded into the crop so a text-only page still renders.
+        return _svg_from_paths(text_elements + paths, all_coords + text_coords)
     except Exception:
         return None
 
@@ -1487,10 +1480,9 @@ def render_rm_file_full_page_png(
     except Exception:
         return None
 
-    # The page template is drawn first, then typed text, so handwritten
-    # strokes layer on top, matching the device's compositing order.
-    background = template_elements(page_template(rm_file_path), paper_w, paper_h)
-    svg = _svg_full_page(background + text_elements + paths, paper_w, paper_h)
+    # Typed text is drawn first so handwritten strokes layer on top of it,
+    # matching the device's compositing order.
+    svg = _svg_full_page(text_elements + paths, paper_w, paper_h)
     scale = _full_page_scale(paper_w, paper_h, dpi)
     output_width = max(1, round(paper_w * scale))
     output_height = max(1, round(paper_h * scale))

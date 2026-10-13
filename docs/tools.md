@@ -171,8 +171,8 @@ that is moved comes to the top.
 Notebook pages name their template (page background) in the document's
 `.content` file. Non-blank templates are listed under `--- Page templates ---`
 and returned as `page_templates: [{"page": 1, "template": "P Dots S"}]`.
-`remarkable_image` draws the small dot grid (`P Dots S`) under the page's
-content; other templates are reported but not drawn.
+Templates are not part of the document, so `remarkable_image` does not draw
+them: notebook pages render on a plain background.
 
 ### Smart Features
 

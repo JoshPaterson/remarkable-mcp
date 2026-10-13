@@ -134,6 +134,9 @@ Use `remarkable_image` when you need visual context:
 
 Example: `remarkable_image("UI Mockup", page=1)` returns a PNG image
 Example: `remarkable_image("Notes", include_ocr=True)` returns image with extracted text
+Notebook page templates (dots, lines, grids) are not part of the document and are
+not drawn; pages render on a plain background. remarkable_read lists each page's
+template.
 Example: `remarkable_image("Notes", page=2, dpi=300)` renders the whole page at 300 dpi,
 enough to read small handwriting
 Example: `remarkable_image("Notes", page=2, dpi=300, region=[0, 0.5, 1, 0.75])` crops
