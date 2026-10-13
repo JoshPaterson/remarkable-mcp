@@ -139,7 +139,7 @@ When `more: true`, use the `page` parameter to continue reading.
 |-----------|------|---------|-------------|
 | `path` | string | `"/"` | Folder path to browse |
 | `query` | string | `None` | Search documents by name |
-| `tags` | list[string] | `None` | Match documents carrying any listed tag (case-insensitive). Searches the folder and all its subfolders. |
+| `tags` | list[string] | `None` | Match documents carrying any listed tag as a document or page tag (case-insensitive). Searches the folder and all its subfolders. |
 
 ### Examples
 

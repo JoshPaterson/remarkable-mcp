@@ -48,7 +48,11 @@ def test_cloud_document_tags_are_read_from_content_blob():
             {"visibleName": "S0.2-06 Layers and tags test", "type": "DocumentType"}
         ).encode(),
         "content-hash": json.dumps(
-            {"fileType": "pdf", "tags": [{"name": "test-doc", "timestamp": 1}]}
+            {
+                "fileType": "pdf",
+                "tags": [{"name": "test-doc", "timestamp": 1}],
+                "pageTags": [{"name": "test-page", "pageId": "p3", "timestamp": 2}],
+            }
         ).encode(),
     }
     client = RemarkableClient.__new__(RemarkableClient)
@@ -58,9 +62,10 @@ def test_cloud_document_tags_are_read_from_content_blob():
 
     assert doc is not None
     assert doc.tags == ["test-doc"]
+    assert doc.page_tags == ["test-page"]
 
 
-def _item(name, item_id, parent, *, folder=False, tags=None):
+def _item(name, item_id, parent, *, folder=False, tags=None, page_tags=None):
     item = Mock()
     item.VissibleName = name
     item.ID = item_id
@@ -68,6 +73,7 @@ def _item(name, item_id, parent, *, folder=False, tags=None):
     item.is_folder = folder
     item.ModifiedClient = None
     item.tags = tags or []
+    item.page_tags = page_tags or []
     return item
 
 
@@ -80,6 +86,7 @@ def _library():
             "d-tagged",
             "f-ws",
             tags=[{"name": "test-doc", "timestamp": 1}],
+            page_tags=["test-page"],
         ),
         _item("S0.2-07 Highlight colors test", "d-plain", "f-ws"),
         _item("Elsewhere", "d-root", "", tags=[{"name": "test-doc", "timestamp": 1}]),
@@ -133,3 +140,27 @@ async def test_search_mode_tag_filter_matches_content_tags():
 
     assert [r["name"] for r in data["results"]] == ["S0.2-06 Layers and tags test"]
     assert data["results"][0]["tags"] == ["test-doc"]
+
+
+@pytest.mark.asyncio
+async def test_browse_tag_filter_matches_page_tags():
+    data = await _call_with_library("remarkable_browse", {"path": "/", "tags": ["TEST-PAGE"]})
+
+    assert [d["id"] for d in data["documents"]] == ["d-tagged"]
+    assert data["documents"][0]["page_tags"] == ["test-page"]
+
+
+@pytest.mark.asyncio
+async def test_search_results_include_page_tags():
+    client = Mock()
+    client.get_meta_items.return_value = _library()
+    read = json.dumps({"content": "text", "total_pages": 3})
+    with (
+        patch("remarkable_mcp.tools.get_rmapi", return_value=client),
+        patch("remarkable_mcp.tools._is_cloud_archived", return_value=False),
+        patch("remarkable_mcp.tools.remarkable_read", return_value=read),
+    ):
+        data = _result_json(await _call_tool("remarkable_search", {"query": "Layers and tags"}))
+
+    assert data["documents"][0]["tags"] == ["test-doc"]
+    assert data["documents"][0]["page_tags"] == ["test-page"]

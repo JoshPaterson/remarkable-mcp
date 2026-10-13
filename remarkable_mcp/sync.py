@@ -26,7 +26,7 @@ from typing import Any, Dict, List, Optional
 import requests
 from requests.adapters import HTTPAdapter
 
-from remarkable_mcp.tags import document_tag_names
+from remarkable_mcp.tags import document_tag_names, page_tag_names
 
 logger = logging.getLogger(__name__)
 
@@ -340,6 +340,7 @@ class Document:
     size: int = 0
     files: List[Dict[str, Any]] = field(default_factory=list)
     tags: List[str] = field(default_factory=list)
+    page_tags: List[str] = field(default_factory=list)
 
     @property
     def is_folder(self) -> bool:
@@ -643,6 +644,7 @@ class RemarkableClient:
             size=entry["size"],
             files=files,
             tags=document_tag_names(metadata, content),
+            page_tags=page_tag_names(content),
         )
 
     def get_doc(self, doc_id: str) -> Optional[Document]:

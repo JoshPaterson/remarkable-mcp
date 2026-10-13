@@ -75,6 +75,7 @@ class Document:
     size: int = 0
     files: List[Dict[str, Any]] = field(default_factory=list)
     tags: List[str] = field(default_factory=list)
+    page_tags: List[str] = field(default_factory=list)
     # SSH-specific: local path to the document folder
     local_path: Optional[str] = None
 

@@ -31,6 +31,13 @@ def document_tag_names(metadata: Optional[dict], content: Optional[dict]) -> Lis
     return []
 
 
+def page_tag_names(content: Optional[dict]) -> List[str]:
+    """Distinct page tag names in a ``.content`` dict."""
+    if not isinstance(content, dict):
+        return []
+    return tag_names(t for t in content.get("pageTags") or () if isinstance(t, dict))
+
+
 def matches_tags(item_tags: Optional[Iterable[Any]], wanted: Iterable[str]) -> bool:
     """True if any wanted tag matches one of ``item_tags`` (case-insensitive)."""
     have = {name.lower() for name in tag_names(item_tags)}

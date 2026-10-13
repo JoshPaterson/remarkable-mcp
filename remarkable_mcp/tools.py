@@ -214,6 +214,17 @@ def _item_tags(item) -> List[str]:
     return tag_names(tags) if isinstance(tags, (list, tuple)) else []
 
 
+def _item_page_tags(item) -> List[str]:
+    """Page tag names for a listed document (empty when the transport has none)."""
+    tags = getattr(item, "page_tags", None)
+    return tag_names(tags) if isinstance(tags, (list, tuple)) else []
+
+
+def _matches_item_tags(item, wanted: List[str]) -> bool:
+    """True if a document or one of its pages carries any wanted tag."""
+    return matches_tags(_item_tags(item), wanted) or matches_tags(_item_page_tags(item), wanted)
+
+
 def _descendant_items(items_by_parent: dict, parent_id: str) -> List:
     """All items below ``parent_id`` in the folder tree, depth-first."""
     found = []
@@ -983,7 +994,8 @@ async def remarkable_browse(
     2. Search mode: Find documents by name
        - Set query="search term" to search across all documents
     3. Filter by tags: Find documents with specific tags
-       - Set tags=["tag1", "tag2"] to list documents carrying any of the tags
+       - Set tags=["tag1", "tag2"] to list documents carrying any of the tags,
+         as document tags or page tags
        - In browse mode, searches the folder and all of its subfolders
        - Works in both browse and search modes
 
@@ -1029,7 +1041,7 @@ async def remarkable_browse(
                 if not _is_within_root(item_path, root):
                     continue
                 # Filter by tags if provided
-                if tags and not matches_tags(_item_tags(item), tags):
+                if tags and not _matches_item_tags(item, tags):
                     continue
                 if query_lower in item.VissibleName.lower():
                     match_info = {
@@ -1044,6 +1056,9 @@ async def remarkable_browse(
                     item_tags = _item_tags(item)
                     if item_tags:
                         match_info["tags"] = item_tags
+                    item_page_tags = _item_page_tags(item)
+                    if item_page_tags:
+                        match_info["page_tags"] = item_page_tags
                     matches.append(match_info)
 
             matches.sort(key=lambda x: x["name"])
@@ -1167,20 +1182,19 @@ async def remarkable_browse(
             for item in _descendant_items(items_by_parent, target_parent):
                 if item.is_folder or _is_cloud_archived(item):
                     continue
-                item_tags = _item_tags(item)
-                if not matches_tags(item_tags, tags):
+                if not _matches_item_tags(item, tags):
                     continue
-                documents.append(
-                    {
-                        "name": item.VissibleName,
-                        "id": item.ID,
-                        "path": _apply_root_filter(get_item_path(item, items_by_id)),
-                        "modified": (
-                            item.ModifiedClient if hasattr(item, "ModifiedClient") else None
-                        ),
-                        "tags": item_tags,
-                    }
-                )
+                doc_info = {
+                    "name": item.VissibleName,
+                    "id": item.ID,
+                    "path": _apply_root_filter(get_item_path(item, items_by_id)),
+                    "modified": (item.ModifiedClient if hasattr(item, "ModifiedClient") else None),
+                    "tags": _item_tags(item),
+                }
+                item_page_tags = _item_page_tags(item)
+                if item_page_tags:
+                    doc_info["page_tags"] = item_page_tags
+                documents.append(doc_info)
             documents.sort(key=lambda d: d["path"].lower())
         else:
             items = items_by_parent.get(target_parent, [])
@@ -1202,6 +1216,9 @@ async def remarkable_browse(
                     item_tags = _item_tags(item)
                     if item_tags:
                         doc_info["tags"] = item_tags
+                    item_page_tags = _item_page_tags(item)
+                    if item_page_tags:
+                        doc_info["page_tags"] = item_page_tags
                     documents.append(doc_info)
 
         result = {"mode": "browse", "path": path, "folders": folders, "documents": documents}
@@ -1422,6 +1439,8 @@ async def remarkable_search(
             # Include tags if present
             if "tags" in doc:
                 doc_result["tags"] = doc["tags"]
+            if "page_tags" in doc:
+                doc_result["page_tags"] = doc["page_tags"]
 
             try:
                 read_result = await remarkable_read(
