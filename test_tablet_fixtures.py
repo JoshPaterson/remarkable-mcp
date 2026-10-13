@@ -86,6 +86,13 @@ def test_freehand_highlighter_strokes(layers_and_tags):
     assert tops == sorted(tops)
 
 
+def test_document_and_page_tags(layers_and_tags):
+    assert [t["name"] for t in layers_and_tags["tags"]] == ["test-doc"]
+    assert layers_and_tags["page_tags"] == [{"page": 3, "name": "test-page"}]
+    page3 = next(ap for ap in layers_and_tags["annotated_pages"] if ap["page"] == 3)
+    assert page3["page_tags"] == ["test-page"]
+
+
 def test_layers_split_strokes_by_layer(layers_and_tags):
     page3 = next(ap for ap in layers_and_tags["annotated_pages"] if ap["page"] == 3)
 
