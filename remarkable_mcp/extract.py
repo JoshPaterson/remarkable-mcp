@@ -760,9 +760,12 @@ _TEXT_WRAP_LINE_RATIO = 44.0 / 70.0
 _TEXT_CHAR_ADVANCE = 0.5
 
 
-# The tablet sets typed text in Noto Sans (bold paragraphs in Noto Sans Bold).
-# The fonts come from the pymupdf-fonts package; without it, text falls back to
-# a generic sans-serif ``<text>`` element.
+# The tablet sets typed text in reMarkable Sans, a proprietary font. Noto Sans
+# (from the pymupdf-fonts package) at the same size comes closest in letter
+# widths among open fonts, within about 2% per word; lines carrying a
+# highlight are then fitted to the tablet's highlight boxes (see
+# _fit_lines_to_highlights). Without the package, text falls back to a generic
+# sans-serif ``<text>`` element.
 _TYPED_FONTS = {False: "notos", True: "notosbo"}
 
 
@@ -978,8 +981,10 @@ def _v6_text_elements_with_bounds(blocks: list) -> Tuple[list, list, dict]:
             )
         # Wrap long paragraphs to the text box; each wrapped line takes a line,
         # with continuation lines spaced tighter than a paragraph break.
+        offset = 0
         for idx, line in enumerate(_wrap_text(text, box_width, size * _TEXT_CHAR_ADVANCE, measure)):
             y_offset += line_height if idx == 0 else line_height * _TEXT_WRAP_LINE_RATIO
+            offset = text.find(line, offset)
             lines.append(
                 {
                     "x": pos_x,
@@ -988,9 +993,13 @@ def _v6_text_elements_with_bounds(blocks: list) -> Tuple[list, list, dict]:
                     "size": size,
                     "bold": bold,
                     "heading": heading,
+                    "paragraph": text,
+                    "start": offset,
                 }
             )
+            offset += len(line)
     anchor_pos[CrdtId(*_ANCHOR_TEXT_BOTTOM)] = pos_y + y_offset
+    _fit_lines_to_highlights(lines, _typed_text_highlights(blocks))
 
     for index, line in enumerate(lines):
         outline = (
@@ -1000,9 +1009,12 @@ def _v6_text_elements_with_bounds(blocks: list) -> Tuple[list, list, dict]:
         )
         if outline is not None:
             label = _xml_escape(line["text"], {'"': "&quot;"})
+            stretch, shift = line.get("fit", (1.0, 0.0))
+            fit = f" scale({stretch:.4f} 1)" if stretch != 1.0 else ""
             elements.append(
                 f'<g class="typed-text" data-text="{label}" data-size="{line["size"]:.1f}" '
-                f'transform="translate({line["x"]:.1f} {line["baseline"]:.1f})">{outline}</g>'
+                f'transform="translate({line["x"] + shift:.1f} {line["baseline"]:.1f}){fit}">'
+                f"{outline}</g>"
             )
             continue
         family = "serif" if line["heading"] else "sans-serif"
@@ -1021,9 +1033,97 @@ def _v6_text_elements_with_bounds(blocks: list) -> Tuple[list, list, dict]:
         )
         if box_width > 0:
             width = min(width, box_width)
-        coords.append((line["x"], line["baseline"] - line["size"]))
-        coords.append((line["x"] + width, line["baseline"] + line["size"] * 0.3))
+        stretch, shift = line.get("fit", (1.0, 0.0))
+        coords.append((line["x"] + shift, line["baseline"] - line["size"]))
+        coords.append((line["x"] + shift + width * stretch, line["baseline"] + line["size"] * 0.3))
     return elements, coords, anchor_pos
+
+
+def _typed_text_highlights(blocks: list) -> List[Tuple[str, list]]:
+    """``(text, rectangles)`` of each live text highlight on a page.
+
+    A later block for the same item replaces an earlier one; a block without a
+    value deletes the item.
+    """
+    latest: Dict[Any, Any] = {}
+    for block in blocks:
+        item = getattr(block, "item", None)
+        if item is not None and hasattr(item, "item_id"):
+            latest[item.item_id] = getattr(item, "value", None)
+    highlights = []
+    for item in latest.values():
+        if type(item).__name__ == "GlyphRange" and getattr(item, "text", None):
+            rects = [r for r in getattr(item, "rectangles", None) or [] if r.w > 0]
+            if rects:
+                highlights.append((item.text, rects))
+    return highlights
+
+
+def _fit_lines_to_highlights(lines: List[Dict[str, Any]], highlights: list) -> None:
+    """Fit typed lines to the tablet's highlight boxes over them.
+
+    The file stores no line widths, only the text box; a highlight over typed
+    text, however, stores the tablet-computed box of the highlighted words.
+    For each line carrying such a highlight, sets ``line["fit"] = (stretch,
+    shift)``: the line is shifted so each highlighted span starts at its box's
+    left edge, and squeezed only if a span would run past its box's right
+    edge. Boxes extend past the words' end on the tablet, so spans are never
+    stretched to fill them. Lines in another font than the tablet's (no
+    outlines available) are left alone.
+    """
+    for text, rects in highlights:
+        for rect in rects:
+            center = rect.y + rect.h / 2
+            line = next(
+                (
+                    candidate
+                    for candidate in lines
+                    if not candidate["heading"]
+                    and candidate["baseline"] - candidate["size"] * 1.5
+                    <= center
+                    <= candidate["baseline"] + candidate["size"] * 0.5
+                ),
+                None,
+            )
+            if line is None or _typed_font(line["bold"]) is None:
+                continue
+            span = _highlight_span_on_line(line, text)
+            if span is None:
+                continue
+            first, last = span
+
+            def width(chars: str, line=line) -> float:
+                return _typed_text_width(chars, line["size"], line["bold"])
+
+            start = width(line["text"][:first])
+            span_width = width(line["text"][first:last])
+            stretch = min(1.0, rect.w / span_width) if span_width > 0 else 1.0
+            shift = (rect.x - line["x"]) - stretch * start
+            line.setdefault("pairs", []).append((stretch, shift))
+    for line in lines:
+        pairs = line.pop("pairs", None)
+        if pairs:
+            stretch = min(p[0] for p in pairs)
+            shift = sum(p[1] for p in pairs) / len(pairs)
+            line["fit"] = (stretch, shift)
+
+
+def _highlight_span_on_line(line: Dict[str, Any], text: str) -> Optional[Tuple[int, int]]:
+    """Character range of a highlight's text within one wrapped line, or None.
+
+    The highlight's text is located in the line's paragraph, so a highlight
+    wrapping onto several lines yields its part on this line.
+    """
+    paragraph, line_start = line["paragraph"], line["start"]
+    line_end = line_start + len(line["text"])
+    position = paragraph.find(text.strip())
+    while position != -1:
+        end = position + len(text.strip())
+        first, last = max(position, line_start), min(end, line_end)
+        if first < last:
+            return first - line_start, last - line_start
+        position = paragraph.find(text.strip(), position + 1)
+    return None
 
 
 def _render_rm_v6_to_svg(rm_file_path: Path) -> Optional[str]:
