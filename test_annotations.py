@@ -434,3 +434,22 @@ async def test_read_annotations_summarizes_highlighter_strokes():
     assert "Page 2: handwritten notes, 2 highlighter strokes (pink, yellow)" in data["content"]
     assert "  ~ [yellow] highlighter stroke, region [0.1, 0.4, 0.4, 0.45]" in data["content"]
     assert [h["color"] for h in data["highlighter_strokes"]] == ["pink", "yellow"]
+
+
+def test_highlighter_stroke_position_follows_text_anchor(tmp_path):
+    """Strokes in a group anchored to typed text are placed like the renderer places them."""
+    from unittest.mock import patch
+
+    rm_file = tmp_path / "page.rm"
+    rm_file.write_bytes(
+        build_rm([("Layer 1", True, [stroke(5, HIGHLIGHTER, [(-50, 100), (150, 120)])])])
+    )
+    layer_node = CrdtId(0, 10)
+
+    with patch(
+        "remarkable_mcp.extract._v6_anchor_offsets",
+        return_value={layer_node: (-464.0, 300.0)},
+    ):
+        details = _page_annotation_details(rm_file)
+
+    assert details["highlighter_strokes"][0]["bbox"] == [-515.0, 399.0, -313.0, 421.0]
