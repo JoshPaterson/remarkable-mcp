@@ -348,6 +348,10 @@ async def remarkable_read(
       may not be synced to the cloud).
     - "annotations": Only annotations, highlights, and handwritten notes
 
+    Highlight text comes from the PDF's text layer and often misses mathematical
+    symbols and equations. When the exact highlighted content matters, render the
+    highlight's region with remarkable_image(document, page, region=...).
+
     Use pagination to read large documents without overwhelming context:
     - Start with page=1 (default)
     - Check "more" field - if true, there's more content
@@ -627,7 +631,8 @@ async def remarkable_read(
                         for h in details:
                             color = h.get("color")
                             prefix = f"[{color}] " if color else ""
-                            annotation_parts.append(f"  • {prefix}{h['text']}")
+                            suffix = f"   region {h['region']}" if h.get("region") else ""
+                            annotation_parts.append(f"  • {prefix}{h['text']}{suffix}")
                             shown_highlights.add(h["text"])
                         for h in strokes:
                             location = f", region {h['region']}" if h.get("region") else ""

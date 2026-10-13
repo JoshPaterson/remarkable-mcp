@@ -2031,6 +2031,25 @@ def _locate_on_page(
     return mm, region
 
 
+def _place_highlight(highlight: Dict[str, Any], frame: Tuple[float, float, float]) -> None:
+    """Replace a highlight's stroke-unit ``rects`` with page positions.
+
+    Adds ``rects_mm`` (one box per line or piece), and ``bbox_mm`` and
+    ``region`` for the box around all of them.
+    """
+    rects = highlight.pop("rects", None)
+    if not rects:
+        return
+    highlight["rects_mm"] = [_locate_on_page(r, frame)[0] for r in rects]
+    union = [
+        min(r[0] for r in rects),
+        min(r[1] for r in rects),
+        max(r[2] for r in rects),
+        max(r[3] for r in rects),
+    ]
+    highlight["bbox_mm"], highlight["region"] = _locate_on_page(union, frame)
+
+
 def _page_annotation_details(rm_file: Path) -> Dict[str, Any]:
     """Extract a page's highlights, highlighter strokes and pen-stroke presence.
 
@@ -2090,6 +2109,10 @@ def _page_annotation_details(rm_file: Path) -> Dict[str, Any]:
                 entry.update(
                     color_info(getattr(item, "color", None), getattr(item, "color_rgba", None))
                 )
+                entry["rects"] = [
+                    [r.x, r.y, r.x + getattr(r, "w", 0.0), r.y + getattr(r, "h", 0.0)]
+                    for r in rects
+                ]
                 highlights.append((y, x, entry))
     except Exception:
         pass
@@ -2249,23 +2272,27 @@ def extract_text_from_document_zip(
                 )
                 result["highlights"].extend(page_highlights)
         result["annotated_pages"].sort(key=lambda a: a["page"])
-        result["highlight_details"] = [
-            {"page": ap["page"], **h}
-            for ap in result["annotated_pages"]
-            for h in ap["highlight_details"]
-        ]
-        # Place highlighter strokes on the page as rendered
-        if any(ap["highlighter_strokes"] for ap in result["annotated_pages"]):
+        # Place highlights and highlighter strokes on the page as rendered
+        if any(
+            ap["highlighter_strokes"] or ap["highlight_details"] for ap in result["annotated_pages"]
+        ):
             pdf_sizes = _pdf_page_sizes(tmpdir_path)
             rm_by_stem = {f.stem: f for f in rm_files}
             for ap in result["annotated_pages"]:
-                if not ap["highlighter_strokes"]:
+                if not (ap["highlighter_strokes"] or ap["highlight_details"]):
                     continue
                 frame = _page_frame(
                     tmpdir_path, ap["page"], rm_by_stem.get(ap["page_id"]), pdf_sizes
                 )
                 for stroke in ap["highlighter_strokes"]:
                     stroke["bbox_mm"], stroke["region"] = _locate_on_page(stroke.pop("bbox"), frame)
+                for highlight in ap["highlight_details"]:
+                    _place_highlight(highlight, frame)
+        result["highlight_details"] = [
+            {"page": ap["page"], **h}
+            for ap in result["annotated_pages"]
+            for h in ap["highlight_details"]
+        ]
         result["highlighter_strokes"] = [
             {"page": ap["page"], **h}
             for ap in result["annotated_pages"]

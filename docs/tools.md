@@ -118,6 +118,20 @@ is a custom color named from the stored ARGB value, or `#rrggbb` when the value
 is not a known highlighter color. `color_hex` is set only when the tablet stores
 an ARGB value.
 
+Each highlight also gives its position, as `[left, top, right, bottom]` from
+the page's top-left corner: `rects_mm`, one box per line or piece; `bbox_mm`,
+the box around all of them; and `region`, that box as fractions of the page,
+which can be passed to `remarkable_image(region=...)`. The text output shows
+the region after the text:
+
+```
+  • [pink] Estimate the remainder for a Taylor series   region [0.177, 0.206, 0.479, 0.219]
+```
+
+Highlight text comes from the PDF's text layer and often misses mathematical
+symbols and equations. When the exact highlighted content matters, render the
+highlight's `region` with `remarkable_image`.
+
 Highlighter strokes that did not snap to text (freehand highlighter ink) are
 summarized per page, e.g. `Page 2: 2 highlighter strokes (pink, yellow)`, and
 returned as `highlighter_strokes` with `page`, the same color fields, and the

@@ -434,3 +434,80 @@ async def test_read_annotations_summarizes_highlighter_strokes():
     assert "Page 2: handwritten notes, 2 highlighter strokes (pink, yellow)" in data["content"]
     assert "  ~ [yellow] highlighter stroke, region [0.1, 0.4, 0.4, 0.45]" in data["content"]
     assert [h["color"] for h in data["highlighter_strokes"]] == ["pink", "yellow"]
+
+
+# --- highlight positions ----------------------------------------------------
+
+
+def _two_line_glyph() -> si.GlyphRange:
+    text = "a highlight that wraps onto a second line"
+    return si.GlyphRange(
+        start=None,
+        length=len(text),
+        text=text,
+        color=si.PenColor(5),
+        rectangles=[
+            si.Rectangle(x=100.0, y=500.0, w=300.0, h=24.0),
+            si.Rectangle(x=-600.0, y=530.0, w=110.0, h=24.0),
+        ],
+    )
+
+
+def test_highlight_positions_per_piece_and_overall(tmp_path):
+    zip_path = write_document_zip(
+        tmp_path / "doc.zip",
+        {"p1": build_rm([("Layer 1", True, [_two_line_glyph()])])},
+        {"pages": ["p1"]},
+    )
+
+    highlight = extract_text_from_document_zip(zip_path)["highlight_details"][0]
+
+    assert "rects" not in highlight
+    assert len(highlight["rects_mm"]) == 2
+    # 0.3177 pt per unit; x is centered on the 1404-unit page.
+    assert highlight["rects_mm"][0] == [89.9, 56.0, 123.5, 58.7]
+    assert highlight["rects_mm"][1] == [11.4, 59.4, 23.8, 62.1]
+    assert highlight["bbox_mm"] == [11.4, 56.0, 123.5, 62.1]
+    assert highlight["region"] == [0.073, 0.267, 0.785, 0.296]
+
+
+async def test_read_annotations_shows_highlight_region():
+    details = [
+        {
+            "text": "Estimate the remainder for a Taylor series",
+            "color": "pink",
+            "region": [0.177, 0.206, 0.479, 0.219],
+        },
+        {
+            "text": "Therefore, at the",
+            "color": "blue",
+            "region": [0.096, 0.674, 0.27, 0.687],
+        },
+    ]
+    data = await _read_annotations(
+        {
+            "typed_text": [],
+            "highlights": [d["text"] for d in details],
+            "highlight_details": [{"page": 2, **d} for d in details],
+            "handwritten_text": None,
+            "pages": 2,
+            "page_ids": ["p1", "p2"],
+            "annotated_pages": [
+                {
+                    "page": 2,
+                    "page_id": "p2",
+                    "has_handwriting": False,
+                    "highlights": [d["text"] for d in details],
+                    "highlight_details": details,
+                }
+            ],
+            "ocr_backend": None,
+            "tags": [],
+        }
+    )
+
+    assert (
+        "  • [pink] Estimate the remainder for a Taylor series"
+        "   region [0.177, 0.206, 0.479, 0.219]" in data["content"]
+    )
+    assert "  • [blue] Therefore, at the   region [0.096, 0.674, 0.27, 0.687]" in data["content"]
