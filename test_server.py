@@ -6253,9 +6253,8 @@ class TestFullPageRender:
         try:
             elements = _v6_text_svg_elements(_v6_blocks(rm_path))
             y = float(re.search(r'y="([-\d.]+)"', elements[0]).group(1))
-            # pos_y(234) + TOP(-39) + line_height(70) == 265 for a 1404x1872 page;
-            # comfortably below the old value of 216.
-            assert 255 <= y <= 275
+            # pos_y(234) + TOP(63) + line_height(70) == 367 for a 1404x1872 page.
+            assert 357 <= y <= 377
         finally:
             rm_path.unlink(missing_ok=True)
 
