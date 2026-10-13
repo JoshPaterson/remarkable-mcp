@@ -261,12 +261,13 @@ def test_extract_page_annotations_orders_highlights_and_detects_ink():
     class Line:
         pass
 
+    items = [
+        GlyphRange("second", 5, 50),
+        Line(),
+        GlyphRange("first", 20, 10),
+    ]
     tree = SimpleNamespace(
-        walk=lambda: [
-            GlyphRange("second", 5, 50),
-            Line(),
-            GlyphRange("first", 20, 10),
-        ]
+        root=SimpleNamespace(node_id="root", children=SimpleNamespace(values=lambda: items))
     )
     with tempfile.TemporaryDirectory() as td:
         rm_file = Path(td) / "page.rm"
