@@ -664,3 +664,22 @@ async def test_image_layers_parameter(tmp_path):
     assert 'stroke="#00A000"' in everything["svg"]
     assert missing["_error"]["type"] == "layer_not_found"
     assert "Layer 3" in missing["_error"]["suggestion"]
+
+
+def test_highlighter_stroke_position_follows_text_anchor(tmp_path):
+    """Strokes in a group anchored to typed text are placed like the renderer places them."""
+    from unittest.mock import patch
+
+    rm_file = tmp_path / "page.rm"
+    rm_file.write_bytes(
+        build_rm([("Layer 1", True, [stroke(5, HIGHLIGHTER, [(-50, 100), (150, 120)])])])
+    )
+    layer_node = CrdtId(0, 10)
+
+    with patch(
+        "remarkable_mcp.extract._v6_anchor_offsets",
+        return_value={layer_node: (-464.0, 300.0)},
+    ):
+        details = _page_annotation_details(rm_file)
+
+    assert details["highlighter_strokes"][0]["bbox"] == [-515.0, 399.0, -313.0, 421.0]
