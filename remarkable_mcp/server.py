@@ -98,7 +98,8 @@ def _build_instructions() -> str:
         """
 ## Available Tools
 
-- `remarkable_browse(path, query)` - Browse folders or search for documents
+- `remarkable_browse(path, query, tags)` - Browse folders, search for documents,
+  or list documents carrying a tag (searches subfolders)
 - `remarkable_read(document, content_type, page, grep)` - Read document content with pagination
 - `remarkable_recent(limit)` - Get recently modified documents
 - `remarkable_status()` - Check connection and diagnose issues
@@ -113,6 +114,7 @@ def _build_instructions() -> str:
 2. Use `remarkable_read("Document Name")` to get content
 3. Use `remarkable_read("Document", page=2)` to continue reading long documents
 4. Use `remarkable_read("Document", grep="pattern")` to search within a document
+5. Use `remarkable_browse("/Folder", tags=["tag"])` to find tagged documents
 
 ### Getting Page Images
 Use `remarkable_image` when you need visual context:
