@@ -2,16 +2,18 @@
 Text extraction helpers for reMarkable documents.
 """
 
+import functools
 import json
 import logging
 import os
+import re
 import tempfile
 import threading
 import time
 import zipfile
 from difflib import SequenceMatcher
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 from xml.sax.saxutils import escape as _xml_escape
 
 logger = logging.getLogger(__name__)
@@ -758,22 +760,95 @@ _TEXT_WRAP_LINE_RATIO = 44.0 / 70.0
 _TEXT_CHAR_ADVANCE = 0.5
 
 
-def _wrap_text(text: str, max_width: float, char_advance: float) -> List[str]:
+# The tablet sets typed text in Noto Sans (bold paragraphs in Noto Sans Bold).
+# The fonts come from the pymupdf-fonts package; without it, text falls back to
+# a generic sans-serif ``<text>`` element.
+_TYPED_FONTS = {False: "notos", True: "notosbo"}
+
+
+@functools.lru_cache(maxsize=None)
+def _typed_font(bold: bool) -> Optional[Any]:
+    """The tablet's typed-text font as a PyMuPDF font, or None if unavailable."""
+    try:
+        import fitz
+
+        font = fitz.Font(_TYPED_FONTS[bold])
+    except Exception:
+        return None
+    return font if "noto sans" in font.name.lower() else None
+
+
+def _typed_font_buffer(name: str) -> Optional[bytes]:
+    font = _typed_font(name == _TYPED_FONTS[True])
+    return font.buffer if font is not None else None
+
+
+def _typed_text_width(text: str, size: float, bold: bool) -> float:
+    """Width of a typed line in stroke units, in the tablet's font when available."""
+    font = _typed_font(bold)
+    if font is not None:
+        return font.text_length(text, fontsize=size)
+    return len(text) * size * _TEXT_CHAR_ADVANCE
+
+
+def _typed_text_outline(text: str, size: float, bold: bool, key: str) -> Optional[str]:
+    """One typed line as glyph outlines in the tablet's font, or None.
+
+    PyMuPDF sets the line on a scratch page and exports it with glyphs as
+    paths, so PNG and SVG renders keep the letter widths the tablet uses. The
+    returned SVG content has its origin at the start of the line's baseline;
+    ``key`` makes its glyph ids unique within the page.
+    """
+    buffer = _typed_font_buffer(_TYPED_FONTS[bold])
+    if buffer is None:
+        return None
+    try:
+        import fitz
+    except ImportError:
+        return None
+    # Scratch page with the baseline at (pad, 2 * size), ample room around it.
+    pad = size
+    doc = fitz.open()
+    try:
+        page = doc.new_page(width=_typed_text_width(text, size, bold) + 2 * pad, height=3 * size)
+        page.insert_font(fontname=_TYPED_FONTS[bold], fontbuffer=buffer)
+        page.insert_text(
+            (pad, 2 * size), text, fontsize=size, fontname=_TYPED_FONTS[bold], color=(0, 0, 0)
+        )
+        svg = page.get_svg_image(text_as_path=True)
+    except Exception:
+        return None
+    finally:
+        doc.close()
+    inner = svg[svg.index(">") + 1 : svg.rindex("</svg>")]
+    # Plain href (SVG 2) needs no xlink namespace on the page's root element.
+    inner = inner.replace("xlink:href=", "href=")
+    inner = re.sub(r'(id="|href="#)', rf"\1typed-{key}-", inner)
+    return f'<g transform="translate({-pad:g} {-2 * size:g})">{inner}</g>'
+
+
+def _wrap_text(
+    text: str,
+    max_width: float,
+    char_advance: float,
+    measure: Optional[Callable[[str], float]] = None,
+) -> List[str]:
     """Greedily word-wrap ``text`` to ``max_width`` (stroke units).
 
     SVG ``<text>`` does not wrap, so paragraphs wider than the text box are
-    split here the way the device wraps them. Line width is approximated as
-    ``len(line) * char_advance`` -- good enough for a faithful preview without
-    embedding the device font. A single word longer than the box is left on its
-    own line rather than split. Returns ``[text]`` when no wrapping applies.
+    split here the way the device wraps them. Line width comes from
+    ``measure`` when given, otherwise it is approximated as
+    ``len(line) * char_advance``. A single word longer than the box is left on
+    its own line rather than split. Returns ``[text]`` when no wrapping applies.
     """
-    if max_width <= 0 or char_advance <= 0:
+    if max_width <= 0 or (measure is None and char_advance <= 0):
         return [text]
+    width = measure or (lambda line: len(line) * char_advance)
     lines: List[str] = []
     cur = ""
     for word in text.split(" "):
         trial = word if not cur else f"{cur} {word}"
-        if not cur or len(trial) * char_advance <= max_width:
+        if not cur or width(trial) <= max_width:
             cur = trial
         else:
             lines.append(cur)
@@ -867,6 +942,7 @@ def _v6_text_elements_with_bounds(blocks: list) -> Tuple[list, list, dict]:
 
     elements: list = []
     coords: list = []
+    lines: List[Dict[str, Any]] = []
     anchor_pos: dict = {}
     y_offset = _TEXT_TOP_Y * scale
     anchor_pos[CrdtId(*_ANCHOR_TEXT_TOP)] = pos_y + y_offset
@@ -890,27 +966,63 @@ def _v6_text_elements_with_bounds(blocks: list) -> Tuple[list, list, dict]:
             # A blank paragraph still consumes a line (e.g. spacing under a title).
             y_offset += line_height
             continue
-        family = "serif" if style == ParagraphStyle.HEADING else "sans-serif"
-        weight = (
-            ' font-weight="bold"' if style in (ParagraphStyle.BOLD, ParagraphStyle.HEADING) else ""
-        )
+        heading = style == ParagraphStyle.HEADING
+        bold = style == ParagraphStyle.BOLD
+        # Headings use a serif face the tablet ships but the renderer lacks;
+        # other paragraphs are measured in the tablet's own font.
+        if heading:
+            measure = None
+        else:
+            measure = lambda line, size=size, bold=bold: _typed_text_width(  # noqa: E731
+                line, size, bold
+            )
         # Wrap long paragraphs to the text box; each wrapped line takes a line,
         # with continuation lines spaced tighter than a paragraph break.
-        for idx, line in enumerate(_wrap_text(text, box_width, size * _TEXT_CHAR_ADVANCE)):
+        for idx, line in enumerate(_wrap_text(text, box_width, size * _TEXT_CHAR_ADVANCE, measure)):
             y_offset += line_height if idx == 0 else line_height * _TEXT_WRAP_LINE_RATIO
-            baseline = pos_y + y_offset
-            elements.append(
-                f'<text x="{pos_x:.1f}" y="{baseline:.1f}" '
-                f'font-family="{family}" font-size="{size:.1f}"{weight} '
-                f'fill="black" xml:space="preserve">{_xml_escape(line)}</text>'
+            lines.append(
+                {
+                    "x": pos_x,
+                    "baseline": pos_y + y_offset,
+                    "text": line,
+                    "size": size,
+                    "bold": bold,
+                    "heading": heading,
+                }
             )
-            # Estimate the line's extent for crop sizing, capped at the box width.
-            est_width = len(line) * size * _TEXT_CHAR_ADVANCE
-            if box_width > 0:
-                est_width = min(est_width, box_width)
-            coords.append((pos_x, baseline - size))
-            coords.append((pos_x + est_width, baseline + size * 0.3))
     anchor_pos[CrdtId(*_ANCHOR_TEXT_BOTTOM)] = pos_y + y_offset
+
+    for index, line in enumerate(lines):
+        outline = (
+            None
+            if line["heading"]
+            else _typed_text_outline(line["text"], line["size"], line["bold"], str(index))
+        )
+        if outline is not None:
+            label = _xml_escape(line["text"], {'"': "&quot;"})
+            elements.append(
+                f'<g class="typed-text" data-text="{label}" data-size="{line["size"]:.1f}" '
+                f'transform="translate({line["x"]:.1f} {line["baseline"]:.1f})">{outline}</g>'
+            )
+            continue
+        family = "serif" if line["heading"] else "sans-serif"
+        weight = ' font-weight="bold"' if line["heading"] or line["bold"] else ""
+        elements.append(
+            f'<text x="{line["x"]:.1f}" y="{line["baseline"]:.1f}" '
+            f'font-family="{family}" font-size="{line["size"]:.1f}"{weight} '
+            f'fill="black" xml:space="preserve">{_xml_escape(line["text"])}</text>'
+        )
+    for line in lines:
+        # The line's extent for crop sizing, capped at the box width.
+        width = (
+            len(line["text"]) * line["size"] * _TEXT_CHAR_ADVANCE
+            if line["heading"]
+            else _typed_text_width(line["text"], line["size"], line["bold"])
+        )
+        if box_width > 0:
+            width = min(width, box_width)
+        coords.append((line["x"], line["baseline"] - line["size"]))
+        coords.append((line["x"] + width, line["baseline"] + line["size"] * 0.3))
     return elements, coords, anchor_pos
 
 
