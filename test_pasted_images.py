@@ -290,3 +290,19 @@ def test_moved_image_comes_to_the_top(tmp_path):
     images = pasted_images(_v6_blocks(write_page(tmp_path, data)))
     assert list(images) == [CrdtId(1, 40)]
     assert _image_above_stroke(tmp_path, data)
+
+
+def test_image_position_follows_text_anchor(tmp_path):
+    """Images in a group anchored to typed text are placed like the renderer places them."""
+    from unittest.mock import patch
+
+    from remarkable_mcp.extract import _page_annotation_details
+
+    rm_file = write_page(tmp_path, page_with_image())
+    with patch(
+        "remarkable_mcp.extract._v6_anchor_offsets",
+        return_value={LAYER_1: (10.0, 100.0)},
+    ):
+        details = _page_annotation_details(rm_file)
+
+    assert details["images"][0]["bbox"] == [-443.5, 930.0, 473.5, 1082.0]

@@ -2507,6 +2507,8 @@ def _page_annotation_details(rm_file: Path) -> Dict[str, Any]:
         bbox = image.bbox()
         if bbox is None:
             continue
+        dx, dy = offsets.get(image.parent_id, (0.0, 0.0))
+        bbox = [bbox[0] + dx, bbox[1] + dy, bbox[2] + dx, bbox[3] + dy]
         stats = layer_of_node.get(image.parent_id) if details["layers"] else None
         if stats:
             stats["images"] += 1
