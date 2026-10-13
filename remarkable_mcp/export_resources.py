@@ -13,7 +13,7 @@ from tempfile import TemporaryDirectory
 from typing import Callable, Generic, Literal, TypeVar
 from uuid import uuid4
 
-ExportFormat = Literal["pdf", "markdown"]
+ExportFormat = Literal["pdf", "markdown", "png"]
 T = TypeVar("T")
 
 EXPORT_TTL_SECONDS = 15 * 60
@@ -22,6 +22,7 @@ EXPORT_MAX_ENTRIES = 8
 _FORMAT_DETAILS: dict[ExportFormat, tuple[str, str]] = {
     "pdf": (".pdf", "application/pdf"),
     "markdown": (".md", "text/markdown; charset=utf-8"),
+    "png": (".png", "image/png"),
 }
 
 
@@ -272,6 +273,17 @@ def temporary_pdf_export(export_id: str) -> bytes:
 def temporary_markdown_export(export_id: str) -> str:
     """Read a live Markdown export from the bounded temporary store."""
     return export_store.read_text(export_id, "markdown")
+
+
+@mcp.resource(
+    "remarkableexport:///png/{export_id}",
+    name="Temporary reMarkable page image",
+    description="A rendered page image. The link expires 15 minutes after creation.",
+    mime_type="image/png",
+)
+def temporary_png_export(export_id: str) -> bytes:
+    """Read a live page image from the bounded temporary store."""
+    return export_store.read_bytes(export_id, "png")
 
 
 def cleanup_export_resources() -> None:

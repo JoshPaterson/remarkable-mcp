@@ -112,6 +112,7 @@ async def test_one_server_serves_modern_and_legacy_catalogs():
                 == {
                     "remarkableexport:///pdf/{export_id}",
                     "remarkableexport:///markdown/{export_id}",
+                    "remarkableexport:///png/{export_id}",
                 }
             )
 
