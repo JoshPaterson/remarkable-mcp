@@ -14,6 +14,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from xml.sax.saxutils import escape as _xml_escape
 
+from remarkable_mcp.tags import page_tag_entries
+
 logger = logging.getLogger(__name__)
 
 
@@ -2021,8 +2023,10 @@ def extract_text_from_document_zip(
                 {"page": int,          # 1-based page number
                  "page_id": str,
                  "has_handwriting": bool,   # page has pen strokes
-                 "highlights": [str]}, # highlighted text on the page
+                 "highlights": [str],  # highlighted text on the page
+                 "page_tags": [str]},  # tags on this page
             ],
+            "page_tags": [{"page": int, "name": str}],  # .content pageTags
             "ocr_backend": str,        # Which OCR backend was used (if any)
         }
     """
@@ -2046,6 +2050,7 @@ def extract_text_from_document_zip(
         "annotated_pages": [],
         "ocr_backend": None,
         "tags": [],
+        "page_tags": [],
     }
 
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -2056,9 +2061,11 @@ def extract_text_from_document_zip(
 
         # Get page order from .content file
         page_order = []
+        content_data: Optional[dict] = None
         for content_file in tmpdir_path.glob("*.content"):
             try:
                 data = json.loads(content_file.read_text())
+                content_data = data if isinstance(data, dict) else None
                 # New format: cPages.pages array
                 if "cPages" in data and "pages" in data["cPages"]:
                     page_order = [p["id"] for p in data["cPages"]["pages"]]
@@ -2120,6 +2127,23 @@ def extract_text_from_document_zip(
                     }
                 )
                 result["highlights"].extend(page_highlights)
+
+        # Page tags, attached to their pages in the annotation index
+        page_ids = page_order or [f.stem for f in rm_files]
+        result["page_tags"] = page_tag_entries(content_data, page_ids)
+        by_page = {ap["page"]: ap for ap in result["annotated_pages"]}
+        for entry in result["page_tags"]:
+            ap = by_page.get(entry["page"])
+            if ap is None:
+                ap = {
+                    "page": entry["page"],
+                    "page_id": page_ids[entry["page"] - 1],
+                    "has_handwriting": False,
+                    "highlights": [],
+                }
+                by_page[entry["page"]] = ap
+                result["annotated_pages"].append(ap)
+            ap.setdefault("page_tags", []).append(entry["name"])
         result["annotated_pages"].sort(key=lambda a: a["page"])
 
         # Extract text from .txt and .md files
