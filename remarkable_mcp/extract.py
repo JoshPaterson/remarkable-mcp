@@ -2246,6 +2246,24 @@ def _locate_on_page(
     return mm, region
 
 
+def _v6_anchor_offsets(rm_file: Path) -> dict:
+    """Group node id -> ``(dx, dy)`` text-anchor translation for a page.
+
+    The same translation the renderer applies (see :func:`_v6_group_offsets`),
+    so positions reported for marks match where they are drawn. Ink on
+    notebook pages with typed text is stored relative to the text it is
+    anchored to.
+    """
+    blocks = _v6_blocks(rm_file)
+    if not blocks:
+        return {}
+    try:
+        _, _, anchor_pos = _v6_text_elements_with_bounds(blocks)
+        return _v6_group_offsets(blocks, anchor_pos) if anchor_pos else {}
+    except Exception:
+        return {}
+
+
 def _page_annotation_details(rm_file: Path) -> Dict[str, Any]:
     """Extract a page's highlights, highlighter strokes and pen-stroke presence.
 
@@ -2279,6 +2297,7 @@ def _page_annotation_details(rm_file: Path) -> Dict[str, Any]:
         return details
     blocks, tree = scene
 
+    offsets = _v6_anchor_offsets(rm_file)
     highlights: list = []
     highlighter_strokes: list = []
     try:
@@ -2320,6 +2339,8 @@ def _page_annotation_details(rm_file: Path) -> Dict[str, Any]:
                 bbox = _stroke_bbox(getattr(item, "points", None) or [])
                 if bbox is None:
                     continue
+                dx, dy = offsets.get(node_id, (0.0, 0.0))
+                bbox = [bbox[0] + dx, bbox[1] + dy, bbox[2] + dx, bbox[3] + dy]
                 entry = dict(color, bbox=bbox, layer=layer_name)
                 highlighter_strokes.append(entry)
                 if stats:
