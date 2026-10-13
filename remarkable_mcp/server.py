@@ -102,7 +102,8 @@ def _build_instructions() -> str:
 - `remarkable_read(document, content_type, page, grep)` - Read document content with pagination
 - `remarkable_recent(limit)` - Get recently modified documents
 - `remarkable_status()` - Check connection and diagnose issues
-- `remarkable_image(document, page, include_ocr)` - Get a PNG image with optional OCR
+- `remarkable_image(document, page, include_ocr, dpi, region)` - Get a page image
+  (PNG or SVG) with optional OCR
 - `remarkable_export(document, output_format)` - Export one document as a
   temporary PDF or Markdown resource
 
@@ -122,6 +123,10 @@ Use `remarkable_image` when you need visual context:
 
 Example: `remarkable_image("UI Mockup", page=1)` returns a PNG image
 Example: `remarkable_image("Notes", include_ocr=True)` returns image with extracted text
+Example: `remarkable_image("Notes", page=2, dpi=300)` renders the whole page at 300 dpi,
+enough to read small handwriting
+Example: `remarkable_image("Notes", page=2, dpi=300, region=[0, 0.5, 1, 0.75])` crops
+to a band of the page (`[left, top, right, bottom]` as page fractions)
 
 ### Exporting a Document
 Use `remarkable_export` for a complete PDF or structured Markdown artifact.

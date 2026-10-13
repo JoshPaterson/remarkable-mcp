@@ -355,6 +355,8 @@ remarkable_status()
 | `include_ocr` | bool | `False` | Enable OCR on the image |
 | `compatibility` | bool | `False` | Return resource URI instead of embedded resource |
 | `render_merged` | bool \| null | `None` (auto) | PNG compositing mode: auto-merge PDF-backed pages, `True` to request merging explicitly, or `False` for annotations only |
+| `dpi` | int \| null | `None` | PNG resolution (36-600 dots per inch of the physical page). Renders the whole page instead of cropping to the ink; use 300 to read small handwriting |
+| `region` | list[float] \| null | `None` | PNG crop box `[left, top, right, bottom]` as fractions of the page, e.g. `[0, 0.5, 1, 0.75]` |
 
 ### Background Colors
 

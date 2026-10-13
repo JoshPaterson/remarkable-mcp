@@ -64,6 +64,18 @@ def _points_per_unit(paper_size: Optional[Tuple[float, float]]) -> float:
     return REMARKABLE_PDF_POINTS_PER_UNIT
 
 
+def _full_page_scale(paper_w: float, paper_h: float, dpi: Optional[float]) -> float:
+    """Output pixels per stroke unit for a full-page render.
+
+    With ``dpi``, the page is sized from its physical extent (stroke units ->
+    PDF points -> inches); otherwise its long edge is
+    ``FULL_PAGE_TARGET_LONG_EDGE`` pixels.
+    """
+    if dpi:
+        return dpi / 72.0 * _points_per_unit((paper_w, paper_h))
+    return FULL_PAGE_TARGET_LONG_EDGE / max(paper_w, paper_h)
+
+
 def _annotation_page_viewbox(
     pdf_w_pt: float,
     pdf_h_pt: float,
@@ -1078,7 +1090,9 @@ def _svg_string_to_png(
 
 
 def render_rm_file_full_page_png(
-    rm_file_path: Path, background_color: Optional[str] = None
+    rm_file_path: Path,
+    background_color: Optional[str] = None,
+    dpi: Optional[float] = None,
 ) -> Optional[Tuple[bytes, Tuple[float, float]]]:
     """Render a v6 .rm page to a FULL-PAGE PNG (not cropped to ink).
 
@@ -1105,7 +1119,7 @@ def render_rm_file_full_page_png(
     # Typed text is drawn first so handwritten strokes layer on top of it,
     # matching the device's compositing order.
     svg = _svg_full_page(text_elements + paths, paper_w, paper_h)
-    scale = FULL_PAGE_TARGET_LONG_EDGE / max(paper_w, paper_h)
+    scale = _full_page_scale(paper_w, paper_h, dpi)
     output_width = max(1, round(paper_w * scale))
     output_height = max(1, round(paper_h * scale))
 
@@ -1378,7 +1392,10 @@ def _document_paper_size(rm_files: List[Path]) -> Tuple[float, float]:
 
 
 def render_page_full_page_from_document_zip(
-    zip_path: Path, page: int = 1, background_color: Optional[str] = None
+    zip_path: Path,
+    page: int = 1,
+    background_color: Optional[str] = None,
+    dpi: Optional[float] = None,
 ) -> Optional[Tuple[bytes, Tuple[float, float]]]:
     """Full-page render of a page, addressed by cPages index.
 
@@ -1404,11 +1421,15 @@ def render_page_full_page_from_document_zip(
             tmpdir_path,
             page=page,
             background_color=background_color,
+            dpi=dpi,
         )
 
 
 def render_page_full_page_from_extracted_document(
-    tmpdir_path: Path, page: int = 1, background_color: Optional[str] = None
+    tmpdir_path: Path,
+    page: int = 1,
+    background_color: Optional[str] = None,
+    dpi: Optional[float] = None,
 ) -> Optional[Tuple[bytes, Tuple[float, float]]]:
     """Render a full page from an already extracted document archive."""
     rm_files = _get_ordered_rm_files(tmpdir_path)
@@ -1425,7 +1446,7 @@ def render_page_full_page_from_extracted_document(
         rm_file = rm_files[page - 1]
 
     if rm_file is not None and rm_file.exists():
-        return render_rm_file_full_page_png(rm_file, background_color=background_color)
+        return render_rm_file_full_page_png(rm_file, background_color=background_color, dpi=dpi)
 
     # The page exists in cPages but has no .rm layer yet (a blank page):
     # render a blank full page at the document's paper size so the viewer
@@ -1433,7 +1454,7 @@ def render_page_full_page_from_extracted_document(
     # page has a drawable layer / has been added via remarkable_add_page.)
     paper_w, paper_h = _document_paper_size(rm_files)
     svg = _svg_full_page([], paper_w, paper_h)
-    scale = FULL_PAGE_TARGET_LONG_EDGE / max(paper_w, paper_h)
+    scale = _full_page_scale(paper_w, paper_h, dpi)
     png = _svg_string_to_png(
         svg, max(1, round(paper_w * scale)), max(1, round(paper_h * scale)), background_color
     )
@@ -1601,7 +1622,10 @@ def _render_pdf_page_to_png(
 
 
 def render_tablet_pdf_page_to_png(
-    pdf_bytes: bytes, page: int = 1, target_long_edge: int = 2048
+    pdf_bytes: bytes,
+    page: int = 1,
+    target_long_edge: int = 2048,
+    dpi: Optional[float] = None,
 ) -> Optional[bytes]:
     """Rasterize one page of the tablet's native PDF export to PNG bytes.
 
@@ -1616,6 +1640,7 @@ def render_tablet_pdf_page_to_png(
         pdf_bytes: Raw bytes of the tablet-exported PDF.
         page: 1-based page number (matches notebook page ordering 1:1).
         target_long_edge: Target pixel size for the longest page edge.
+        dpi: Output resolution; overrides ``target_long_edge`` when given.
 
     Returns:
         PNG image bytes, or None on failure / out-of-range page.
@@ -1644,7 +1669,7 @@ def render_tablet_pdf_page_to_png(
             return None
         pdf_page = doc[index]
         longest_edge = max(pdf_page.rect.width, pdf_page.rect.height) or 1.0
-        zoom = target_long_edge / longest_edge
+        zoom = dpi / 72.0 if dpi else target_long_edge / longest_edge
         pix = pdf_page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
         return pix.tobytes("png")
     except Exception:
@@ -1695,6 +1720,7 @@ def render_merged_page_from_document_zip(
     background_color: Optional[str] = None,
     canvas_width: Optional[int] = None,
     canvas_height: Optional[int] = None,
+    dpi: Optional[float] = None,
 ) -> tuple[Optional[bytes], Optional[str]]:
     """Render a page with the PDF underlay composited with the annotation layer.
 
@@ -1710,6 +1736,7 @@ def render_merged_page_from_document_zip(
         background_color: Background color for annotation layer
         canvas_width: Output canvas width (default: derived from PDF page)
         canvas_height: Output canvas height (default: derived from PDF page)
+        dpi: Output resolution when no canvas size is given (default 144)
 
     Returns:
         Tuple of (png_bytes, note) where note is an informational message
@@ -1730,6 +1757,7 @@ def render_merged_page_from_document_zip(
             background_color=background_color,
             canvas_width=canvas_width,
             canvas_height=canvas_height,
+            dpi=dpi,
         )
 
 
@@ -1739,6 +1767,7 @@ def render_merged_page_from_extracted_document(
     background_color: Optional[str] = None,
     canvas_width: Optional[int] = None,
     canvas_height: Optional[int] = None,
+    dpi: Optional[float] = None,
 ) -> tuple[Optional[bytes], Optional[str]]:
     """Render a merged page from an already extracted document archive."""
     import io
@@ -1755,6 +1784,7 @@ def render_merged_page_from_extracted_document(
             tmpdir_path,
             page=page,
             background_color=background_color,
+            dpi=dpi,
         )
         if full_page is None:
             return None, f"Page {page} has no renderable annotation layer."
@@ -1787,6 +1817,7 @@ def render_merged_page_from_extracted_document(
             tmpdir_path,
             page=page,
             background_color=background_color,
+            dpi=dpi,
         )
         if full_page is None:
             return None, f"{reason}; page has no renderable annotation layer."
@@ -1817,8 +1848,9 @@ def render_merged_page_from_extracted_document(
         return annotation_only("Could not read PDF dimensions")
 
     # Determine output canvas size
-    out_w = canvas_width or int(pdf_w_pt * 2)
-    out_h = canvas_height or int(pdf_h_pt * 2)
+    pixels_per_point = dpi / 72.0 if dpi else 2.0
+    out_w = canvas_width or int(round(pdf_w_pt * pixels_per_point))
+    out_h = canvas_height or int(round(pdf_h_pt * pixels_per_point))
 
     # 1. Rasterize the PDF page
     pdf_png = _render_pdf_page_to_png(pdf_bytes, pdf_page_index, out_w, out_h)
