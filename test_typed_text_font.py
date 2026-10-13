@@ -51,7 +51,7 @@ def test_typed_text_drawn_as_outlines_at_text_box_origin():
     assert stretch == 1.0
 
 
-def test_highlighted_words_centered_and_resting_on_box_bottom():
+def test_highlighted_words_centered_in_their_box():
     blocks = _blocks()
     text = next(b.value for b in blocks if type(b).__name__ == "RootTextBlock")
     _, baseline, _ = _line(_v6_text_elements_with_bounds(blocks)[0])
@@ -68,8 +68,8 @@ def test_highlighted_words_centered_and_resting_on_box_bottom():
     x, new_baseline, stretch = _line(elements)
     assert stretch == 1.0
     assert abs(x - (text.pos_x + 3)) < 0.1
-    # Descenders reach the box's bottom edge (box bottom is baseline + 7).
-    assert abs(new_baseline + 0.24 * 30 - (baseline + 7)) < 0.1
+    # The line stays at the height the text layout gives it.
+    assert new_baseline == baseline
 
 
 def test_line_squeezed_when_words_overrun_their_box():

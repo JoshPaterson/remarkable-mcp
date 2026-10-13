@@ -1140,8 +1140,6 @@ _TEXT_CHAR_ADVANCE = 0.5
 # _fit_lines_to_highlights). Without the package, text falls back to a generic
 # sans-serif ``<text>`` element.
 _TYPED_FONTS = {False: "notos", True: "notosbo"}
-# Depth of Noto Sans descenders (g, p, q, y) below the baseline, in em.
-_TYPED_DESCENT = 0.24
 
 
 @functools.lru_cache(maxsize=None)
@@ -1384,11 +1382,11 @@ def _v6_text_elements_with_bounds(blocks: list) -> Tuple[list, list, dict]:
         )
         if outline is not None:
             label = _xml_escape(line["text"], {'"': "&quot;"})
-            stretch, shift, rise = line.get("fit", (1.0, 0.0, 0.0))
+            stretch, shift = line.get("fit", (1.0, 0.0))
             fit = f" scale({stretch:.4f} 1)" if stretch != 1.0 else ""
             elements.append(
                 f'<g class="typed-text" data-text="{label}" data-size="{line["size"]:.1f}" '
-                f'transform="translate({line["x"] + shift:.1f} {line["baseline"] + rise:.1f})'
+                f'transform="translate({line["x"] + shift:.1f} {line["baseline"]:.1f})'
                 f'{fit}">'
                 f"{outline}</g>"
             )
@@ -1409,8 +1407,8 @@ def _v6_text_elements_with_bounds(blocks: list) -> Tuple[list, list, dict]:
         )
         if box_width > 0:
             width = min(width, box_width)
-        stretch, shift, rise = line.get("fit", (1.0, 0.0, 0.0))
-        baseline = line["baseline"] + rise
+        stretch, shift = line.get("fit", (1.0, 0.0))
+        baseline = line["baseline"]
         coords.append((line["x"] + shift, baseline - line["size"]))
         coords.append((line["x"] + shift + width * stretch, baseline + line["size"] * 0.3))
     return elements, coords, anchor_pos
@@ -1442,12 +1440,12 @@ def _fit_lines_to_highlights(lines: List[Dict[str, Any]], highlights: list) -> N
     The file stores no line widths, only the text box; a highlight over typed
     text, however, stores the tablet-computed box of the highlighted words.
     For each line carrying such a highlight, sets ``line["fit"] = (stretch,
-    shift, rise)``: the line is moved so each highlighted span sits as it does
-    on the tablet, centered horizontally in its box with descenders reaching
-    the box's bottom edge, and squeezed only if a span is wider than its box.
-    Boxes are padded at the sides, so spans are never stretched to fill them.
-    Lines in another font than the tablet's (no outlines available) are left
-    alone.
+    shift)``: the line is moved sideways so each highlighted span sits
+    centered in its box, as on the tablet, and squeezed only if a span is
+    wider than its box. Boxes are padded at the sides, so spans are never
+    stretched to fill them. The line's height on the page is left as the text
+    layout places it. Lines in another font than the tablet's (no outlines
+    available) are left alone.
     """
     for text, rects in highlights:
         for rect in rects:
@@ -1477,16 +1475,13 @@ def _fit_lines_to_highlights(lines: List[Dict[str, Any]], highlights: list) -> N
             span_width = width(line["text"][first:last])
             stretch = min(1.0, rect.w / span_width) if span_width > 0 else 1.0
             shift = (rect.x + rect.w / 2 - line["x"]) - stretch * (start + span_width / 2)
-            # Descenders (g, p, y) reach the box's bottom edge.
-            rise = rect.y + rect.h - _TYPED_DESCENT * line["size"] - line["baseline"]
-            line.setdefault("pairs", []).append((stretch, shift, rise))
+            line.setdefault("pairs", []).append((stretch, shift))
     for line in lines:
         pairs = line.pop("pairs", None)
         if pairs:
             stretch = min(p[0] for p in pairs)
             shift = sum(p[1] for p in pairs) / len(pairs)
-            rise = sum(p[2] for p in pairs) / len(pairs)
-            line["fit"] = (stretch, shift, rise)
+            line["fit"] = (stretch, shift)
 
 
 def _highlight_span_on_line(line: Dict[str, Any], text: str) -> Optional[Tuple[int, int]]:
