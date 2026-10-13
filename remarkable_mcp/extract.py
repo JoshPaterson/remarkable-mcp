@@ -2,9 +2,11 @@
 Text extraction helpers for reMarkable documents.
 """
 
+import functools
 import json
 import logging
 import os
+import re
 import tempfile
 import threading
 import time
@@ -1131,22 +1133,98 @@ _TEXT_WRAP_LINE_RATIO = 44.0 / 70.0
 _TEXT_CHAR_ADVANCE = 0.5
 
 
-def _wrap_text(text: str, max_width: float, char_advance: float) -> List[str]:
+# The tablet sets typed text in reMarkable Sans, a proprietary font. Noto Sans
+# (from the pymupdf-fonts package) at the same size comes closest in letter
+# widths among open fonts, within about 2% per word; lines carrying a
+# highlight are then fitted to the tablet's highlight boxes (see
+# _fit_lines_to_highlights). Without the package, text falls back to a generic
+# sans-serif ``<text>`` element.
+_TYPED_FONTS = {False: "notos", True: "notosbo"}
+
+
+@functools.lru_cache(maxsize=None)
+def _typed_font(bold: bool) -> Optional[Any]:
+    """The tablet's typed-text font as a PyMuPDF font, or None if unavailable."""
+    try:
+        import fitz
+
+        font = fitz.Font(_TYPED_FONTS[bold])
+    except Exception:
+        return None
+    return font if "noto sans" in font.name.lower() else None
+
+
+def _typed_font_buffer(name: str) -> Optional[bytes]:
+    font = _typed_font(name == _TYPED_FONTS[True])
+    return font.buffer if font is not None else None
+
+
+def _typed_text_width(text: str, size: float, bold: bool) -> float:
+    """Width of a typed line in stroke units, in the tablet's font when available."""
+    font = _typed_font(bold)
+    if font is not None:
+        return font.text_length(text, fontsize=size)
+    return len(text) * size * _TEXT_CHAR_ADVANCE
+
+
+def _typed_text_outline(text: str, size: float, bold: bool, key: str) -> Optional[str]:
+    """One typed line as glyph outlines in the tablet's font, or None.
+
+    PyMuPDF sets the line on a scratch page and exports it with glyphs as
+    paths, so PNG and SVG renders keep the letter widths the tablet uses. The
+    returned SVG content has its origin at the start of the line's baseline;
+    ``key`` makes its glyph ids unique within the page.
+    """
+    buffer = _typed_font_buffer(_TYPED_FONTS[bold])
+    if buffer is None:
+        return None
+    try:
+        import fitz
+    except ImportError:
+        return None
+    # Scratch page with the baseline at (pad, 2 * size), ample room around it.
+    pad = size
+    doc = fitz.open()
+    try:
+        page = doc.new_page(width=_typed_text_width(text, size, bold) + 2 * pad, height=3 * size)
+        page.insert_font(fontname=_TYPED_FONTS[bold], fontbuffer=buffer)
+        page.insert_text(
+            (pad, 2 * size), text, fontsize=size, fontname=_TYPED_FONTS[bold], color=(0, 0, 0)
+        )
+        svg = page.get_svg_image(text_as_path=True)
+    except Exception:
+        return None
+    finally:
+        doc.close()
+    inner = svg[svg.index(">") + 1 : svg.rindex("</svg>")]
+    # Plain href (SVG 2) needs no xlink namespace on the page's root element.
+    inner = inner.replace("xlink:href=", "href=")
+    inner = re.sub(r'(id="|href="#)', rf"\1typed-{key}-", inner)
+    return f'<g transform="translate({-pad:g} {-2 * size:g})">{inner}</g>'
+
+
+def _wrap_text(
+    text: str,
+    max_width: float,
+    char_advance: float,
+    measure: Optional[Callable[[str], float]] = None,
+) -> List[str]:
     """Greedily word-wrap ``text`` to ``max_width`` (stroke units).
 
     SVG ``<text>`` does not wrap, so paragraphs wider than the text box are
-    split here the way the device wraps them. Line width is approximated as
-    ``len(line) * char_advance`` -- good enough for a faithful preview without
-    embedding the device font. A single word longer than the box is left on its
-    own line rather than split. Returns ``[text]`` when no wrapping applies.
+    split here the way the device wraps them. Line width comes from
+    ``measure`` when given, otherwise it is approximated as
+    ``len(line) * char_advance``. A single word longer than the box is left on
+    its own line rather than split. Returns ``[text]`` when no wrapping applies.
     """
-    if max_width <= 0 or char_advance <= 0:
+    if max_width <= 0 or (measure is None and char_advance <= 0):
         return [text]
+    width = measure or (lambda line: len(line) * char_advance)
     lines: List[str] = []
     cur = ""
     for word in text.split(" "):
         trial = word if not cur else f"{cur} {word}"
-        if not cur or len(trial) * char_advance <= max_width:
+        if not cur or width(trial) <= max_width:
             cur = trial
         else:
             lines.append(cur)
@@ -1240,6 +1318,7 @@ def _v6_text_elements_with_bounds(blocks: list) -> Tuple[list, list, dict]:
 
     elements: list = []
     coords: list = []
+    lines: List[Dict[str, Any]] = []
     anchor_pos: dict = {}
     y_offset = _TEXT_TOP_Y * scale
     anchor_pos[CrdtId(*_ANCHOR_TEXT_TOP)] = pos_y + y_offset
@@ -1263,28 +1342,161 @@ def _v6_text_elements_with_bounds(blocks: list) -> Tuple[list, list, dict]:
             # A blank paragraph still consumes a line (e.g. spacing under a title).
             y_offset += line_height
             continue
-        family = "serif" if style == ParagraphStyle.HEADING else "sans-serif"
-        weight = (
-            ' font-weight="bold"' if style in (ParagraphStyle.BOLD, ParagraphStyle.HEADING) else ""
-        )
+        heading = style == ParagraphStyle.HEADING
+        bold = style == ParagraphStyle.BOLD
+        # Headings use a serif face the tablet ships but the renderer lacks;
+        # other paragraphs are measured in the tablet's own font.
+        if heading:
+            measure = None
+        else:
+            measure = lambda line, size=size, bold=bold: _typed_text_width(  # noqa: E731
+                line, size, bold
+            )
         # Wrap long paragraphs to the text box; each wrapped line takes a line,
         # with continuation lines spaced tighter than a paragraph break.
-        for idx, line in enumerate(_wrap_text(text, box_width, size * _TEXT_CHAR_ADVANCE)):
+        offset = 0
+        for idx, line in enumerate(_wrap_text(text, box_width, size * _TEXT_CHAR_ADVANCE, measure)):
             y_offset += line_height if idx == 0 else line_height * _TEXT_WRAP_LINE_RATIO
-            baseline = pos_y + y_offset
-            elements.append(
-                f'<text x="{pos_x:.1f}" y="{baseline:.1f}" '
-                f'font-family="{family}" font-size="{size:.1f}"{weight} '
-                f'fill="black" xml:space="preserve">{_xml_escape(line)}</text>'
+            offset = text.find(line, offset)
+            lines.append(
+                {
+                    "x": pos_x,
+                    "baseline": pos_y + y_offset,
+                    "text": line,
+                    "size": size,
+                    "bold": bold,
+                    "heading": heading,
+                    "paragraph": text,
+                    "start": offset,
+                }
             )
-            # Estimate the line's extent for crop sizing, capped at the box width.
-            est_width = len(line) * size * _TEXT_CHAR_ADVANCE
-            if box_width > 0:
-                est_width = min(est_width, box_width)
-            coords.append((pos_x, baseline - size))
-            coords.append((pos_x + est_width, baseline + size * 0.3))
+            offset += len(line)
     anchor_pos[CrdtId(*_ANCHOR_TEXT_BOTTOM)] = pos_y + y_offset
+    _fit_lines_to_highlights(lines, _typed_text_highlights(blocks))
+
+    for index, line in enumerate(lines):
+        outline = (
+            None
+            if line["heading"]
+            else _typed_text_outline(line["text"], line["size"], line["bold"], str(index))
+        )
+        if outline is not None:
+            label = _xml_escape(line["text"], {'"': "&quot;"})
+            stretch, shift = line.get("fit", (1.0, 0.0))
+            fit = f" scale({stretch:.4f} 1)" if stretch != 1.0 else ""
+            elements.append(
+                f'<g class="typed-text" data-text="{label}" data-size="{line["size"]:.1f}" '
+                f'transform="translate({line["x"] + shift:.1f} {line["baseline"]:.1f}){fit}">'
+                f"{outline}</g>"
+            )
+            continue
+        family = "serif" if line["heading"] else "sans-serif"
+        weight = ' font-weight="bold"' if line["heading"] or line["bold"] else ""
+        elements.append(
+            f'<text x="{line["x"]:.1f}" y="{line["baseline"]:.1f}" '
+            f'font-family="{family}" font-size="{line["size"]:.1f}"{weight} '
+            f'fill="black" xml:space="preserve">{_xml_escape(line["text"])}</text>'
+        )
+    for line in lines:
+        # The line's extent for crop sizing, capped at the box width.
+        width = (
+            len(line["text"]) * line["size"] * _TEXT_CHAR_ADVANCE
+            if line["heading"]
+            else _typed_text_width(line["text"], line["size"], line["bold"])
+        )
+        if box_width > 0:
+            width = min(width, box_width)
+        stretch, shift = line.get("fit", (1.0, 0.0))
+        coords.append((line["x"] + shift, line["baseline"] - line["size"]))
+        coords.append((line["x"] + shift + width * stretch, line["baseline"] + line["size"] * 0.3))
     return elements, coords, anchor_pos
+
+
+def _typed_text_highlights(blocks: list) -> List[Tuple[str, list]]:
+    """``(text, rectangles)`` of each live text highlight on a page.
+
+    A later block for the same item replaces an earlier one; a block without a
+    value deletes the item.
+    """
+    latest: Dict[Any, Any] = {}
+    for block in blocks:
+        item = getattr(block, "item", None)
+        if item is not None and hasattr(item, "item_id"):
+            latest[item.item_id] = getattr(item, "value", None)
+    highlights = []
+    for item in latest.values():
+        if type(item).__name__ == "GlyphRange" and getattr(item, "text", None):
+            rects = [r for r in getattr(item, "rectangles", None) or [] if r.w > 0]
+            if rects:
+                highlights.append((item.text, rects))
+    return highlights
+
+
+def _fit_lines_to_highlights(lines: List[Dict[str, Any]], highlights: list) -> None:
+    """Fit typed lines to the tablet's highlight boxes over them.
+
+    The file stores no line widths, only the text box; a highlight over typed
+    text, however, stores the tablet-computed box of the highlighted words.
+    For each line carrying such a highlight, sets ``line["fit"] = (stretch,
+    shift)``: the line is shifted so each highlighted span starts at its box's
+    left edge, and squeezed only if a span would run past its box's right
+    edge. Boxes extend past the words' end on the tablet, so spans are never
+    stretched to fill them. Lines in another font than the tablet's (no
+    outlines available) are left alone.
+    """
+    for text, rects in highlights:
+        for rect in rects:
+            center = rect.y + rect.h / 2
+            line = next(
+                (
+                    candidate
+                    for candidate in lines
+                    if not candidate["heading"]
+                    and candidate["baseline"] - candidate["size"] * 1.5
+                    <= center
+                    <= candidate["baseline"] + candidate["size"] * 0.5
+                ),
+                None,
+            )
+            if line is None or _typed_font(line["bold"]) is None:
+                continue
+            span = _highlight_span_on_line(line, text)
+            if span is None:
+                continue
+            first, last = span
+
+            def width(chars: str, line=line) -> float:
+                return _typed_text_width(chars, line["size"], line["bold"])
+
+            start = width(line["text"][:first])
+            span_width = width(line["text"][first:last])
+            stretch = min(1.0, rect.w / span_width) if span_width > 0 else 1.0
+            shift = (rect.x - line["x"]) - stretch * start
+            line.setdefault("pairs", []).append((stretch, shift))
+    for line in lines:
+        pairs = line.pop("pairs", None)
+        if pairs:
+            stretch = min(p[0] for p in pairs)
+            shift = sum(p[1] for p in pairs) / len(pairs)
+            line["fit"] = (stretch, shift)
+
+
+def _highlight_span_on_line(line: Dict[str, Any], text: str) -> Optional[Tuple[int, int]]:
+    """Character range of a highlight's text within one wrapped line, or None.
+
+    The highlight's text is located in the line's paragraph, so a highlight
+    wrapping onto several lines yields its part on this line.
+    """
+    paragraph, line_start = line["paragraph"], line["start"]
+    line_end = line_start + len(line["text"])
+    position = paragraph.find(text.strip())
+    while position != -1:
+        end = position + len(text.strip())
+        first, last = max(position, line_start), min(end, line_end)
+        if first < last:
+            return first - line_start, last - line_start
+        position = paragraph.find(text.strip(), position + 1)
+    return None
 
 
 def _render_rm_v6_to_svg(rm_file_path: Path, layers: Optional[str] = None) -> Optional[str]:

@@ -39,6 +39,21 @@ from remarkable_mcp.responses import (
 from remarkable_mcp.server import mcp
 
 
+def _has_typed_text(svg: str) -> bool:
+    """Typed text renders as glyph outlines, or as <text> without the font."""
+    return 'class="typed-text"' in svg or "<text " in svg
+
+
+def _text_baseline(element: str) -> float:
+    """Baseline y of a rendered typed-text line."""
+    import re
+
+    match = re.search(r'class="typed-text"[^>]*translate\([-\d.]+ ([-\d.]+)\)', element)
+    if match is None:
+        match = re.search(r'y="([-\d.]+)"', element)
+    return float(match.group(1))
+
+
 async def _call_tool(name: str, arguments: dict):
     """Call a tool directly for focused handler tests."""
     return await mcp.call_tool(name, arguments)
@@ -6125,7 +6140,7 @@ class TestFullPageRender:
             elements = _v6_text_svg_elements(_v6_blocks(rm_path))
             assert len(elements) == 2
             joined = "".join(elements)
-            assert "<text " in joined
+            assert _has_typed_text(joined)
             assert "Hello world" in joined
             assert "Second line" in joined
         finally:
@@ -6180,7 +6195,7 @@ class TestFullPageRender:
         try:
             svg = _render_rm_v6_to_svg(rm_path)
             assert svg is not None
-            assert "<text " in svg
+            assert _has_typed_text(svg)
             assert "Hello world" in svg
         finally:
             rm_path.unlink(missing_ok=True)
@@ -6242,7 +6257,6 @@ class TestFullPageRender:
     def test_typed_text_baseline_matches_device_offset(self):
         """First line sits where the device draws it (calibrated, not the old
         rmc offset that rendered text ~50 units too high)."""
-        import re
 
         from remarkable_mcp import notebooks as nb
         from remarkable_mcp.extract import _v6_blocks, _v6_text_svg_elements
@@ -6252,7 +6266,7 @@ class TestFullPageRender:
             rm_path = Path(rm_tmp.name)
         try:
             elements = _v6_text_svg_elements(_v6_blocks(rm_path))
-            y = float(re.search(r'y="([-\d.]+)"', elements[0]).group(1))
+            y = _text_baseline(elements[0])
             # pos_y(234) + TOP(63) + line_height(70) == 367 for a 1404x1872 page.
             assert 357 <= y <= 377
         finally:
@@ -6282,9 +6296,9 @@ class TestFullPageRender:
             def metrics_at(page_h):
                 with patch.object(extract, "_v6_paper_size", return_value=(width, page_h)):
                     els = _v6_text_svg_elements(blocks)
-                y0 = float(re.search(r'y="([-\d.]+)"', els[0]).group(1))
-                y1 = float(re.search(r'y="([-\d.]+)"', els[1]).group(1))
-                size = float(re.search(r'font-size="([-\d.]+)"', els[0]).group(1))
+                y0 = _text_baseline(els[0])
+                y1 = _text_baseline(els[1])
+                size = float(re.search(r'(?:font-size|data-size)="([-\d.]+)"', els[0]).group(1))
                 return y1 - y0, size
 
             # Reference 1872-tall page: full-size metrics.
@@ -8301,7 +8315,7 @@ class TestTextAnchoredInk:
         assert svg is not None
         # The stroke's raw stored Y must not appear: it renders translated.
         assert f"M {raw_points[0][0]:.1f} {raw_points[0][1]:.1f}" not in svg
-        assert "<text " in svg and "<path " in svg
+        assert _has_typed_text(svg) and "<path " in svg
 
     def test_unanchored_stroke_unchanged_when_anchor_map_present(self):
         import tempfile

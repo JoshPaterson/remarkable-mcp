@@ -7,6 +7,7 @@ pos_y + 63 and the bottom-of-text anchor after the last paragraph.
 """
 
 import io
+import re
 
 from rmscene import read_blocks
 from rmscene.tagged_block_common import CrdtId
@@ -36,5 +37,6 @@ def test_text_anchors_follow_device_layout():
     # paragraph that falls inside the tablet's highlight box for the line
     # (y 470..514 when pos_y is 234).
     assert 470 - 234 < 63 + 3 * 70 < 514 - 234
-    baseline = float(elements[-1].split('y="')[1].split('"')[0])
+    match = re.search(r'translate\([-\d.]+ ([-\d.]+)\)|y="([-\d.]+)"', elements[-1])
+    baseline = float(match.group(1) or match.group(2))
     assert baseline == top + paragraphs * 70
