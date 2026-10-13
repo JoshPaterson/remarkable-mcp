@@ -355,6 +355,7 @@ remarkable_status()
 | `include_ocr` | bool | `False` | Enable OCR on the image |
 | `compatibility` | bool | `False` | Return resource URI instead of embedded resource |
 | `render_merged` | bool \| null | `None` (auto) | PNG compositing mode: auto-merge PDF-backed pages, `True` to request merging explicitly, or `False` for annotations only |
+| `layers` | string | `"visible"` | Layers to draw: `"visible"` (what the tablet shows), `"all"` (include hidden layers), or one layer's name, e.g. `"Layer 3"` |
 
 ### Background Colors
 

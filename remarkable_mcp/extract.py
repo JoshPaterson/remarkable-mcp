@@ -11,13 +11,13 @@ import time
 import zipfile
 from difflib import SequenceMatcher
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 from xml.sax.saxutils import escape as _xml_escape
 
 logger = logging.getLogger(__name__)
 
 
-def _rm_to_svg(rm_file_path: Path, output_svg_path: Path) -> bool:
+def _rm_to_svg(rm_file_path: Path, output_svg_path: Path, layers: Optional[str] = None) -> bool:
     """Convert a .rm file to SVG using the built-in rmscene renderers.
 
     The ``rmc`` dependency has been dropped: it transitively pinned
@@ -31,7 +31,7 @@ def _rm_to_svg(rm_file_path: Path, output_svg_path: Path) -> bool:
 
     Credit: khalid-hasan (PR #97), ljdutel (#95)
     """
-    svg_content = _render_rm_v6_to_svg(rm_file_path) or _render_rm_v5_to_svg(rm_file_path)
+    svg_content = _render_rm_v6_to_svg(rm_file_path, layers) or _render_rm_v5_to_svg(rm_file_path)
     if svg_content is not None:
         output_svg_path.write_text(svg_content)
         return True
@@ -576,6 +576,165 @@ def _v6_paper_size(blocks: list) -> Tuple[float, float]:
     return float(REMARKABLE_WIDTH), float(REMARKABLE_HEIGHT)
 
 
+def _is_scene_group(item: Any) -> bool:
+    """True for an rmscene ``Group`` (a layer or a nested group)."""
+    return hasattr(item, "node_id") and hasattr(getattr(item, "children", None), "values")
+
+
+def _scene_items(node: Any):
+    """Yield ``(item, group_node_id)`` for every leaf item below ``node``."""
+    for child in node.children.values():
+        if _is_scene_group(child):
+            yield from _scene_items(child)
+        else:
+            yield child, node.node_id
+
+
+def _lww(value: Any, default: Any) -> Any:
+    """Value of an rmscene ``LwwValue`` (or a plain value)."""
+    value = getattr(value, "value", value)
+    return default if value is None else value
+
+
+def _v6_scene(rm_file_path: Path) -> Optional[Tuple[list, Any]]:
+    """``(blocks, scene_tree)`` for a v6 page, or None if it cannot be parsed."""
+    blocks = _v6_blocks(rm_file_path)
+    if blocks is None:
+        return None
+    tree = _v6_tree(blocks)
+    return None if tree is None else (blocks, tree)
+
+
+def _v6_tree(blocks: list) -> Optional[Any]:
+    """Build an rmscene ``SceneTree`` from v6 blocks, or None on failure."""
+    try:
+        from rmscene.scene_stream import build_tree
+        from rmscene.scene_tree import SceneTree
+
+        tree = SceneTree()
+        build_tree(tree, blocks)
+    except Exception:
+        return None
+    return tree
+
+
+def _v6_layer_order(blocks: list) -> List[Any]:
+    """Node ids of a page's live layers, in tablet order.
+
+    Layers are the groups placed directly under the scene root, ordered as a
+    CRDT sequence. Moving a layer deletes its old group item and inserts a new
+    one, so the sequence is ordered with its deleted items in place (rmscene's
+    tree drops them, which breaks the order). Deleting a layer writes a
+    scene-tree entry moving the layer's node under (0, 0); the last entry for a
+    node wins.
+    """
+    try:
+        from rmscene.crdt_sequence import toposort_items
+        from rmscene.scene_stream import SceneGroupItemBlock, SceneTreeBlock
+        from rmscene.tagged_block_common import CrdtId
+    except ImportError:
+        return []
+    root = CrdtId(0, 1)
+    detached = CrdtId(0, 0)
+
+    parents: dict = {}
+    items = []
+    for block in blocks:
+        if isinstance(block, SceneTreeBlock):
+            node = block.node_id if block.node_id != detached else block.tree_id
+            parents[node] = block.parent_id
+        elif isinstance(block, SceneGroupItemBlock) and block.parent_id == root:
+            items.append(block.item)
+
+    values = {item.item_id: item.value for item in items}
+    order = []
+    for item_id in toposort_items(items):
+        node = values.get(item_id)
+        if node is None or node in order or parents.get(node, root) == detached:
+            continue
+        order.append(node)
+    return order
+
+
+def _scene_layers(tree: Any, blocks: list) -> List[Dict[str, Any]]:
+    """Live layers of a page, in tablet order.
+
+    Each layer is ``{"name", "visible", "group"}``; layers without a label are
+    named ``Layer N`` by position, as the tablet shows them.
+    """
+    layers = []
+    for node_id in _v6_layer_order(blocks):
+        try:
+            group = tree[node_id]
+        except (KeyError, TypeError):
+            continue
+        if not _is_scene_group(group):
+            continue
+        label = _lww(getattr(group, "label", None), "")
+        layers.append(
+            {
+                "name": str(label) if label else f"Layer {len(layers) + 1}",
+                "visible": bool(_lww(getattr(group, "visible", None), True)),
+                "group": group,
+            }
+        )
+    return layers
+
+
+# Layer selections for rendering: visible layers only (the default), every
+# layer, or a single layer given by name.
+LAYERS_VISIBLE = "visible"
+LAYERS_ALL = "all"
+
+
+def _v6_layer_node_filter(blocks: list, layers: Optional[str]) -> Optional[Callable[[Any], bool]]:
+    """Predicate on an item's group node id: should it be drawn?
+
+    Returns None when every item should be drawn: ``layers="all"``, or the page
+    has no layer structure rmscene can rebuild. Items whose group is outside
+    every layer are drawn unless a single layer is requested.
+    """
+    selection = (layers or LAYERS_VISIBLE).strip()
+    if selection.lower() == LAYERS_ALL:
+        return None
+    tree = _v6_tree(blocks)
+    if tree is None:
+        return None
+    page_layers = _scene_layers(tree, blocks)
+    if not page_layers:
+        return None
+
+    def subtree_nodes(group) -> set:
+        nodes = {group.node_id}
+        for child in group.children.values():
+            if _is_scene_group(child):
+                nodes |= subtree_nodes(child)
+        return nodes
+
+    if selection.lower() == LAYERS_VISIBLE:
+        hidden: set = set()
+        for layer in page_layers:
+            if not layer["visible"]:
+                hidden |= subtree_nodes(layer["group"])
+        return lambda node_id: node_id not in hidden
+
+    wanted = selection.lower()
+    allowed: set = set()
+    for layer in page_layers:
+        if layer["name"].lower() == wanted:
+            allowed |= subtree_nodes(layer["group"])
+    return lambda node_id: node_id in allowed
+
+
+def v6_page_layers(rm_file_path: Path) -> List[Dict[str, Any]]:
+    """``[{"name", "visible"}]`` for a v6 page's layers, in tablet order."""
+    scene = _v6_scene(rm_file_path)
+    if scene is None:
+        return []
+    blocks, tree = scene
+    return [{"name": la["name"], "visible": la["visible"]} for la in _scene_layers(tree, blocks)]
+
+
 def _v6_group_offsets(blocks: list, anchor_pos: dict) -> dict:
     """Map group node ``CrdtId``s to cumulative ``(dx, dy)`` anchor offsets.
 
@@ -636,7 +795,9 @@ def _v6_group_offsets(blocks: list, anchor_pos: dict) -> dict:
     return offsets
 
 
-def _v6_paths_from_blocks(blocks: list, anchor_pos: Optional[dict] = None) -> Tuple[list, list]:
+def _v6_paths_from_blocks(
+    blocks: list, anchor_pos: Optional[dict] = None, layers: Optional[str] = None
+) -> Tuple[list, list]:
     """Build SVG ``<path>`` strings + a flat coordinate list from v6 blocks.
 
     ``anchor_pos`` (from :func:`_v6_text_elements_with_bounds`) enables
@@ -644,6 +805,10 @@ def _v6_paths_from_blocks(blocks: list, anchor_pos: Optional[dict] = None) -> Tu
     typed-text line are shifted to that line's position, matching where the
     device draws them. Without it strokes render at their stored coordinates,
     which for anchored groups is on top of the typed text block.
+
+    ``layers`` selects which layers to draw: ``"visible"`` (default) draws the
+    layers shown on the tablet, ``"all"`` includes hidden layers, and any other
+    value draws only the layer with that name (case-insensitive).
     """
     # Integer pen/color values (rmscene exposes ints on blocks).
     HIGHLIGHTER_PENS = {5, 18}  # HIGHLIGHTER_1, HIGHLIGHTER_2
@@ -666,11 +831,14 @@ def _v6_paths_from_blocks(blocks: list, anchor_pos: Optional[dict] = None) -> Tu
     }
 
     group_offsets = _v6_group_offsets(blocks, anchor_pos) if anchor_pos else {}
+    draw_node = _v6_layer_node_filter(blocks, layers)
 
     paths: list = []
     all_coords: list = []
     for block in blocks:
         if not hasattr(block, "item") or not hasattr(block.item, "value"):
+            continue
+        if draw_node is not None and not draw_node(getattr(block, "parent_id", None)):
             continue
         line = block.item.value
         dx, dy = group_offsets.get(getattr(block, "parent_id", None), (0.0, 0.0))
@@ -914,7 +1082,7 @@ def _v6_text_elements_with_bounds(blocks: list) -> Tuple[list, list, dict]:
     return elements, coords, anchor_pos
 
 
-def _render_rm_v6_to_svg(rm_file_path: Path) -> Optional[str]:
+def _render_rm_v6_to_svg(rm_file_path: Path, layers: Optional[str] = None) -> Optional[str]:
     """
     Render a v6 .rm file to a content-cropped SVG (read-only viewing).
 
@@ -928,7 +1096,7 @@ def _render_rm_v6_to_svg(rm_file_path: Path) -> Optional[str]:
         return None
     try:
         text_elements, text_coords, anchor_pos = _v6_text_elements_with_bounds(blocks)
-        paths, all_coords = _v6_paths_from_blocks(blocks, anchor_pos)
+        paths, all_coords = _v6_paths_from_blocks(blocks, anchor_pos, layers)
         # Typed text is drawn under strokes (handwriting layers on top), and its
         # extent is folded into the crop so a text-only page still renders.
         return _svg_from_paths(text_elements + paths, all_coords + text_coords)
@@ -937,7 +1105,7 @@ def _render_rm_v6_to_svg(rm_file_path: Path) -> Optional[str]:
 
 
 def render_rm_file_to_png(
-    rm_file_path: Path, background_color: Optional[str] = None
+    rm_file_path: Path, background_color: Optional[str] = None, layers: Optional[str] = None
 ) -> Optional[bytes]:
     """
     Render a .rm file to PNG image bytes.
@@ -961,7 +1129,7 @@ def render_rm_file_to_png(
             tmp_svg_path = Path(tmp_svg.name)
 
         # Convert .rm to SVG via the rmscene renderers
-        if not _rm_to_svg(rm_file_path, tmp_svg_path):
+        if not _rm_to_svg(rm_file_path, tmp_svg_path, layers):
             return None
 
         # Get content bounds from SVG
@@ -1078,7 +1246,7 @@ def _svg_string_to_png(
 
 
 def render_rm_file_full_page_png(
-    rm_file_path: Path, background_color: Optional[str] = None
+    rm_file_path: Path, background_color: Optional[str] = None, layers: Optional[str] = None
 ) -> Optional[Tuple[bytes, Tuple[float, float]]]:
     """Render a v6 .rm page to a FULL-PAGE PNG (not cropped to ink).
 
@@ -1097,7 +1265,7 @@ def render_rm_file_full_page_png(
         return None
     try:
         text_elements, _, anchor_pos = _v6_text_elements_with_bounds(blocks)
-        paths, _ = _v6_paths_from_blocks(blocks, anchor_pos)
+        paths, _ = _v6_paths_from_blocks(blocks, anchor_pos, layers)
         paper_w, paper_h = _v6_paper_size(blocks)
     except Exception:
         return None
@@ -1116,7 +1284,7 @@ def render_rm_file_full_page_png(
 
 
 def render_rm_file_to_svg(
-    rm_file_path: Path, background_color: Optional[str] = None
+    rm_file_path: Path, background_color: Optional[str] = None, layers: Optional[str] = None
 ) -> Optional[str]:
     """
     Render a .rm file to SVG string.
@@ -1142,7 +1310,7 @@ def render_rm_file_to_svg(
             tmp_svg_path = Path(tmp_svg.name)
 
         # Convert .rm to SVG via the rmscene renderers
-        if not _rm_to_svg(rm_file_path, tmp_svg_path):
+        if not _rm_to_svg(rm_file_path, tmp_svg_path, layers):
             return None
 
         # Read SVG content
@@ -1300,8 +1468,24 @@ def _select_rm_file_for_page(tmpdir_path: Path, rm_files: List[Path], page: int)
     return None
 
 
+def get_page_layers_from_document_zip(zip_path: Path, page: int = 1) -> List[Dict[str, Any]]:
+    """``[{"name", "visible"}]`` for a page's layers; empty if it has none."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmpdir_path = Path(tmpdir)
+        with zipfile.ZipFile(zip_path, "r") as zf:
+            zf.extractall(tmpdir_path)
+        rm_files = _get_ordered_rm_files(tmpdir_path)
+        rm_file = _select_rm_file_for_page(tmpdir_path, rm_files, page)
+        if rm_file is None:
+            return []
+        return v6_page_layers(rm_file)
+
+
 def render_page_from_document_zip_svg(
-    zip_path: Path, page: int = 1, background_color: Optional[str] = None
+    zip_path: Path,
+    page: int = 1,
+    background_color: Optional[str] = None,
+    layers: Optional[str] = None,
 ) -> Optional[str]:
     """
     Render a specific page from a reMarkable document zip to SVG.
@@ -1329,11 +1513,16 @@ def render_page_from_document_zip_svg(
         if target_rm_file is None:
             return None
 
-        return render_rm_file_to_svg(target_rm_file, background_color=background_color)
+        return render_rm_file_to_svg(
+            target_rm_file, background_color=background_color, layers=layers
+        )
 
 
 def render_page_from_document_zip(
-    zip_path: Path, page: int = 1, background_color: Optional[str] = None
+    zip_path: Path,
+    page: int = 1,
+    background_color: Optional[str] = None,
+    layers: Optional[str] = None,
 ) -> Optional[bytes]:
     """
     Render a specific page from a reMarkable document zip to PNG.
@@ -1361,7 +1550,9 @@ def render_page_from_document_zip(
         if target_rm_file is None:
             return None
 
-        return render_rm_file_to_png(target_rm_file, background_color=background_color)
+        return render_rm_file_to_png(
+            target_rm_file, background_color=background_color, layers=layers
+        )
 
 
 def _document_paper_size(rm_files: List[Path]) -> Tuple[float, float]:
@@ -1378,7 +1569,10 @@ def _document_paper_size(rm_files: List[Path]) -> Tuple[float, float]:
 
 
 def render_page_full_page_from_document_zip(
-    zip_path: Path, page: int = 1, background_color: Optional[str] = None
+    zip_path: Path,
+    page: int = 1,
+    background_color: Optional[str] = None,
+    layers: Optional[str] = None,
 ) -> Optional[Tuple[bytes, Tuple[float, float]]]:
     """Full-page render of a page, addressed by cPages index.
 
@@ -1404,11 +1598,15 @@ def render_page_full_page_from_document_zip(
             tmpdir_path,
             page=page,
             background_color=background_color,
+            layers=layers,
         )
 
 
 def render_page_full_page_from_extracted_document(
-    tmpdir_path: Path, page: int = 1, background_color: Optional[str] = None
+    tmpdir_path: Path,
+    page: int = 1,
+    background_color: Optional[str] = None,
+    layers: Optional[str] = None,
 ) -> Optional[Tuple[bytes, Tuple[float, float]]]:
     """Render a full page from an already extracted document archive."""
     rm_files = _get_ordered_rm_files(tmpdir_path)
@@ -1425,7 +1623,9 @@ def render_page_full_page_from_extracted_document(
         rm_file = rm_files[page - 1]
 
     if rm_file is not None and rm_file.exists():
-        return render_rm_file_full_page_png(rm_file, background_color=background_color)
+        return render_rm_file_full_page_png(
+            rm_file, background_color=background_color, layers=layers
+        )
 
     # The page exists in cPages but has no .rm layer yet (a blank page):
     # render a blank full page at the document's paper size so the viewer
@@ -1695,6 +1895,7 @@ def render_merged_page_from_document_zip(
     background_color: Optional[str] = None,
     canvas_width: Optional[int] = None,
     canvas_height: Optional[int] = None,
+    layers: Optional[str] = None,
 ) -> tuple[Optional[bytes], Optional[str]]:
     """Render a page with the PDF underlay composited with the annotation layer.
 
@@ -1730,6 +1931,7 @@ def render_merged_page_from_document_zip(
             background_color=background_color,
             canvas_width=canvas_width,
             canvas_height=canvas_height,
+            layers=layers,
         )
 
 
@@ -1739,6 +1941,7 @@ def render_merged_page_from_extracted_document(
     background_color: Optional[str] = None,
     canvas_width: Optional[int] = None,
     canvas_height: Optional[int] = None,
+    layers: Optional[str] = None,
 ) -> tuple[Optional[bytes], Optional[str]]:
     """Render a merged page from an already extracted document archive."""
     import io
@@ -1755,6 +1958,7 @@ def render_merged_page_from_extracted_document(
             tmpdir_path,
             page=page,
             background_color=background_color,
+            layers=layers,
         )
         if full_page is None:
             return None, f"Page {page} has no renderable annotation layer."
@@ -1787,6 +1991,7 @@ def render_merged_page_from_extracted_document(
             tmpdir_path,
             page=page,
             background_color=background_color,
+            layers=layers,
         )
         if full_page is None:
             return None, f"{reason}; page has no renderable annotation layer."
@@ -1833,7 +2038,7 @@ def render_merged_page_from_extracted_document(
         with tempfile.NamedTemporaryFile(suffix=".svg", delete=False) as tmp_svg:
             ann_svg_path = Path(tmp_svg.name)
 
-        if target_rm_file is not None and _rm_to_svg(target_rm_file, ann_svg_path):
+        if target_rm_file is not None and _rm_to_svg(target_rm_file, ann_svg_path, layers):
             # rmscene coordinates use the device paper grid, not PDF points. Set
             # the root viewBox to the calibrated page rectangle before rasterizing.
             svg_content = ann_svg_path.read_text()
