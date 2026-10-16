@@ -4,6 +4,7 @@ Text extraction helpers for reMarkable documents.
 
 import json
 import logging
+import math
 import os
 import tempfile
 import threading
@@ -154,6 +155,8 @@ CONTENT_MARGIN = 50
 # rasterised at this resolution preserving the page aspect; the displayed image
 # is then scaled by the host, so this only sets crispness, not layout.
 FULL_PAGE_TARGET_LONG_EDGE = 1872
+# Blank space kept below the lowest ink when a page is extended to hold it.
+INK_EXTENSION_MARGIN = 50.0
 
 # Cache TTL in seconds (5 minutes)
 CACHE_TTL_SECONDS = 300
@@ -1077,8 +1080,23 @@ def _svg_string_to_png(
             doc.close()
 
 
+def _extend_to_ink(paper_h: float, coords: list) -> float:
+    """Page height grown to hold ink written below the page.
+
+    On the tablet a page can be scrolled and written on past its
+    ``paper_size``; the page then extends downward. Returns ``paper_h`` when
+    all ink fits, otherwise the lowest ink plus ``INK_EXTENSION_MARGIN``.
+    """
+    if not coords:
+        return paper_h
+    bottom = max(c[1] for c in coords)
+    if bottom <= paper_h:
+        return paper_h
+    return float(math.ceil(bottom + INK_EXTENSION_MARGIN))
+
+
 def render_rm_file_full_page_png(
-    rm_file_path: Path, background_color: Optional[str] = None
+    rm_file_path: Path, background_color: Optional[str] = None, extend_to_ink: bool = True
 ) -> Optional[Tuple[bytes, Tuple[float, float]]]:
     """Render a v6 .rm page to a FULL-PAGE PNG (not cropped to ink).
 
@@ -1089,7 +1107,12 @@ def render_rm_file_full_page_png(
     overlay places strokes exactly where the write tool will, and blank pages
     render as a blank page instead of returning ``None``.
 
-    Returns ``(png_bytes, (paper_w, paper_h))`` or ``None`` if the file is not
+    With ``extend_to_ink`` the page grows downward to include ink written
+    below ``paper_size`` (see ``_extend_to_ink``), at the same scale; the
+    origin and top of the page are unchanged. The interactive canvas passes
+    False to keep the strict ``paper_size`` frame.
+
+    Returns ``(png_bytes, (page_w, page_h))`` or ``None`` if the file is not
     v6 or rendering dependencies are unavailable (callers should fall back).
     """
     blocks = _v6_blocks(rm_file_path)
@@ -1097,22 +1120,23 @@ def render_rm_file_full_page_png(
         return None
     try:
         text_elements, _, anchor_pos = _v6_text_elements_with_bounds(blocks)
-        paths, _ = _v6_paths_from_blocks(blocks, anchor_pos)
+        paths, coords = _v6_paths_from_blocks(blocks, anchor_pos)
         paper_w, paper_h = _v6_paper_size(blocks)
     except Exception:
         return None
 
+    page_h = _extend_to_ink(paper_h, coords) if extend_to_ink else paper_h
     # Typed text is drawn first so handwritten strokes layer on top of it,
     # matching the device's compositing order.
-    svg = _svg_full_page(text_elements + paths, paper_w, paper_h)
+    svg = _svg_full_page(text_elements + paths, paper_w, page_h)
     scale = FULL_PAGE_TARGET_LONG_EDGE / max(paper_w, paper_h)
     output_width = max(1, round(paper_w * scale))
-    output_height = max(1, round(paper_h * scale))
+    output_height = max(1, round(page_h * scale))
 
     png = _svg_string_to_png(svg, output_width, output_height, background_color)
     if png is None:
         return None
-    return png, (paper_w, paper_h)
+    return png, (paper_w, page_h)
 
 
 def render_rm_file_to_svg(
@@ -1378,7 +1402,10 @@ def _document_paper_size(rm_files: List[Path]) -> Tuple[float, float]:
 
 
 def render_page_full_page_from_document_zip(
-    zip_path: Path, page: int = 1, background_color: Optional[str] = None
+    zip_path: Path,
+    page: int = 1,
+    background_color: Optional[str] = None,
+    extend_to_ink: bool = True,
 ) -> Optional[Tuple[bytes, Tuple[float, float]]]:
     """Full-page render of a page, addressed by cPages index.
 
@@ -1391,8 +1418,10 @@ def render_page_full_page_from_document_zip(
        have no ``.rm`` file) are present.
     2. The page is rendered full-bleed using its own ``SceneInfo.paper_size``,
        so the overlay's normalized coordinates map exactly onto stroke space.
+       The canvas passes ``extend_to_ink=False`` to keep that frame; reads and
+       exports extend the page downward to include ink written below it.
 
-    Returns ``(png_bytes, (paper_w, paper_h))`` or ``None`` (caller falls back
+    Returns ``(png_bytes, (page_w, page_h))`` or ``None`` (caller falls back
     to PDF rasterization or an error).
     """
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -1404,11 +1433,15 @@ def render_page_full_page_from_document_zip(
             tmpdir_path,
             page=page,
             background_color=background_color,
+            extend_to_ink=extend_to_ink,
         )
 
 
 def render_page_full_page_from_extracted_document(
-    tmpdir_path: Path, page: int = 1, background_color: Optional[str] = None
+    tmpdir_path: Path,
+    page: int = 1,
+    background_color: Optional[str] = None,
+    extend_to_ink: bool = True,
 ) -> Optional[Tuple[bytes, Tuple[float, float]]]:
     """Render a full page from an already extracted document archive."""
     rm_files = _get_ordered_rm_files(tmpdir_path)
@@ -1425,7 +1458,9 @@ def render_page_full_page_from_extracted_document(
         rm_file = rm_files[page - 1]
 
     if rm_file is not None and rm_file.exists():
-        return render_rm_file_full_page_png(rm_file, background_color=background_color)
+        return render_rm_file_full_page_png(
+            rm_file, background_color=background_color, extend_to_ink=extend_to_ink
+        )
 
     # The page exists in cPages but has no .rm layer yet (a blank page):
     # render a blank full page at the document's paper size so the viewer
