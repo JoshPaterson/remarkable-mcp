@@ -2467,6 +2467,46 @@ class _DocumentExportResult:
     pdf_mode: PdfMode | None = None
 
 
+def _parse_page_spec(pages) -> List[tuple]:
+    """``(first, last)`` ranges from ``5``, ``"5"`` or ``"5-9,12"``; ValueError if malformed."""
+    if isinstance(pages, bool):
+        raise ValueError("pages must be a page number or ranges like '5-9,12'.")
+    if isinstance(pages, int):
+        parts = [str(pages)]
+    else:
+        parts = [part.strip() for part in str(pages).split(",")]
+    ranges = []
+    for part in parts:
+        first, sep, last = part.partition("-")
+        try:
+            start = int(first)
+            end = int(last) if sep else start
+        except ValueError:
+            raise ValueError(
+                f"Invalid page selection '{part}'. Use a page number or ranges like '5-9,12'."
+            )
+        if start < 1 or end < start:
+            raise ValueError(
+                f"Invalid page range '{part}'. Pages start at 1 and ranges run low to high."
+            )
+        ranges.append((start, end))
+    return ranges
+
+
+def _select_pages(ranges: List[tuple], page_count: int) -> List[int]:
+    """Pages in ``ranges``, in document order without repeats, checked against the count."""
+    out_of_range = [r for r in ranges if r[1] > page_count]
+    if out_of_range:
+        first, last = out_of_range[0]
+        label = f"{first}" if first == last else f"{first}-{last}"
+        raise _ExportRequestError(
+            "invalid_page_selection",
+            f"Page selection {label} is outside the document, which has {page_count} page(s).",
+            f"Choose pages between 1 and {page_count}.",
+        )
+    return sorted({page for first, last in ranges for page in range(first, last + 1)})
+
+
 class _ExportRequestError(Exception):
     def __init__(self, error_type: str, message: str, suggestion: str):
         super().__init__(message)
@@ -2499,8 +2539,17 @@ def _publish_document_export(
     pdf_mode: PdfMode,
     include_ocr: bool,
     background_color: str,
+    page_ranges: Optional[List[tuple]] = None,
 ) -> PublishedExport[_DocumentExportResult]:
-    """Download, build, and publish one export without touching tablet state."""
+    """Download, build, and publish one export without touching tablet state.
+
+    ``page_ranges`` (PDF only) limits the export to those physical pages.
+    """
+
+    def selection(page_count: Optional[int]) -> Optional[List[int]]:
+        if page_ranges is None or page_count is None:
+            return None
+        return _select_pages(page_ranges, page_count)
 
     def writer(destination: Path) -> _DocumentExportResult:
         raw_doc = client.download(target_doc)
@@ -2527,7 +2576,9 @@ def _publish_document_export(
                             "or newer USB firmware that exposes an rmdoc archive."
                         ),
                     )
-                build = write_native_pdf_export(raw_doc, destination, resolved)
+                build = write_native_pdf_export(
+                    raw_doc, destination, resolved, pages=selection(page_count)
+                )
                 return _DocumentExportResult(
                     build=build,
                     metadata=resolved,
@@ -2587,7 +2638,12 @@ def _publish_document_export(
                     if _is_pdf_payload(native_pdf):
                         native_pages = _count_pdf_pages(native_pdf)
                         native_metadata = replace(resolved, page_count=native_pages)
-                        build = write_native_pdf_export(native_pdf, destination, native_metadata)
+                        build = write_native_pdf_export(
+                            native_pdf,
+                            destination,
+                            native_metadata,
+                            pages=selection(native_pages),
+                        )
                         return _DocumentExportResult(
                             build=build,
                             metadata=native_metadata,
@@ -2616,6 +2672,7 @@ def _publish_document_export(
                     resolved,
                     pdf_mode=pdf_mode,
                     background_color=background_color,
+                    pages=selection(resolved.page_count),
                 )
                 return _DocumentExportResult(
                     build=build,
@@ -2700,6 +2757,7 @@ async def remarkable_export(
     output_format: Literal["pdf", "markdown"] = "pdf",
     pdf_mode: Literal["merged", "annotations"] = "merged",
     include_ocr: bool = False,
+    pages: Optional[int | str] = None,
 ):
     """
     <usecase>Export one reMarkable document as a reusable PDF or Markdown file.</usecase>
@@ -2719,6 +2777,8 @@ async def remarkable_export(
       transport provides a document archive.
     - Pages remain in physical device order. A render failure produces a labeled
       placeholder at that ordinal and a partial-export warning; pages are not skipped.
+    - `pages` exports only the selected physical pages (same numbering as
+      remarkable_image), in document order.
 
     Markdown behavior:
     - Preserves basic source metadata and fixed source text, typed text, annotation,
@@ -2732,11 +2792,13 @@ async def remarkable_export(
     - output_format: "pdf" (default) or "markdown".
     - pdf_mode: PDF-only mode, "merged" (default) or "annotations".
     - include_ocr: Enable existing handwriting OCR for Markdown (default: False).
+    - pages: PDF only. One page (5) or ranges ("5-9,12"); default: every page.
     </parameters>
     <examples>
     - remarkable_export("Meeting Notes")
     - remarkable_export("Research Paper", output_format="pdf", pdf_mode="annotations")
     - remarkable_export("Journal", output_format="markdown", include_ocr=True)
+    - remarkable_export("Lecture Notes", pages="3-5,9")
     </examples>
     """
     if output_format == "markdown" and pdf_mode != "merged":
@@ -2751,6 +2813,22 @@ async def remarkable_export(
             message="include_ocr applies only to Markdown exports.",
             suggestion="Set include_ocr=False, or choose output_format='markdown'.",
         )
+    page_ranges = None
+    if pages is not None:
+        if output_format != "pdf":
+            return make_error(
+                error_type="invalid_export_options",
+                message="pages applies only to PDF exports.",
+                suggestion="Omit pages for Markdown, or choose output_format='pdf'.",
+            )
+        try:
+            page_ranges = _parse_page_spec(pages)
+        except ValueError as exc:
+            return make_error(
+                error_type="invalid_page_selection",
+                message=str(exc),
+                suggestion="Examples: pages=5, pages='5-9', pages='1,3,10-12'.",
+            )
 
     try:
         client = await run_blocking(get_rmapi)
@@ -2796,6 +2874,7 @@ async def remarkable_export(
             pdf_mode=pdf_mode,
             include_ocr=include_ocr,
             background_color=background,
+            page_ranges=page_ranges,
         )
     except _ExportRequestError as exc:
         return make_error(
@@ -2835,6 +2914,9 @@ async def remarkable_export(
     }
     if result.pdf_mode is not None:
         response["pdf_mode"] = result.pdf_mode
+    if page_ranges is not None:
+        response["selected_pages"] = _select_pages(page_ranges, result.metadata.page_count)
+        response["document_pages"] = result.metadata.page_count
     if build.ocr_backend:
         response["ocr_backend"] = build.ocr_backend
 

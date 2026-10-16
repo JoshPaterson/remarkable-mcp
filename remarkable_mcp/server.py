@@ -105,8 +105,8 @@ def _build_instructions() -> str:
 - `remarkable_status()` - Check connection and diagnose issues
 - `remarkable_image(document, page, include_ocr, layers, dpi, region)` - Get a page
   image (PNG or SVG) with optional OCR
-- `remarkable_export(document, output_format)` - Export one document as a
-  temporary PDF or Markdown resource
+- `remarkable_export(document, output_format, pages)` - Export one document (or
+  selected pages, PDF only) as a temporary PDF or Markdown resource
 
 ## Recommended Workflows
 
@@ -149,6 +149,7 @@ by default only visible layers are drawn, and `layers="Layer 2"` draws one layer
 Use `remarkable_export` for a complete PDF or structured Markdown artifact.
 Exports never modify the tablet, but they do create a server-managed temporary
 local file. The returned resource link expires after 15 minutes.
+Example: `remarkable_export("Lecture Notes", pages="3-5,9")` exports only those pages.
 
 ### For Large Documents
 Use pagination to avoid overwhelming context. The response includes:

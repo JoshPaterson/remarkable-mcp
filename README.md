@@ -514,6 +514,9 @@ remarkable_export("Journal", output_format="markdown", include_ocr=True)
 
 # Export only full-page annotation layers when archive data is available
 remarkable_export("Research Paper", pdf_mode="annotations")
+
+# Export selected pages as a PDF
+remarkable_export("Lecture Notes", pages="3-5,9")
 ```
 
 > **Note:** PNG rendering uses PyMuPDF for both notebook SVGs and PDF pages, so
