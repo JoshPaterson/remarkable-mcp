@@ -10,7 +10,7 @@ import zipfile
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Iterable, Iterator, Literal, Optional
+from typing import Iterable, Iterator, Literal, Optional, Sequence
 
 import fitz
 from PIL import Image
@@ -104,8 +104,12 @@ def write_native_pdf_export(
     pdf_bytes: bytes,
     destination: Path,
     metadata: ExportMetadata,
+    pages: Sequence[int] | None = None,
 ) -> ExportBuildResult:
-    """Preserve an existing complete PDF while adding stable source metadata."""
+    """Preserve an existing complete PDF while adding stable source metadata.
+
+    ``pages`` (1-based, in output order) keeps only those pages.
+    """
     if not pdf_bytes.lstrip().startswith(b"%PDF"):
         raise ValueError("Native PDF export did not contain PDF data")
 
@@ -113,6 +117,11 @@ def write_native_pdf_export(
         page_count = len(document)
         if page_count == 0:
             raise ValueError("Native PDF export has no pages")
+        if pages is not None:
+            if not pages or min(pages) < 1 or max(pages) > page_count:
+                raise ValueError(f"Selected pages are outside 1-{page_count}")
+            document.select([page - 1 for page in pages])
+            page_count = len(document)
         document.set_metadata(_pdf_metadata(document.metadata, metadata))
         document.save(str(destination), garbage=3, deflate=True)
 
@@ -133,23 +142,33 @@ def write_rendered_pdf_export(
     destination: Path,
     metadata: ExportMetadata,
     pages: Iterable[RenderedPage],
+    page_numbers: Sequence[int] | None = None,
 ) -> ExportBuildResult:
-    """Assemble ordered rendered pages, retaining failed ordinals as placeholders."""
+    """Assemble ordered rendered pages, retaining failed ordinals as placeholders.
+
+    ``page_numbers`` lists the physical pages expected, in order; by default
+    every page from 1 to ``metadata.page_count``.
+    """
     output = fitz.open()
     failed_pages: list[int] = []
     warnings: list[str] = []
-    expected_page = 1
+    expected = list(page_numbers) if page_numbers is not None else None
+    position = 0
     previous_size = (445.0, 594.0)
     partial = False
 
     try:
         for rendered in pages:
+            position += 1
+            if expected is None:
+                expected_page = position
+            else:
+                expected_page = expected[position - 1] if position <= len(expected) else None
             if rendered.page != expected_page:
                 raise ValueError(
-                    f"Rendered pages must be sequential: expected {expected_page}, "
+                    f"Rendered pages must be in order: expected {expected_page}, "
                     f"received {rendered.page}"
                 )
-            expected_page += 1
 
             if rendered.warning:
                 warnings.append(f"Page {rendered.page}: {rendered.warning}")
@@ -206,11 +225,16 @@ def write_rendered_pdf_export(
         page_count = len(output)
         if page_count == 0:
             raise ValueError("Document has no physical pages to export")
-        if metadata.page_count is not None and page_count != metadata.page_count:
+        if expected is not None and page_count != len(expected):
             raise ValueError(
-                f"Export produced {page_count} pages but metadata declares "
-                f"{metadata.page_count} physical pages"
+                f"Export produced {page_count} pages but {len(expected)} were selected"
             )
+        if expected is None and metadata.page_count is not None:
+            if page_count != metadata.page_count:
+                raise ValueError(
+                    f"Export produced {page_count} pages but metadata declares "
+                    f"{metadata.page_count} physical pages"
+                )
 
         output.set_metadata(_pdf_metadata({}, metadata))
         output.save(str(destination), garbage=3, deflate=True)
@@ -232,8 +256,12 @@ def render_archive_pages(
     *,
     pdf_mode: PdfMode = "merged",
     background_color: str | None = None,
+    pages: Sequence[int] | None = None,
 ) -> Iterator[RenderedPage]:
-    """Render every physical page from one archive extraction in device order."""
+    """Render physical pages from one archive extraction.
+
+    Renders ``pages`` (1-based, in that order), or every page in device order.
+    """
     if metadata.page_count is None or metadata.page_count <= 0:
         raise ValueError("Physical page count is unavailable")
 
@@ -243,7 +271,7 @@ def render_archive_pages(
             archive.extractall(extracted)
 
         has_source_pdf = any(extracted.glob("**/*.pdf"))
-        for page_number in range(1, metadata.page_count + 1):
+        for page_number in pages if pages is not None else range(1, metadata.page_count + 1):
             try:
                 if pdf_mode == "merged" and metadata.source_type == "pdf" and has_source_pdf:
                     has_mapped_underlay = (
@@ -300,8 +328,12 @@ def write_archive_pdf_export(
     *,
     pdf_mode: PdfMode = "merged",
     background_color: str | None = None,
+    pages: Sequence[int] | None = None,
 ) -> ExportBuildResult:
-    """Render and assemble a PDF from a reMarkable document archive."""
+    """Render and assemble a PDF from a reMarkable document archive.
+
+    ``pages`` (1-based, in output order) exports only those pages.
+    """
     return write_rendered_pdf_export(
         destination,
         metadata,
@@ -310,7 +342,9 @@ def write_archive_pdf_export(
             metadata,
             pdf_mode=pdf_mode,
             background_color=background_color,
+            pages=pages,
         ),
+        page_numbers=pages,
     )
 
 

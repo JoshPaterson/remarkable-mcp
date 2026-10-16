@@ -448,6 +448,7 @@ used when configured; otherwise OCR runs locally with Tesseract.
 | `output_format` | `"pdf"` \| `"markdown"` | `"pdf"` | Export format |
 | `pdf_mode` | `"merged"` \| `"annotations"` | `"merged"` | PDF-only rendering mode |
 | `include_ocr` | bool | `False` | Run the existing OCR path for Markdown |
+| `pages` | int \| string | all pages | PDF only: one page (`5`) or ranges (`"5-9,12"`) |
 
 ### Delivery and lifecycle
 
@@ -468,6 +469,9 @@ available when the server runs with `--read-only`.
 ### PDF behavior
 
 - Physical page order comes from reMarkable `.content` metadata.
+- `pages` exports only the selected physical pages, numbered as in
+  `remarkable_image`, in document order. The response lists them in
+  `selected_pages`, with the document's page count in `document_pages`.
 - `pdf_mode="merged"` combines mapped PDF underlays and annotations by default.
 - Native notebooks use complete full-page ink/blank renders.
 - `pdf_mode="annotations"` returns complete annotation layers only.
@@ -507,6 +511,9 @@ remarkable_export("Research Paper", pdf_mode="annotations")
 
 # Markdown with handwriting OCR
 remarkable_export("Journal", output_format="markdown", include_ocr=True)
+
+# Export pages 3-5 and 9 only
+remarkable_export("Lecture Notes", pages="3-5,9")
 ```
 
 ### Response
