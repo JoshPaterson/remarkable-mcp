@@ -731,7 +731,11 @@ async def _render_canvas_page_impl(document: str, page: int, ctx: Optional[Conte
         # coordinate extent, surfaced so the model can draw in-bounds.
         paper_size = None
         full = await run_blocking(
-            render_page_full_page_from_document_zip, tmp_path, page, background_color=background
+            render_page_full_page_from_document_zip,
+            tmp_path,
+            page,
+            background_color=background,
+            extend_to_ink=False,
         )
         render_source = "strokes"
         if full is not None:

@@ -5,6 +5,7 @@ Text extraction helpers for reMarkable documents.
 import functools
 import json
 import logging
+import math
 import os
 import re
 import tempfile
@@ -173,6 +174,8 @@ CONTENT_MARGIN = 50
 # rasterised at this resolution preserving the page aspect; the displayed image
 # is then scaled by the host, so this only sets crispness, not layout.
 FULL_PAGE_TARGET_LONG_EDGE = 1872
+# Blank space kept below the lowest ink when a page is extended to hold it.
+INK_EXTENSION_MARGIN = 50.0
 
 # Cache TTL in seconds (5 minutes)
 CACHE_TTL_SECONDS = 300
@@ -1667,11 +1670,37 @@ def _svg_string_to_png(
             doc.close()
 
 
+def _extend_to_ink(paper_h: float, coords: list) -> float:
+    """Page height grown to hold ink written below the page.
+
+    On the tablet a page can be scrolled and written on past its
+    ``paper_size``; the page then extends downward. Returns ``paper_h`` when
+    all ink fits, otherwise the lowest ink plus ``INK_EXTENSION_MARGIN``.
+    """
+    if not coords:
+        return paper_h
+    bottom = max(c[1] for c in coords)
+    if bottom <= paper_h:
+        return paper_h
+    return float(math.ceil(bottom + INK_EXTENSION_MARGIN))
+
+
+def _v6_page_height(blocks: list, anchor_pos: Optional[dict], paper_h: float) -> float:
+    """Page height including ink written below it, on any layer.
+
+    Hidden layers count too, so the page frame (and ``region`` fractions)
+    stays the same whichever layers are drawn.
+    """
+    _, coords = _v6_paths_from_blocks(blocks, anchor_pos, "all")
+    return _extend_to_ink(paper_h, coords)
+
+
 def render_rm_file_full_page_png(
     rm_file_path: Path,
     background_color: Optional[str] = None,
     layers: Optional[str] = None,
     dpi: Optional[float] = None,
+    extend_to_ink: bool = True,
 ) -> Optional[Tuple[bytes, Tuple[float, float]]]:
     """Render a v6 .rm page to a FULL-PAGE PNG (not cropped to ink).
 
@@ -1682,7 +1711,12 @@ def render_rm_file_full_page_png(
     overlay places strokes exactly where the write tool will, and blank pages
     render as a blank page instead of returning ``None``.
 
-    Returns ``(png_bytes, (paper_w, paper_h))`` or ``None`` if the file is not
+    With ``extend_to_ink`` the page grows downward to include ink written
+    below ``paper_size`` (see ``_extend_to_ink``), at the same scale; the
+    origin and top of the page are unchanged. The interactive canvas passes
+    False to keep the strict ``paper_size`` frame.
+
+    Returns ``(png_bytes, (page_w, page_h))`` or ``None`` if the file is not
     v6 or rendering dependencies are unavailable (callers should fall back).
     """
     blocks = _v6_blocks(rm_file_path)
@@ -1695,17 +1729,18 @@ def render_rm_file_full_page_png(
     except Exception:
         return None
 
+    page_h = _v6_page_height(blocks, anchor_pos, paper_h) if extend_to_ink else paper_h
     # Typed text is drawn first so handwritten strokes layer on top of it,
     # matching the device's compositing order.
-    svg = _svg_full_page(text_elements + paths, paper_w, paper_h)
+    svg = _svg_full_page(text_elements + paths, paper_w, page_h)
     scale = _full_page_scale(paper_w, paper_h, dpi)
     output_width = max(1, round(paper_w * scale))
-    output_height = max(1, round(paper_h * scale))
+    output_height = max(1, round(page_h * scale))
 
     png = _svg_string_to_png(svg, output_width, output_height, background_color)
     if png is None:
         return None
-    return png, (paper_w, paper_h)
+    return png, (paper_w, page_h)
 
 
 def render_rm_file_to_svg(
@@ -1990,6 +2025,7 @@ def render_page_full_page_from_document_zip(
     background_color: Optional[str] = None,
     layers: Optional[str] = None,
     dpi: Optional[float] = None,
+    extend_to_ink: bool = True,
 ) -> Optional[Tuple[bytes, Tuple[float, float]]]:
     """Full-page render of a page, addressed by cPages index.
 
@@ -2002,8 +2038,10 @@ def render_page_full_page_from_document_zip(
        have no ``.rm`` file) are present.
     2. The page is rendered full-bleed using its own ``SceneInfo.paper_size``,
        so the overlay's normalized coordinates map exactly onto stroke space.
+       The canvas passes ``extend_to_ink=False`` to keep that frame; reads and
+       exports extend the page downward to include ink written below it.
 
-    Returns ``(png_bytes, (paper_w, paper_h))`` or ``None`` (caller falls back
+    Returns ``(png_bytes, (page_w, page_h))`` or ``None`` (caller falls back
     to PDF rasterization or an error).
     """
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -2017,6 +2055,7 @@ def render_page_full_page_from_document_zip(
             background_color=background_color,
             layers=layers,
             dpi=dpi,
+            extend_to_ink=extend_to_ink,
         )
 
 
@@ -2026,6 +2065,7 @@ def render_page_full_page_from_extracted_document(
     background_color: Optional[str] = None,
     layers: Optional[str] = None,
     dpi: Optional[float] = None,
+    extend_to_ink: bool = True,
 ) -> Optional[Tuple[bytes, Tuple[float, float]]]:
     """Render a full page from an already extracted document archive."""
     rm_files = _get_ordered_rm_files(tmpdir_path)
@@ -2043,7 +2083,11 @@ def render_page_full_page_from_extracted_document(
 
     if rm_file is not None and rm_file.exists():
         return render_rm_file_full_page_png(
-            rm_file, background_color=background_color, layers=layers, dpi=dpi
+            rm_file,
+            background_color=background_color,
+            layers=layers,
+            dpi=dpi,
+            extend_to_ink=extend_to_ink,
         )
 
     # The page exists in cPages but has no .rm layer yet (a blank page):
@@ -2627,7 +2671,8 @@ def _page_frame(
     """``(width, height, points_per_unit)`` of a page as rendered, in stroke units.
 
     PDF-backed pages span their PDF page; other pages span the scene's paper
-    size. Stroke x coordinates are centered on the page, y starts at the top.
+    size, extended downward to hold ink written below it (as rendered).
+    Stroke x coordinates are centered on the page, y starts at the top.
     """
     blocks = _v6_blocks(rm_file) if rm_file is not None else None
     paper = _v6_paper_size(blocks) if blocks else (REMARKABLE_WIDTH, REMARKABLE_HEIGHT)
@@ -2637,7 +2682,14 @@ def _page_frame(
         if index is not None and 0 <= index < len(pdf_page_sizes):
             width_pt, height_pt = pdf_page_sizes[index]
             return width_pt / ppu, height_pt / ppu, ppu
-    return float(paper[0]), float(paper[1]), ppu
+    height = float(paper[1])
+    if blocks:
+        try:
+            _, _, anchor_pos = _v6_text_elements_with_bounds(blocks)
+            height = _v6_page_height(blocks, anchor_pos, height)
+        except Exception:
+            pass
+    return float(paper[0]), height, ppu
 
 
 def _locate_on_page(
