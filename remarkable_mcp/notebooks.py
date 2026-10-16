@@ -25,6 +25,7 @@ from typing import Optional
 
 from rmscene import simple_text_document, write_blocks
 
+from remarkable_mcp.pages import content_page_ids
 from remarkable_mcp.strokes import WRITE_VERSION
 
 # reMarkable 1/2 portrait stroke space. simple_text_document emits no SceneInfo,
@@ -198,7 +199,9 @@ def append_page_to_content(content_data: dict, new_page_id: str) -> dict:
     idx_value = next_page_idx([v for v in existing_idx if isinstance(v, str)])
     pages.append(_page_entry(new_page_id, idx_value))
 
-    total = len(pages)
+    # Pages deleted on the tablet stay in cPages.pages; the page count and the
+    # new page's position cover only the pages the tablet shows.
+    total = len(content_page_ids(content_data))
     content_data["pageCount"] = total
     return {
         "content": content_data,

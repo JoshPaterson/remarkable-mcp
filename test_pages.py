@@ -75,3 +75,25 @@ def test_document_zip_page_count_and_ids(tmp_path):
     result = extract_text_from_document_zip(zip_path)
     assert result["pages"] == 3
     assert result["page_ids"] == ["p1", "p3", "added"]
+
+
+def test_added_page_counts_only_live_pages():
+    from remarkable_mcp import notebooks as nb
+
+    content = {
+        "cPages": {
+            "pages": [
+                {"id": "a", "idx": {"timestamp": "1:2", "value": "ba"}},
+                {"id": "b", "idx": {"timestamp": "1:2", "value": "bb"}, "deleted": DELETED},
+                {"id": "c", "idx": {"timestamp": "1:2", "value": "bc"}},
+            ]
+        }
+    }
+
+    result = nb.append_page_to_content(content, "d")
+
+    assert result["total_pages"] == 3
+    assert result["page_index"] == 3
+    assert content["pageCount"] == 3
+    # The new page sorts after every existing entry, deleted ones included.
+    assert result["idx"] > "bc"
