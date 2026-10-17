@@ -1,8 +1,10 @@
-"""remarkable_upload from base64 contents."""
+"""remarkable_upload from base64 contents, and moving staged sources to the Trash."""
 
 import base64
 import json
+import os
 import tempfile
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import pytest
@@ -28,6 +30,7 @@ MODE_VARS = [
     "REMARKABLE_LOCAL_DIR",
     "REMARKABLE_READ_ONLY",
     "REMARKABLE_MAX_INLINE_BYTES",
+    "REMARKABLE_UPLOAD_STAGING_DIR",
 ]
 
 
@@ -244,3 +247,155 @@ async def test_path_upload_reports_source_and_keeps_file(monkeypatch, tmp_path):
     assert data["source"] == "path"
     assert data["size_bytes"] == len(PDF)
     assert source.read_bytes() == PDF
+
+
+@pytest.fixture
+def staging(tmp_path, monkeypatch):
+    """A staging folder with one PDF; send2trash is recorded, not run."""
+    folder = tmp_path / "Tablet Uploads"
+    folder.mkdir()
+    (folder / "week3.pdf").write_bytes(PDF)
+    trashed = []
+    monkeypatch.setattr("send2trash.send2trash", lambda path: trashed.append(path))
+    _register(monkeypatch)
+    monkeypatch.setenv("REMARKABLE_UPLOAD_STAGING_DIR", str(folder))
+    mcp._tool_manager._tools.pop("remarkable_upload", None)
+    from remarkable_mcp.write_tools import register_write_tools
+
+    register_write_tools()
+    return SimpleNamespace(folder=folder, source=folder / "week3.pdf", trashed=trashed)
+
+
+async def _upload_tool():
+    return next(t for t in await mcp.list_tools() if t.name == "remarkable_upload")
+
+
+async def test_trash_option_hidden_without_staging_folder(monkeypatch):
+    _register(monkeypatch)
+    tool = await _upload_tool()
+
+    assert "trash_source_after_upload" not in tool.input_schema["properties"]
+    assert "Trash" not in tool.description
+    assert not tool.annotations.destructive_hint
+
+
+async def test_trash_option_offered_with_staging_folder(staging):
+    tool = await _upload_tool()
+
+    assert tool.input_schema["properties"]["trash_source_after_upload"]["default"] is False
+    assert str(staging.folder) in tool.description
+    assert tool.annotations.destructive_hint is True
+
+
+async def test_staged_source_trashed_after_upload(staging):
+    client = _cloud_client()
+    with patch("remarkable_mcp.write_tools.get_rmapi", return_value=client):
+        data = await _upload(file_path=str(staging.source), trash_source_after_upload=True)
+
+    assert data["uploaded"] is True
+    assert data["source_trashed"] is True
+    assert staging.trashed == [os.path.realpath(staging.source)]
+
+
+async def test_staged_source_kept_by_default(staging):
+    client = _cloud_client()
+    with patch("remarkable_mcp.write_tools.get_rmapi", return_value=client):
+        data = await _upload(file_path=str(staging.source))
+
+    assert data["uploaded"] is True
+    assert "source_trashed" not in data
+    assert staging.trashed == []
+
+
+async def test_staged_source_kept_when_upload_fails(staging):
+    client = _cloud_client()
+    client.upload_document.side_effect = RuntimeError("network down")
+    with patch("remarkable_mcp.write_tools.get_rmapi", return_value=client):
+        data = await _upload(file_path=str(staging.source), trash_source_after_upload=True)
+
+    assert data["_error"]["type"] == "upload_failed"
+    assert staging.trashed == []
+    assert staging.source.exists()
+
+
+async def test_staged_source_kept_when_changed_during_upload(staging):
+    client = _cloud_client()
+
+    def upload_and_replace(*args):
+        staging.source.write_bytes(PDF + b"% edited")
+        return Mock(id="new-doc-id")
+
+    client.upload_document.side_effect = upload_and_replace
+    with patch("remarkable_mcp.write_tools.get_rmapi", return_value=client):
+        data = await _upload(file_path=str(staging.source), trash_source_after_upload=True)
+
+    assert data["uploaded"] is True
+    assert data["source_trashed"] is False
+    assert "changed" in data["source_kept_reason"]
+    assert staging.trashed == []
+
+
+async def test_staged_source_kept_when_trash_fails(staging, monkeypatch):
+    def refuse(path):
+        raise OSError("Trash unavailable")
+
+    monkeypatch.setattr("send2trash.send2trash", refuse)
+    client = _cloud_client()
+    with patch("remarkable_mcp.write_tools.get_rmapi", return_value=client):
+        data = await _upload(file_path=str(staging.source), trash_source_after_upload=True)
+
+    assert data["uploaded"] is True
+    assert data["source_trashed"] is False
+    assert "Trash unavailable" in data["source_kept_reason"]
+    assert staging.source.exists()
+
+
+async def test_trash_refused_outside_staging_folder(staging, tmp_path):
+    outside = tmp_path / "course.pdf"
+    outside.write_bytes(PDF)
+    nested = staging.folder / "sub"
+    nested.mkdir()
+    (nested / "deep.pdf").write_bytes(PDF)
+    link = staging.folder / "link.pdf"
+    link.symlink_to(outside)
+    staged_link = staging.folder / "alias.pdf"
+    staged_link.symlink_to(staging.source)
+    client = _cloud_client()
+
+    attempts = {
+        "outside": str(outside),
+        "dotted": str(staging.folder / ".." / "course.pdf"),
+        "subfolder": str(nested / "deep.pdf"),
+        "symlink out": str(link),
+        "symlink in": str(staged_link),
+        "folder": str(staging.folder),
+    }
+    with patch("remarkable_mcp.write_tools.get_rmapi", return_value=client):
+        for label, path in attempts.items():
+            data = await _upload(file_path=path, trash_source_after_upload=True)
+            assert data["_error"]["type"] == "invalid_parameter", label
+
+    client.upload_document.assert_not_called()
+    assert staging.trashed == []
+    assert outside.exists() and staging.source.exists()
+
+
+async def test_trash_refused_for_content_uploads(staging):
+    client = _cloud_client()
+    with patch("remarkable_mcp.write_tools.get_rmapi", return_value=client):
+        data = await _upload(
+            file_content=_b64(PDF), document_name="Doc", trash_source_after_upload=True
+        )
+
+    assert "only to file_path" in data["_error"]["message"]
+    client.upload_document.assert_not_called()
+
+
+async def test_trash_refused_when_staging_folder_unset_later(staging, monkeypatch):
+    monkeypatch.delenv("REMARKABLE_UPLOAD_STAGING_DIR")
+    client = _cloud_client()
+    with patch("remarkable_mcp.write_tools.get_rmapi", return_value=client):
+        data = await _upload(file_path=str(staging.source), trash_source_after_upload=True)
+
+    assert "REMARKABLE_UPLOAD_STAGING_DIR" in data["_error"]["message"]
+    assert staging.trashed == []

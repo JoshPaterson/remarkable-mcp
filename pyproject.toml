@@ -30,6 +30,7 @@ dependencies = [
     "beautifulsoup4>=4.15.0",
     "markdown-it-py>=4.2.0",
     "pymupdf-fonts>=1.0.5",
+    "send2trash>=1.8.3",
 ]
 
 [project.optional-dependencies]
