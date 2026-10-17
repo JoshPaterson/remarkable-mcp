@@ -25,6 +25,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import shlex
 import socket
 import threading
@@ -826,6 +827,82 @@ def _decode_inline_file(file_content: str, file_format: str) -> bytes:
     if file_format == "epub" and not data.startswith(b"PK\x03\x04"):
         raise ValueError("file_content is not an EPUB (it is not a zip archive).")
     return data
+
+
+def upload_staging_dir() -> Optional[str]:
+    """The resolved REMARKABLE_UPLOAD_STAGING_DIR, or None when unset or not a folder.
+
+    Only files directly inside this folder may be moved to the Trash after an
+    upload (``trash_source_after_upload``).
+    """
+    staging = os.environ.get("REMARKABLE_UPLOAD_STAGING_DIR", "").strip()
+    if not staging:
+        return None
+    resolved = os.path.realpath(os.path.expanduser(staging))
+    return resolved if os.path.isdir(resolved) else None
+
+
+def _staged_source(file_path: str) -> str:
+    """Resolve an upload source that may be moved to the Trash afterwards.
+
+    The file must be a regular file (not a symlink) directly inside the
+    staging folder. Raises ``ValueError`` otherwise.
+    """
+    import stat
+
+    staging = upload_staging_dir()
+    if staging is None:
+        raise ValueError(
+            "trash_source_after_upload needs REMARKABLE_UPLOAD_STAGING_DIR set to an "
+            "existing folder."
+        )
+    if os.path.islink(file_path):
+        raise ValueError("trash_source_after_upload does not accept symlinks.")
+    source = os.path.realpath(file_path)
+    if os.path.dirname(source) != staging:
+        raise ValueError(
+            f"trash_source_after_upload is only allowed for files directly inside {staging}."
+        )
+    try:
+        mode = os.lstat(source).st_mode
+    except OSError:
+        raise ValueError(f"File not found: '{file_path}'")
+    if not stat.S_ISREG(mode):
+        raise ValueError("trash_source_after_upload needs a regular file.")
+    return source
+
+
+def _file_sha256(path: str) -> str:
+    import hashlib
+
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _trash_uploaded_source(source: str, uploaded_sha256: str) -> dict:
+    """Move an uploaded staging file to the Trash if it is unchanged since upload.
+
+    Returns the result fields: ``source_trashed`` and, when the file is kept,
+    ``source_kept_reason``.
+    """
+    from send2trash import send2trash
+
+    def kept(reason: str) -> dict:
+        return {"source_trashed": False, "source_kept_reason": reason}
+
+    try:
+        _staged_source(source)
+        if _file_sha256(source) != uploaded_sha256:
+            return kept("The file changed during the upload, so it was kept.")
+        send2trash(source)
+    except ValueError as e:
+        return kept(str(e))
+    except Exception as e:
+        return kept(f"Could not move the file to the Trash: {e}")
+    return {"source_trashed": True}
 
 
 def _add_upload_source(response: str, fields: dict) -> str:
@@ -1833,14 +1910,14 @@ def register_write_tools():
                 return await run_operation(usb_client, "upload", _impl)
         return await asyncio.to_thread(_impl)
 
-    @mcp.tool(annotations=UPLOAD_ANNOTATIONS)
-    async def remarkable_upload(
+    async def _upload_tool(
         file_path: Optional[str] = None,
         parent_folder: str = "/",
         document_name: Optional[str] = None,
         defer_restart: bool = False,
         file_content: Optional[str] = None,
         file_format: str = "pdf",
+        trash_source_after_upload: bool = False,
     ) -> str:
         """
         <usecase>Upload a PDF or EPUB file to the reMarkable tablet.</usecase>
@@ -1911,6 +1988,11 @@ def register_write_tools():
             )
 
         if file_content is not None:
+            if trash_source_after_upload:
+                return invalid(
+                    "trash_source_after_upload applies only to file_path uploads.",
+                    "Omit trash_source_after_upload when using file_content.",
+                )
             if not document_name or not document_name.strip():
                 return invalid(
                     "document_name is required with file_content.",
@@ -1938,9 +2020,96 @@ def register_write_tools():
                 )
             return _add_upload_source(response, {"source": "content", "size_bytes": len(data)})
 
+        source = None
+        uploaded_sha256 = None
+        if trash_source_after_upload:
+            try:
+                source = _staged_source(file_path)
+                uploaded_sha256 = await asyncio.to_thread(_file_sha256, source)
+            except (ValueError, OSError) as e:
+                return invalid(
+                    str(e),
+                    "Upload without trash_source_after_upload, or put the file directly "
+                    "in the staging folder.",
+                )
         size = os.path.getsize(file_path) if os.path.isfile(file_path) else None
         response = await _upload_path(file_path, parent_folder, document_name, defer_restart)
-        return _add_upload_source(response, {"source": "path", "size_bytes": size})
+        fields = {"source": "path", "size_bytes": size}
+        if source is not None:
+            # Only a confirmed upload releases the source; errors and partial
+            # writes keep it.
+            if json.loads(response).get("uploaded") is True:
+                fields.update(
+                    await asyncio.to_thread(_trash_uploaded_source, source, uploaded_sha256)
+                )
+            else:
+                fields.update(
+                    {"source_trashed": False, "source_kept_reason": "The upload did not succeed."}
+                )
+        return _add_upload_source(response, fields)
+
+    upload_doc = _upload_tool.__doc__
+    staging_dir = upload_staging_dir()
+    if staging_dir:
+
+        async def remarkable_upload(
+            file_path: Optional[str] = None,
+            parent_folder: str = "/",
+            document_name: Optional[str] = None,
+            defer_restart: bool = False,
+            file_content: Optional[str] = None,
+            file_format: str = "pdf",
+            trash_source_after_upload: bool = False,
+        ) -> str:
+            return await _upload_tool(
+                file_path,
+                parent_folder,
+                document_name,
+                defer_restart,
+                file_content,
+                file_format,
+                trash_source_after_upload,
+            )
+
+        # Docstrings may or may not keep their indentation (Python 3.13 strips
+        # it), so the option's lines take the indentation of </parameters>.
+        trash_param = (
+            "- trash_source_after_upload: file_path only. When True, move the\n"
+            "  source file to the Trash after a successful upload, so the caller\n"
+            "  needs no delete permission. Only for files directly inside the\n"
+            f"  staging folder {staging_dir}; the file is kept if the upload fails\n"
+            "  or the file changed during it. The result reports source_trashed\n"
+            "  (and source_kept_reason when kept). Use it only when asked to clean\n"
+            "  up the staged copy.\n"
+        )
+        remarkable_upload.__doc__ = re.sub(
+            r"^([ \t]*)</parameters>",
+            lambda m: "".join(m.group(1) + line for line in trash_param.splitlines(True))
+            + m.group(0),
+            upload_doc,
+            count=1,
+            flags=re.M,
+        )
+        # The staging option can remove a local file (recoverably, via the Trash).
+        upload_annotations = ToolAnnotations(read_only_hint=False, destructive_hint=True)
+    else:
+
+        async def remarkable_upload(
+            file_path: Optional[str] = None,
+            parent_folder: str = "/",
+            document_name: Optional[str] = None,
+            defer_restart: bool = False,
+            file_content: Optional[str] = None,
+            file_format: str = "pdf",
+        ) -> str:
+            return await _upload_tool(
+                file_path, parent_folder, document_name, defer_restart, file_content, file_format
+            )
+
+        remarkable_upload.__doc__ = upload_doc
+        upload_annotations = UPLOAD_ANNOTATIONS
+
+    mcp.tool(annotations=upload_annotations)(remarkable_upload)
 
     @mcp.tool(annotations=UPLOAD_ANNOTATIONS)
     async def remarkable_markdown_to_pdf(
