@@ -33,7 +33,7 @@ import time
 import uuid
 from contextlib import contextmanager, nullcontext
 from datetime import datetime
-from typing import Annotated, Optional
+from typing import Annotated, Dict, List, Optional, Union
 
 from mcp.server.mcpserver import Context, Elicit, ElicitationResult, Resolve
 from mcp.types import ToolAnnotations
@@ -1181,6 +1181,110 @@ def _cloud_rename(document: str, new_name: str) -> str:
         },
         "Document renamed in the reMarkable cloud. Use remarkable_browse() to verify.",
     )
+
+
+def _as_list(value) -> list:
+    """A tool argument given as one name or a list of names, as a list."""
+    if value is None:
+        return []
+    return [value] if isinstance(value, str) else list(value)
+
+
+def _library_tag_names(collection: list) -> list:
+    """Tag names used anywhere in the library (document and page tags)."""
+    names: list = []
+    for item in collection:
+        for attr in ("tags", "page_tags"):
+            for tag in getattr(item, attr, None) or ():
+                name = tag.get("name") if isinstance(tag, dict) else tag
+                if isinstance(name, str) and name and name not in names:
+                    names.append(name)
+    return names
+
+
+def _tag_editor(add: list, remove: list, rename: dict, page: Optional[int], known: list):
+    """``apply(content)`` for ``update_document_content`` / the SSH path."""
+    from remarkable_mcp.tag_edit import TagEditError, edit_tags
+
+    def apply(content: dict) -> dict:
+        page_id = None
+        if page is not None:
+            page_ids = _page_ids_from_content(content)
+            if not 1 <= page <= len(page_ids):
+                raise TagEditError(
+                    f"Page {page} does not exist; the document has {len(page_ids)} page(s)."
+                )
+            page_id = page_ids[page - 1]
+        return edit_tags(
+            content,
+            now_ms=int(time.time() * 1000),
+            add=add,
+            remove=remove,
+            rename=rename,
+            page_id=page_id,
+            known_tags=known,
+        )
+
+    return apply
+
+
+def _tag_response(target, page: Optional[int], result: dict, transport: str, **extra) -> str:
+    data = {
+        "document": target.VissibleName,
+        "page": page,
+        "tags": result["tags"],
+        "added": result["added"],
+        "removed": result["removed"],
+        "renamed": result["renamed"],
+        "changed": result["changed"],
+        "transport": transport,
+    }
+    if page is None:
+        del data["page"]
+    if result["notes"]:
+        data["notes"] = result["notes"]
+    data.update(extra)
+    scope = f"page {page} of '{target.VissibleName}'" if page else f"'{target.VissibleName}'"
+    if result["changed"]:
+        hint = f"Tags on {scope} updated. Changes reach the tablet on its next sync."
+    else:
+        hint = f"No tag changes made on {scope}."
+    return make_response(data, hint)
+
+
+def _ssh_tag(ssh_client, target, apply, page: Optional[int], defer_restart: bool) -> str:
+    """Change a document's tags on the tablet's filesystem."""
+    from remarkable_mcp import tablet_json
+    from remarkable_mcp.tag_edit import other_fields
+
+    content_path = f"{XOCHITL_PATH}/{target.ID}.content"
+    meta_path = f"{XOCHITL_PATH}/{target.ID}.metadata"
+    content_raw = _read_remote_bytes(ssh_client, content_path)
+    meta_raw = _read_remote_bytes(ssh_client, meta_path)
+    if not content_raw or not meta_raw:
+        return make_error(
+            error_type="no_content",
+            message=f"Could not read the .content or .metadata file for '{target.VissibleName}'.",
+            suggestion="Check the document exists on the tablet, then try again.",
+        )
+    content = json.loads(content_raw)
+    before = json.loads(json.dumps(other_fields(content)))
+    result = apply(content)
+    if not result["changed"]:
+        return _tag_response(target, page, result, "ssh", refresh_pending=False)
+    if other_fields(content) != before:
+        raise RuntimeError("Refusing to write: fields other than tags changed.")
+
+    metadata = json.loads(meta_raw)
+    metadata["lastModified"] = str(int(time.time() * 1000))
+    _write_remote_bytes(ssh_client, content_path, tablet_json.dumps(content).encode("utf-8"))
+    _write_remote_bytes(ssh_client, meta_path, tablet_json.dumps(metadata).encode("utf-8"))
+    ssh_client.mark_operation_dirty()
+
+    restarted = _maybe_restart_xochitl(ssh_client, defer_restart)
+    target.last_modified = datetime.now()
+    _update_deferred_ssh_cache(ssh_client, restarted, document=target)
+    return _tag_response(target, page, result, "ssh", refresh_pending=not restarted)
 
 
 def _cloud_delete(document: str) -> str:
@@ -2542,6 +2646,126 @@ def register_write_tools():
                     return await _run_ssh_tool_operation(
                         ssh_client,
                         "rename",
+                        _impl,
+                        defer_restart=defer_restart,
+                    )
+            return await asyncio.to_thread(_impl)
+
+        @mcp.tool(annotations=WRITE_ANNOTATIONS)
+        async def remarkable_tag(
+            document: str,
+            add: Optional[Union[str, List[str]]] = None,
+            remove: Optional[Union[str, List[str]]] = None,
+            rename: Optional[Dict[str, str]] = None,
+            page: Optional[int] = None,
+            defer_restart: bool = False,
+        ) -> str:
+            """
+            <usecase>Add, rename or remove tags on a reMarkable document or page.</usecase>
+            <instructions>
+            Changes document tags, or with `page` that page's tags. Tag names
+            match case-insensitively, and a new tag reuses the spelling of a tag
+            already used in the library. Renames run first, then removals, then
+            additions. With no changes requested it reports the current tags.
+            The response lists the resulting tags and what changed.
+
+            Tag changes replace the tablet's copy of the document's tag list:
+            tag edits made on the tablet that have not synced yet are lost, as
+            with the reMarkable desktop app. Avoid tagging a document the user
+            is editing on the tablet while it is offline.
+
+            Works in cloud and SSH modes (default; --read-only disables). Not
+            available over the USB web interface. Folders cannot be tagged.
+            </instructions>
+            <parameters>
+            - document: Document name or path
+            - add: Tag name or list of names to add
+            - remove: Tag name or list of names to remove
+            - rename: Mapping of current name to new name, e.g. {"todo": "done"}.
+              Renaming onto a tag the document already has merges the two.
+            - page: 1-based page number to change page tags instead of
+              document tags
+            - defer_restart: SSH only. Skip the xochitl restart so a batch of
+              writes can refresh once via remarkable_refresh(). Ignored in
+              cloud mode.
+            </parameters>
+            <examples>
+            - remarkable_tag("Week 3 worksheet", add="to-grade")
+            - remarkable_tag("Week 3 worksheet", rename={"to-grade": "graded"})
+            - remarkable_tag("/Course/Notes", page=4, add=["review", "exam"])
+            - remarkable_tag("Week 3 worksheet", remove="graded")
+            - remarkable_tag("Week 3 worksheet")  # list current tags
+            </examples>
+            """
+            from remarkable_mcp.tag_edit import TagEditError
+
+            def invalid(message: str, suggestion: str) -> str:
+                return make_error(
+                    error_type="invalid_parameter", message=message, suggestion=suggestion
+                )
+
+            if page is not None and page < 1:
+                return invalid("page must be 1 or more.", "Pages are numbered from 1.")
+            if rename is not None and not isinstance(rename, dict):
+                return invalid(
+                    "rename must map current names to new names.",
+                    'Example: rename={"to-grade": "graded"}',
+                )
+            adds, removes, renames = _as_list(add), _as_list(remove), rename or {}
+
+            def _impl() -> str:
+                error = _require_managed_write_mode()
+                if error:
+                    return error
+
+                cloud = _is_cloud_mode()
+                client = get_rmapi() if cloud else _get_ssh_client()
+                try:
+                    collection = client.get_meta_items()
+                    items_by_id = get_items_by_id(collection)
+                    target = _resolve_document(document, collection, items_by_id)
+                    if not target:
+                        from remarkable_mcp.extract import find_similar_documents
+
+                        similar = find_similar_documents(document, collection)
+                        return make_error(
+                            error_type="document_not_found",
+                            message=f"Document not found: '{document}'",
+                            suggestion="Use remarkable_browse() to find the correct name.",
+                            did_you_mean=similar if similar else None,
+                        )
+                    if target.is_folder:
+                        return invalid(
+                            f"'{target.VissibleName}' is a folder; only documents have tags.",
+                            "Tag the documents inside the folder instead.",
+                        )
+                    apply = _tag_editor(
+                        adds, removes, renames, page, _library_tag_names(collection)
+                    )
+
+                    if cloud:
+                        result = client.update_document_content(target.ID, apply)
+                        if result["changed"]:
+                            _invalidate_client_cache(client)
+                        return _tag_response(target, page, result, "cloud")
+                    return _ssh_tag(client, target, apply, page, defer_restart)
+                except TagEditError as e:
+                    return invalid(str(e), "Check the tag names and page number.")
+                except SSHReliabilityError:
+                    raise
+                except Exception as e:
+                    return make_error(
+                        error_type="tag_failed",
+                        message=f"Failed to change tags: {e}",
+                        suggestion="Check the connection and try again.",
+                    )
+
+            if _is_ssh_mode():
+                ssh_client = _get_ssh_client()
+                if isinstance(ssh_client, SSHClient):
+                    return await _run_ssh_tool_operation(
+                        ssh_client,
+                        "tag",
                         _impl,
                         defer_restart=defer_restart,
                     )
