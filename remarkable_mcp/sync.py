@@ -891,12 +891,17 @@ class RemarkableClient:
         ``mutate`` may upload blobs as a side effect; it is re-invoked on a
         generation conflict after re-reading the remote root, so it must be
         idempotent with respect to blob uploads (content-addressed uploads are).
-        On success all in-memory document caches are invalidated.
+        When ``mutate`` returns the list it was given, nothing changed and no
+        root is committed. On success all in-memory document caches are
+        invalidated.
         """
         last_error: Optional[Exception] = None
         for attempt in range(_ROOT_COMMIT_ATTEMPTS):
             entries, generation = self._read_root_entries()
-            new_entries = mutate(list(entries))
+            current = list(entries)
+            new_entries = mutate(current)
+            if new_entries is current:
+                return
             root_body = _serialize_root_index(new_entries)
             root_hash = hashlib.sha256(root_body).hexdigest()
             self._put_blob(root_body, root_hash, "root.docSchema", "text/plain; charset=UTF-8")
@@ -945,6 +950,57 @@ class RemarkableClient:
         new_entry = self._upload_file_blob(new_meta, meta_entry["id"])
         files = [new_entry if f["id"] == meta_entry["id"] else f for f in files]
         return self._upload_doc_index(doc_id, files)
+
+    def update_document_content(self, doc_id: str, apply: "Any") -> Any:
+        """Rewrite one document's ``.content`` and return ``apply``'s result.
+
+        ``apply(content: dict)`` edits the content in place and returns a
+        result whose ``"changed"`` key says whether anything changed. Only the
+        tag lists may change (see ``tag_edit.TAG_FIELDS``), since tags exist
+        only in ``.content``. When something changed, ``.content`` and
+        ``.metadata`` are written in the tablet's own JSON layout with the
+        original key order (see ``tablet_json``), and only the metadata's
+        ``lastModified`` is updated, as the desktop app does when it changes
+        tags. A ``.content`` rewritten compact with sorted keys left the tablet
+        unable to sync the document.
+        """
+        from remarkable_mcp import tablet_json
+        from remarkable_mcp.tag_edit import other_fields
+
+        outcome: Dict[str, Any] = {}
+
+        def mutate(entries):
+            entry = self._require_entry(entries, doc_id)
+            files = self._parse_index(self._get_file(entry["hash"], f"{doc_id}.docSchema"))
+            content_file = next((f for f in files if f["id"].endswith(".content")), None)
+            meta_file = next((f for f in files if f["id"].endswith(".metadata")), None)
+            if content_file is None or meta_file is None:
+                raise CloudWriteError(f"Document {doc_id} has no content or metadata blob.")
+
+            content = json.loads(self._get_file(content_file["hash"], content_file["id"]))
+            before = json.loads(json.dumps(other_fields(content)))
+            result = apply(content)
+            outcome["result"] = result
+            if not result.get("changed"):
+                return entries
+            if other_fields(content) != before:
+                raise CloudWriteError("Refusing to write: fields other than tags changed.")
+
+            metadata = json.loads(self._get_file(meta_file["hash"], meta_file["id"]))
+            metadata["lastModified"] = self._now_ms()
+            replaced = {
+                content_file["id"]: self._upload_file_blob(
+                    tablet_json.dumps(content).encode("utf-8"), content_file["id"]
+                ),
+                meta_file["id"]: self._upload_file_blob(
+                    tablet_json.dumps(metadata).encode("utf-8"), meta_file["id"]
+                ),
+            }
+            new_files = [replaced.get(f["id"], f) for f in files]
+            return self._replace_root_entry(entries, self._upload_doc_index(doc_id, new_files))
+
+        self._sync_root(mutate)
+        return outcome.get("result")
 
     def _replace_root_entry(self, entries, new_entry):
         """Return ``entries`` with the entry matching ``new_entry['id']`` replaced."""

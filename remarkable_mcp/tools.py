@@ -1514,6 +1514,7 @@ async def remarkable_status() -> str:
             "mkdir": True,
             "move": True,
             "rename": True,
+            "tag": True,
             "delete": True,
         },
         "ssh": {
@@ -1524,6 +1525,7 @@ async def remarkable_status() -> str:
             "mkdir": True,
             "move": True,
             "rename": True,
+            "tag": True,
             "delete": True,
         },
         "usb-web": {
@@ -1534,6 +1536,7 @@ async def remarkable_status() -> str:
             "mkdir": False,
             "move": False,
             "rename": False,
+            "tag": False,
             "delete": False,
         },
         # Local directory is strictly read-only: the folder is the desktop
@@ -1546,6 +1549,7 @@ async def remarkable_status() -> str:
             "mkdir": False,
             "move": False,
             "rename": False,
+            "tag": False,
             "delete": False,
         },
     }
@@ -1625,7 +1629,7 @@ async def remarkable_status() -> str:
                 )
             else:
                 hint_parts.append(
-                    "Write is enabled: upload, mkdir, move, rename, and delete are available."
+                    "Write is enabled: upload, mkdir, move, rename, tag, and delete are available."
                 )
         elif selected_transport == "local-dir":
             hint_parts.append(

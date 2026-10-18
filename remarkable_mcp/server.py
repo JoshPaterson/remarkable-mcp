@@ -194,6 +194,8 @@ Write operations are enabled. These tools modify your tablet's filesystem:
 - `remarkable_mkdir(folder_name, parent, defer_restart)` - Create a folder
 - `remarkable_move(document, dest_folder, defer_restart)` - Move a document/folder
 - `remarkable_rename(document, new_name, defer_restart)` - Rename a document/folder
+- `remarkable_tag(document, add, remove, rename, page, defer_restart)` - Add, rename or
+  remove document or page tags
 - `remarkable_delete(document, defer_restart, permanent)` - Delete a document/folder
 - `remarkable_author(method, ..., defer_restart)` - Author native ink/notebooks
 - `remarkable_refresh()` - Restart xochitl once to apply writes deferred with `defer_restart=True`
@@ -243,6 +245,8 @@ and sync to all your devices:
 - `remarkable_mkdir(folder_name, parent)` - Create a folder
 - `remarkable_move(document, dest_folder)` - Move a document/folder
 - `remarkable_rename(document, new_name)` - Rename a document/folder
+- `remarkable_tag(document, add, remove, rename, page)` - Add, rename or remove
+  document or page tags
 - `remarkable_delete(document)` - Delete a document/folder (destructive)
 
 ### Safety
