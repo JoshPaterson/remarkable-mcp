@@ -980,12 +980,21 @@ class RemarkableClient:
         tags. A ``.content`` rewritten compact with sorted keys left the tablet
         unable to sync the document.
         """
+
+        return self.update_documents_content([doc_id], apply)[doc_id]
+
+    def update_documents_content(self, doc_ids: List[str], apply: "Any") -> Dict[str, Any]:
+        """``update_document_content`` for several documents in one commit.
+
+        ``apply`` is called on each document's content; returns its result by
+        document id. Nothing is written if ``apply`` raises for any document.
+        """
         from remarkable_mcp import tablet_json
         from remarkable_mcp.tag_edit import other_fields
 
         outcome: Dict[str, Any] = {}
 
-        def mutate(entries):
+        def edit(entries, doc_id):
             entry = self._require_entry(entries, doc_id)
             files = self._parse_index(self._get_file(entry["hash"], f"{doc_id}.docSchema"))
             content_file = next((f for f in files if f["id"].endswith(".content")), None)
@@ -996,9 +1005,9 @@ class RemarkableClient:
             content = json.loads(self._get_file(content_file["hash"], content_file["id"]))
             before = json.loads(json.dumps(other_fields(content)))
             result = apply(content)
-            outcome["result"] = result
+            outcome[doc_id] = result
             if not result.get("changed"):
-                return entries
+                return None
             if other_fields(content) != before:
                 raise CloudWriteError("Refusing to write: fields other than tags changed.")
 
@@ -1013,10 +1022,18 @@ class RemarkableClient:
                 ),
             }
             new_files = [replaced.get(f["id"], f) for f in files]
-            return self._replace_root_entry(entries, self._upload_doc_index(doc_id, new_files))
+            return self._upload_doc_index(doc_id, new_files)
+
+        def mutate(entries):
+            outcome.clear()
+            for doc_id in doc_ids:
+                new_entry = edit(entries, doc_id)
+                if new_entry is not None:
+                    entries = self._replace_root_entry(entries, new_entry)
+            return entries
 
         self._sync_root(mutate)
-        return outcome.get("result")
+        return dict(outcome)
 
     def read_document_pdf(self, doc_id: str) -> tuple:
         """Return ``(pdf_bytes, content, files)`` for a PDF document.
