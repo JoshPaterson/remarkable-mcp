@@ -1054,9 +1054,19 @@ def test_end_leader_starts_beside_the_text_heading_away_from_it():
     # The point is above or below the note: the line starts at the text's
     # top or bottom edge, on the side of the point.
     assert start[1] == pytest.approx(bottom if 0.45 > bottom else top, abs=1e-3)
-    # A point level with the note gets a level line.
-    route = pdf_marks._leader_route([0.2, 0.4, 0.4, 0.42], [0.6, 0.41], "end")
-    assert route[0][1] == route[1][1] == pytest.approx(0.41)
+    # The six starts: top, middle or bottom of the left or right end.
+    box = [0.2, 0.4, 0.4, 0.42]
+    for near, start in [
+        ([0.6, 0.30], (0.4, 0.40)),
+        ([0.6, 0.405], (0.4, 0.41)),
+        ([0.6, 0.50], (0.4, 0.42)),
+        ([0.1, 0.30], (0.2, 0.40)),
+        ([0.1, 0.415], (0.2, 0.41)),
+        ([0.1, 0.50], (0.2, 0.42)),
+    ]:
+        x, y = pdf_marks._leader_route(box, near, "end")[0]
+        assert y == pytest.approx(start[1])
+        assert (x > box[2]) if start[0] == box[2] else (x < box[0])
     with pytest.raises(MarkError, match="leader_style must be"):
         _near_edit(
             [{"page": 1, "text": "x", "near": [0.5, 0.2], "leader": True, "leader_style": "x"}],

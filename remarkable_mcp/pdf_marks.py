@@ -1149,9 +1149,9 @@ def _leader_route(box: Sequence[float], near: Sequence[float], style: str, size=
     """Points of a leader from ``box`` to just short of ``near``, or None if
     the point is too close to need one.
 
-    ``end``: just past the end of the note's text that faces the point, at
-    the height within the text closest to the point's (its bottom for a point
-    below, its top for one above), so the line heads away from the text.
+    ``end``: just past the left or right end of the note's text, whichever
+    faces the point, at its top for a point above the text, its bottom for
+    one below, otherwise its middle, so the line heads away from the text.
     ``underline``: along the bottom of the note from its far end, round the
     corner nearest the point. ``box`` (and marks that are not notes): from the
     nearest point of the note's box or border.
@@ -1162,7 +1162,12 @@ def _leader_route(box: Sequence[float], near: Sequence[float], style: str, size=
         far, start = ([box[0], y], [box[2], y]) if facing_right else ([box[2], y], [box[0], y])
     elif style == "end":
         gap = LEADER_START_GAP / size[0]
-        y = min(max(near[1], box[1]), box[3])
+        if near[1] < box[1]:
+            y = box[1]
+        elif near[1] > box[3]:
+            y = box[3]
+        else:
+            y = (box[1] + box[3]) / 2
         start = [box[2] + gap, y] if facing_right else [box[0] - gap, y]
     else:
         start = [min(max(near[0], box[0]), box[2]), min(max(near[1], box[1]), box[3])]
