@@ -1040,7 +1040,7 @@ def test_underline_leader_runs_along_the_note():
     assert leader["from"][1] == leader["via"][0][1] == pytest.approx(mark["box"][3])
 
 
-def test_end_leader_starts_beside_the_text_at_mid_height():
+def test_end_leader_starts_beside_the_text_heading_away_from_it():
     ink = [[0.05, 0.3, 0.95, 0.5]]
     result = _near_edit(
         [{"page": 1, "id": "n", "text": "note", "near": [0.9, 0.45], "leader": True}], ink
@@ -1048,11 +1048,15 @@ def test_end_leader_starts_beside_the_text_at_mid_height():
     mark = result["marks"][0]
     assert "border" not in mark["request"] or mark["request"]["border"] is False
     assert mark["request"]["leader_style"] == "end"
-    leader = mark["leader"]
     left, top, right, bottom = mark["box"]
-    start = leader["from"]
-    assert start[1] == pytest.approx((top + bottom) / 2, abs=1e-3)
+    start = mark["leader"]["from"]
     assert start[0] > right or start[0] < left  # beyond the text, not on it
+    # The point is above or below the note: the line starts at the text's
+    # top or bottom edge, on the side of the point.
+    assert start[1] == pytest.approx(bottom if 0.45 > bottom else top, abs=1e-3)
+    # A point level with the note gets a level line.
+    route = pdf_marks._leader_route([0.2, 0.4, 0.4, 0.42], [0.6, 0.41], "end")
+    assert route[0][1] == route[1][1] == pytest.approx(0.41)
     with pytest.raises(MarkError, match="leader_style must be"):
         _near_edit(
             [{"page": 1, "text": "x", "near": [0.5, 0.2], "leader": True, "leader_style": "x"}],

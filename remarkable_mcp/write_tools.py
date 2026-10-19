@@ -3027,7 +3027,8 @@ def register_write_tools():
                 marks, and "leader": true draws a thin line from the mark to the
                 point, ending in a dot; it is drawn only when the mark cannot sit
                 beside the point. A note's leader starts just past the end of its
-                text at mid-height ("leader_style": "end", the default), or runs
+                text, on the edge facing the point, so it never crosses the text
+                ("leader_style": "end", the default), or runs
                 along an underline ("underline") or from a rounded border ("box").
                 Use near, with a leader, on pages full of writing; give the point
                 of what the mark is about, at its edge (such as the end of an
