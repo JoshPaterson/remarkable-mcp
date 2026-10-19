@@ -98,13 +98,15 @@ def _build_instructions() -> str:
         """
 ## Available Tools
 
-- `remarkable_browse(path, query)` - Browse folders or search for documents
+- `remarkable_browse(path, query, tags)` - Browse folders, search for documents,
+  or list documents carrying a tag (searches subfolders)
 - `remarkable_read(document, content_type, page, grep)` - Read document content with pagination
 - `remarkable_recent(limit)` - Get recently modified documents
 - `remarkable_status()` - Check connection and diagnose issues
-- `remarkable_image(document, page, include_ocr)` - Get a PNG image with optional OCR
-- `remarkable_export(document, output_format)` - Export one document as a
-  temporary PDF or Markdown resource
+- `remarkable_image(document, page, include_ocr, layers, dpi, region)` - Get a page
+  image (PNG or SVG) with optional OCR
+- `remarkable_export(document, output_format, pages)` - Export one document (or
+  selected pages, PDF only) as a temporary PDF or Markdown resource
 
 ## Recommended Workflows
 
@@ -113,6 +115,16 @@ def _build_instructions() -> str:
 2. Use `remarkable_read("Document Name")` to get content
 3. Use `remarkable_read("Document", page=2)` to continue reading long documents
 4. Use `remarkable_read("Document", grep="pattern")` to search within a document
+5. Use `remarkable_browse("/Folder", tags=["tag"])` to find tagged documents
+
+### Reading Annotations
+`remarkable_read("Document", content_type="annotations")` lists each annotated
+page with:
+- highlights with their color, e.g. `[pink] passage text`
+- freehand highlighter strokes with color and `region` (page fractions)
+- page tags, and the page's layers when it has several or a hidden one
+The response also returns `highlights`, `highlighter_strokes`, `page_tags` and
+`layers` as structured data.
 
 ### Getting Page Images
 Use `remarkable_image` when you need visual context:
@@ -122,11 +134,22 @@ Use `remarkable_image` when you need visual context:
 
 Example: `remarkable_image("UI Mockup", page=1)` returns a PNG image
 Example: `remarkable_image("Notes", include_ocr=True)` returns image with extracted text
+Notebook page templates (dots, lines, grids) are not part of the document and are
+not drawn; pages render on a plain background. remarkable_read lists each page's
+template.
+Example: `remarkable_image("Notes", page=2, dpi=300)` renders the whole page at 300 dpi,
+enough to read small handwriting
+Example: `remarkable_image("Notes", page=2, dpi=300, region=[0, 0.5, 1, 0.75])` crops
+to a band of the page (`[left, top, right, bottom]` as page fractions; a
+highlighter stroke's `region` from remarkable_read can be passed directly)
+Example: `remarkable_image("Notes", page=3, layers="all")` includes hidden layers;
+by default only visible layers are drawn, and `layers="Layer 2"` draws one layer
 
 ### Exporting a Document
 Use `remarkable_export` for a complete PDF or structured Markdown artifact.
 Exports never modify the tablet, but they do create a server-managed temporary
 local file. The returned resource link expires after 15 minutes.
+Example: `remarkable_export("Lecture Notes", pages="3-5,9")` exports only those pages.
 
 ### For Large Documents
 Use pagination to avoid overwhelming context. The response includes:
@@ -189,6 +212,7 @@ You're connected directly to the tablet via SSH. This enables:
 Write operations are enabled. These tools modify your tablet's filesystem:
 
 - `remarkable_upload(file_path, parent_folder, document_name, defer_restart)` - Upload a PDF/EPUB
+  (or pass base64 `file_content` with `document_name`, up to 2 MB)
 - `remarkable_markdown_to_pdf(markdown, document_name, parent_folder, defer_restart)` -
   Render Markdown as a PDF and upload it
 - `remarkable_mkdir(folder_name, parent, defer_restart)` - Create a folder
@@ -216,7 +240,8 @@ Write operations are enabled. These tools modify your tablet's filesystem:
 
 Upload is available via the USB web interface:
 
-- `remarkable_upload(file_path)` - Upload a PDF/EPUB file
+- `remarkable_upload(file_path)` - Upload a PDF/EPUB file (or base64 `file_content`
+  with `document_name`, up to 2 MB)
 - `remarkable_markdown_to_pdf(markdown, document_name)` - Render Markdown as a
   named PDF and upload it to the root folder
 
@@ -240,6 +265,7 @@ Write operations are enabled (the default). These tools modify your cloud librar
 and sync to all your devices:
 
 - `remarkable_upload(file_path, parent_folder, document_name)` - Upload a PDF/EPUB
+  (or pass base64 `file_content` with `document_name`, up to 2 MB)
 - `remarkable_markdown_to_pdf(markdown, document_name, parent_folder)` - Render
   Markdown as a PDF and upload it
 - `remarkable_mkdir(folder_name, parent)` - Create a folder

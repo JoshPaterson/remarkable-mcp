@@ -25,6 +25,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import shlex
 import socket
 import threading
@@ -768,6 +769,148 @@ def _upload_via_usb_web(local_path: str, document_name: Optional[str] = None) ->
             raise RuntimeError(f"USB web upload failed: {e}")
 
 
+DEFAULT_MAX_INLINE_BYTES = 2 * 1024 * 1024
+UPLOAD_FORMATS = ("pdf", "epub")
+
+
+def _max_inline_bytes() -> int:
+    """Decoded size cap for ``file_content`` uploads (REMARKABLE_MAX_INLINE_BYTES)."""
+    raw = os.environ.get("REMARKABLE_MAX_INLINE_BYTES", "").strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        return DEFAULT_MAX_INLINE_BYTES
+    return value if value > 0 else DEFAULT_MAX_INLINE_BYTES
+
+
+def _decode_inline_file(file_content: str, file_format: str) -> bytes:
+    """Decode base64 file contents and check they are the given format.
+
+    Accepts line breaks and a ``data:<type>;base64,`` prefix. Raises
+    ``ValueError`` with a caller-facing message on any problem.
+    """
+    import base64
+    import binascii
+    import re
+
+    text = file_content.strip()
+    if text[:5].lower() == "data:":
+        header, sep, text = text.partition(",")
+        if not sep or not header.lower().endswith(";base64"):
+            raise ValueError("file_content data URL must be base64-encoded (';base64,').")
+    text = re.sub(r"\s+", "", text)
+    if not text:
+        raise ValueError("file_content is empty.")
+
+    limit = _max_inline_bytes()
+    too_large = (
+        f"file_content is larger than the {limit}-byte inline limit "
+        "(REMARKABLE_MAX_INLINE_BYTES). Use file_path for larger files."
+    )
+    if len(text) // 4 * 3 > limit + 3:
+        raise ValueError(too_large)
+    try:
+        data = base64.b64decode(text + "=" * (-len(text) % 4), validate=True)
+    except (binascii.Error, ValueError):
+        raise ValueError("file_content is not valid base64.")
+    if len(data) > limit:
+        raise ValueError(too_large)
+
+    if file_format == "pdf" and not data.startswith(b"%PDF-"):
+        raise ValueError("file_content is not a PDF (it does not start with '%PDF-').")
+    if file_format == "epub" and not data.startswith(b"PK\x03\x04"):
+        raise ValueError("file_content is not an EPUB (it is not a zip archive).")
+    return data
+
+
+def upload_staging_dir() -> Optional[str]:
+    """The resolved REMARKABLE_UPLOAD_STAGING_DIR, or None when unset or not a folder.
+
+    Only files directly inside this folder may be moved to the Trash after an
+    upload (``trash_source_after_upload``).
+    """
+    staging = os.environ.get("REMARKABLE_UPLOAD_STAGING_DIR", "").strip()
+    if not staging:
+        return None
+    resolved = os.path.realpath(os.path.expanduser(staging))
+    return resolved if os.path.isdir(resolved) else None
+
+
+def _staged_source(file_path: str) -> str:
+    """Resolve an upload source that may be moved to the Trash afterwards.
+
+    The file must be a regular file (not a symlink) directly inside the
+    staging folder. Raises ``ValueError`` otherwise.
+    """
+    import stat
+
+    staging = upload_staging_dir()
+    if staging is None:
+        raise ValueError(
+            "trash_source_after_upload needs REMARKABLE_UPLOAD_STAGING_DIR set to an "
+            "existing folder."
+        )
+    if os.path.islink(file_path):
+        raise ValueError("trash_source_after_upload does not accept symlinks.")
+    source = os.path.realpath(file_path)
+    if os.path.dirname(source) != staging:
+        raise ValueError(
+            f"trash_source_after_upload is only allowed for files directly inside {staging}."
+        )
+    try:
+        mode = os.lstat(source).st_mode
+    except OSError:
+        raise ValueError(f"File not found: '{file_path}'")
+    if not stat.S_ISREG(mode):
+        raise ValueError("trash_source_after_upload needs a regular file.")
+    return source
+
+
+def _file_sha256(path: str) -> str:
+    import hashlib
+
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _trash_uploaded_source(source: str, uploaded_sha256: str) -> dict:
+    """Move an uploaded staging file to the Trash if it is unchanged since upload.
+
+    Returns the result fields: ``source_trashed`` and, when the file is kept,
+    ``source_kept_reason``.
+    """
+    from send2trash import send2trash
+
+    def kept(reason: str) -> dict:
+        return {"source_trashed": False, "source_kept_reason": reason}
+
+    try:
+        _staged_source(source)
+        if _file_sha256(source) != uploaded_sha256:
+            return kept("The file changed during the upload, so it was kept.")
+        send2trash(source)
+    except ValueError as e:
+        return kept(str(e))
+    except Exception as e:
+        return kept(f"Could not move the file to the Trash: {e}")
+    return {"source_trashed": True}
+
+
+def _add_upload_source(response: str, fields: dict) -> str:
+    """Add source details to a successful upload response, before its hint."""
+    data = json.loads(response)
+    if "_error" in data:
+        return response
+    hint = data.pop("_hint", None)
+    data.update(fields)
+    if hint is not None:
+        data["_hint"] = hint
+    return json.dumps(data, indent=2)
+
+
 def _resolve_parent_id(parent_path: str, items_by_id: dict, collection: list) -> Optional[str]:
     """Resolve a folder path to its UUID.
 
@@ -782,11 +925,14 @@ def _resolve_parent_id(parent_path: str, items_by_id: dict, collection: list) ->
     if not parent_path or parent_path == "/":
         return ""
 
+    from remarkable_mcp.tools import _is_cloud_archived
+
     # Normalize
     parent_path = parent_path.strip("/")
 
     for item in collection:
-        if not item.is_folder:
+        # Never write into a trashed folder.
+        if not item.is_folder or _is_cloud_archived(item, items_by_id):
             continue
         item_path = get_item_path(item, items_by_id).strip("/")
         if item_path.lower() == parent_path.lower():
@@ -806,13 +952,23 @@ def _resolve_document(
         items_by_id: Dict mapping item IDs to items
         folders_only: If True, only match folders
 
+    Live items win. A trashed item is only matched by its explicit
+    ``/trash/...`` path (e.g. to permanently delete it over SSH), never by a
+    bare name that a live item could also carry.
+
     Returns:
         The matching item, or None
     """
+    from remarkable_mcp.tools import _is_cloud_archived
+
     target = name_or_path.lower().strip("/")
 
+    trashed = []
     for item in collection:
         if folders_only and not item.is_folder:
+            continue
+        if _is_cloud_archived(item, items_by_id):
+            trashed.append(item)
             continue
         # Match by name
         if item.VissibleName.lower() == target:
@@ -820,6 +976,13 @@ def _resolve_document(
         # Match by path
         item_path = get_item_path(item, items_by_id).strip("/")
         if item_path.lower() == target:
+            return item
+
+    # Trashed items need the explicit absolute path, not "trash/...".
+    if not name_or_path.lower().startswith("/trash/"):
+        return None
+    for item in trashed:
+        if get_item_path(item, items_by_id).strip("/").lower() == target:
             return item
 
     return None
@@ -1664,50 +1827,13 @@ def register_write_tools():
     if _is_ssh_mode():
         mcp.tool(annotations=WRITE_ANNOTATIONS)(remarkable_author)
 
-    @mcp.tool(annotations=UPLOAD_ANNOTATIONS)
-    async def remarkable_upload(
+    async def _upload_path(
         file_path: str,
-        parent_folder: str = "/",
-        document_name: Optional[str] = None,
-        defer_restart: bool = False,
+        parent_folder: str,
+        document_name: Optional[str],
+        defer_restart: bool,
     ) -> str:
-        """
-        <usecase>Upload a PDF or EPUB file to the reMarkable tablet.</usecase>
-        <instructions>
-        Uploads a local file to the tablet. Only PDF and EPUB formats
-        are supported. Works in all three transports:
-        - Cloud: uploaded via the sync protocol; supports parent_folder + document_name
-        - SSH: transferred over SSH, metadata created; supports parent_folder + document_name
-        - USB web: uploaded via POST /upload. The multipart filename carries
-          document_name, parent_folder is ignored, and the tablet web service
-          chooses the destination folder.
-
-        Requires write mode (the default; disabled with --read-only).
-        </instructions>
-        <parameters>
-        - file_path: Absolute path to the local PDF or EPUB file
-        - parent_folder: Destination folder path on tablet (default: root "/").
-          Honored in cloud and SSH modes; ignored by the USB web interface.
-        - document_name: Display name on tablet (default: filename without
-          extension). Honored in every mode; USB web uses it as the uploaded filename.
-        - defer_restart: SSH only. When True, skip the xochitl restart that
-          normally makes the upload visible. Use this for every upload in a
-          batch, then call remarkable_refresh() ONCE at the end. Each restart
-          forces a full document-store rescan that briefly destabilises the SSH
-          link, so deferring turns N restarts (and N races) into one. The
-          response sets "refresh_pending": true while a refresh is owed. Ignored
-          in cloud/USB modes (no xochitl).
-        </parameters>
-        <examples>
-        - remarkable_upload("/tmp/paper.pdf")
-        - remarkable_upload("/tmp/book.epub", parent_folder="/Books")
-        - remarkable_upload("/tmp/report.pdf", document_name="Q4 Report")
-        - # batch import: defer every upload, refresh once at the end
-          remarkable_upload("/tmp/a.pdf", defer_restart=True)
-          remarkable_upload("/tmp/b.pdf", defer_restart=True)
-          remarkable_refresh()
-        </examples>
-        """
+        """Upload a local PDF/EPUB file over the active transport."""
 
         def _impl() -> str:
             error = _require_write_transport()
@@ -1902,6 +2028,207 @@ def register_write_tools():
                 return await run_operation(usb_client, "upload", _impl)
         return await asyncio.to_thread(_impl)
 
+    async def _upload_tool(
+        file_path: Optional[str] = None,
+        parent_folder: str = "/",
+        document_name: Optional[str] = None,
+        defer_restart: bool = False,
+        file_content: Optional[str] = None,
+        file_format: str = "pdf",
+        trash_source_after_upload: bool = False,
+    ) -> str:
+        """
+        <usecase>Upload a PDF or EPUB file to the reMarkable tablet.</usecase>
+        <instructions>
+        Uploads a PDF or EPUB to the tablet, given either a path on the machine
+        running this server or the file's contents. Give exactly one of:
+        - file_path: a file on the server's machine. Use this when the server
+          can read the file, and for files larger than the inline limit.
+        - file_content: the file's bytes, base64-encoded. Use this when the
+          caller cannot place files on the server's disk. Decoded size is
+          limited to 2 MB by default (REMARKABLE_MAX_INLINE_BYTES); use
+          file_path for anything larger. Requires document_name.
+
+        Works in all three transports:
+        - Cloud: uploaded via the sync protocol; supports parent_folder + document_name
+        - SSH: transferred over SSH, metadata created; supports parent_folder + document_name
+        - USB web: uploaded via POST /upload. The multipart filename carries
+          document_name, parent_folder is ignored, and the tablet web service
+          chooses the destination folder.
+
+        The result also reports source ("path" or "content") and size_bytes.
+
+        Requires write mode (the default; disabled with --read-only).
+        </instructions>
+        <parameters>
+        - file_path: Absolute path to the local PDF or EPUB file
+        - parent_folder: Destination folder path on tablet (default: root "/").
+          Honored in cloud and SSH modes; ignored by the USB web interface.
+        - document_name: Display name on tablet (default: filename without
+          extension). Required with file_content. Honored in every mode; USB web
+          uses it as the uploaded filename.
+        - defer_restart: SSH only. When True, skip the xochitl restart that
+          normally makes the upload visible. Use this for every upload in a
+          batch, then call remarkable_refresh() ONCE at the end. Each restart
+          forces a full document-store rescan that briefly destabilises the SSH
+          link, so deferring turns N restarts (and N races) into one. The
+          response sets "refresh_pending": true while a refresh is owed. Ignored
+          in cloud/USB modes (no xochitl).
+        - file_content: Base64-encoded file bytes, instead of file_path. Line
+          breaks and a "data:application/pdf;base64," prefix are accepted.
+        - file_format: "pdf" (default) or "epub"; the format of file_content.
+          The decoded bytes must match it.
+        </parameters>
+        <examples>
+        - remarkable_upload("/tmp/paper.pdf")
+        - remarkable_upload("/tmp/book.epub", parent_folder="/Books")
+        - remarkable_upload("/tmp/report.pdf", document_name="Q4 Report")
+        - remarkable_upload(file_content="JVBERi0xLjQK...", document_name="Notes",
+          parent_folder="/Course")
+        - # batch import: defer every upload, refresh once at the end
+          remarkable_upload("/tmp/a.pdf", defer_restart=True)
+          remarkable_upload("/tmp/b.pdf", defer_restart=True)
+          remarkable_refresh()
+        </examples>
+        """
+        import tempfile
+
+        def invalid(message: str, suggestion: str) -> str:
+            return make_error(
+                error_type="invalid_parameter", message=message, suggestion=suggestion
+            )
+
+        if (file_path is None) == (file_content is None):
+            return invalid(
+                "Give exactly one of file_path or file_content.",
+                "Use file_path for a file on this machine, or file_content for "
+                "base64-encoded bytes (up to the inline size limit).",
+            )
+
+        if file_content is not None:
+            if trash_source_after_upload:
+                return invalid(
+                    "trash_source_after_upload applies only to file_path uploads.",
+                    "Omit trash_source_after_upload when using file_content.",
+                )
+            if not document_name or not document_name.strip():
+                return invalid(
+                    "document_name is required with file_content.",
+                    "Pass the display name the document should have on the tablet.",
+                )
+            fmt = (file_format or "").strip().lower()
+            if fmt not in UPLOAD_FORMATS:
+                return invalid(
+                    f"Unsupported file_format: '{file_format}'",
+                    "Use file_format='pdf' or file_format='epub'.",
+                )
+            try:
+                data = _decode_inline_file(file_content, fmt)
+            except ValueError as e:
+                return invalid(
+                    str(e),
+                    "Send the whole file base64-encoded, or use file_path for large files.",
+                )
+            with tempfile.TemporaryDirectory(prefix="remarkable-upload-") as temp_dir:
+                temp_path = os.path.join(temp_dir, f"document.{fmt}")
+                with open(temp_path, "wb") as temp_file:
+                    temp_file.write(data)
+                response = await _upload_path(
+                    temp_path, parent_folder, document_name, defer_restart
+                )
+            return _add_upload_source(response, {"source": "content", "size_bytes": len(data)})
+
+        source = None
+        uploaded_sha256 = None
+        if trash_source_after_upload:
+            try:
+                source = _staged_source(file_path)
+                uploaded_sha256 = await asyncio.to_thread(_file_sha256, source)
+            except (ValueError, OSError) as e:
+                return invalid(
+                    str(e),
+                    "Upload without trash_source_after_upload, or put the file directly "
+                    "in the staging folder.",
+                )
+        size = os.path.getsize(file_path) if os.path.isfile(file_path) else None
+        response = await _upload_path(file_path, parent_folder, document_name, defer_restart)
+        fields = {"source": "path", "size_bytes": size}
+        if source is not None:
+            # Only a confirmed upload releases the source; errors and partial
+            # writes keep it.
+            if json.loads(response).get("uploaded") is True:
+                fields.update(
+                    await asyncio.to_thread(_trash_uploaded_source, source, uploaded_sha256)
+                )
+            else:
+                fields.update(
+                    {"source_trashed": False, "source_kept_reason": "The upload did not succeed."}
+                )
+        return _add_upload_source(response, fields)
+
+    upload_doc = _upload_tool.__doc__
+    staging_dir = upload_staging_dir()
+    if staging_dir:
+
+        async def remarkable_upload(
+            file_path: Optional[str] = None,
+            parent_folder: str = "/",
+            document_name: Optional[str] = None,
+            defer_restart: bool = False,
+            file_content: Optional[str] = None,
+            file_format: str = "pdf",
+            trash_source_after_upload: bool = False,
+        ) -> str:
+            return await _upload_tool(
+                file_path,
+                parent_folder,
+                document_name,
+                defer_restart,
+                file_content,
+                file_format,
+                trash_source_after_upload,
+            )
+
+        # Docstrings may or may not keep their indentation (Python 3.13 strips
+        # it), so the option's lines take the indentation of </parameters>.
+        trash_param = (
+            "- trash_source_after_upload: file_path only. When True, move the\n"
+            "  source file to the Trash after a successful upload, so the caller\n"
+            "  needs no delete permission. Only for files directly inside the\n"
+            f"  staging folder {staging_dir}; the file is kept if the upload fails\n"
+            "  or the file changed during it. The result reports source_trashed\n"
+            "  (and source_kept_reason when kept). Use it only when asked to clean\n"
+            "  up the staged copy.\n"
+        )
+        remarkable_upload.__doc__ = re.sub(
+            r"^([ \t]*)</parameters>",
+            lambda m: "".join(m.group(1) + line for line in trash_param.splitlines(True))
+            + m.group(0),
+            upload_doc,
+            count=1,
+            flags=re.M,
+        )
+        # The staging option can remove a local file (recoverably, via the Trash).
+        upload_annotations = ToolAnnotations(read_only_hint=False, destructive_hint=True)
+    else:
+
+        async def remarkable_upload(
+            file_path: Optional[str] = None,
+            parent_folder: str = "/",
+            document_name: Optional[str] = None,
+            defer_restart: bool = False,
+            file_content: Optional[str] = None,
+            file_format: str = "pdf",
+        ) -> str:
+            return await _upload_tool(
+                file_path, parent_folder, document_name, defer_restart, file_content, file_format
+            )
+
+        remarkable_upload.__doc__ = upload_doc
+        upload_annotations = UPLOAD_ANNOTATIONS
+
+    mcp.tool(annotations=upload_annotations)(remarkable_upload)
+
     @mcp.tool(annotations=UPLOAD_ANNOTATIONS)
     async def remarkable_markdown_to_pdf(
         markdown: str,
@@ -1965,12 +2292,7 @@ def register_write_tools():
             pdf_path = os.path.join(temp_dir, "document.pdf")
             with open(pdf_path, "wb") as pdf_file:
                 pdf_file.write(pdf_bytes)
-            return await remarkable_upload(
-                pdf_path,
-                parent_folder=parent_folder,
-                document_name=document_name,
-                defer_restart=defer_restart,
-            )
+            return await _upload_path(pdf_path, parent_folder, document_name, defer_restart)
 
     if _is_ssh_mode() or _is_cloud_mode():
 

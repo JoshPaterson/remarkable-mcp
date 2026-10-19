@@ -27,6 +27,7 @@ from mcp.types import (
 
 from remarkable_mcp.api import (
     REMARKABLE_TOKEN,
+    document_version,
     download_raw_file,
     get_file_type,
     get_item_path,
@@ -54,6 +55,7 @@ from remarkable_mcp.extract import (
     get_document_file_type,
     get_document_page_count,
     get_ocr_backend,
+    get_page_layers_from_document_zip,
     render_mapped_pdf_page_from_document_zip,
     render_merged_page_from_document_zip,
     render_page_from_document_zip,
@@ -63,6 +65,8 @@ from remarkable_mcp.extract import (
 )
 from remarkable_mcp.responses import make_error, make_response
 from remarkable_mcp.server import mcp
+from remarkable_mcp.tags import matches_tags, tag_names
+from remarkable_mcp.templates import group_pages
 
 logger = logging.getLogger(__name__)
 
@@ -132,7 +136,7 @@ def _find_target_document(collection, items_by_id: dict, document: str):
     actual_document = _resolve_root_path(document) if document.startswith("/") else document
     document_lower = actual_document.lower().strip("/")
     for item in collection:
-        if item.is_folder or _is_cloud_archived(item):
+        if item.is_folder or _is_cloud_archived(item, items_by_id):
             continue
         item_path = get_item_path(item, items_by_id)
         if not _is_within_root(item_path, root):
@@ -195,8 +199,8 @@ EXPORT_ANNOTATIONS = ToolAnnotations(
 DEFAULT_PAGE_SIZE = 8000
 
 
-def _is_cloud_archived(item) -> bool:
-    """Check if an item is cloud-archived (not available on device)."""
+def _is_directly_archived(item) -> bool:
+    """Check the item's own metadata, ignoring its ancestors."""
     # SSH/local-dir/USB expose an explicit property. Require a real bool so
     # permissive proxy objects do not accidentally hide otherwise valid items.
     archived = getattr(item, "is_cloud_archived", None)
@@ -205,6 +209,136 @@ def _is_cloud_archived(item) -> bool:
     # Cloud mode: check parent == "trash"
     parent = item.Parent if hasattr(item, "Parent") else getattr(item, "parent", "")
     return parent == "trash"
+
+
+def _item_tags(item) -> List[str]:
+    """Tag names for a listed document (empty when the transport has none)."""
+    tags = getattr(item, "tags", None)
+    return tag_names(tags) if isinstance(tags, (list, tuple)) else []
+
+
+def _item_page_tags(item) -> List[str]:
+    """Page tag names for a listed document (empty when the transport has none)."""
+    tags = getattr(item, "page_tags", None)
+    return tag_names(tags) if isinstance(tags, (list, tuple)) else []
+
+
+def _matches_item_tags(item, wanted: List[str]) -> bool:
+    """True if a document or one of its pages carries any wanted tag."""
+    return matches_tags(_item_tags(item), wanted) or matches_tags(_item_page_tags(item), wanted)
+
+
+def _plural(count: int, noun: str) -> str:
+    return f"{count} {noun}" + ("s" if count != 1 else "")
+
+
+def _page_shows_layers(layers: list) -> bool:
+    """Layer detail is worth showing when a page has several or hidden layers."""
+    return len(layers) > 1 or any(not la.get("visible", True) for la in layers)
+
+
+def _annotated_page_lines(ap: dict) -> List[str]:
+    """Text lines describing one annotated page for remarkable_read."""
+    layers = ap.get("layers") or []
+    show_layers = _page_shows_layers(layers)
+    hidden = {la["name"] for la in layers if not la.get("visible", True)}
+
+    def on_layer(entry: dict) -> str:
+        layer = entry.get("layer")
+        if not show_layers or not layer:
+            return ""
+        return f" ({layer}{', hidden' if layer in hidden else ''})"
+
+    marks = []
+    if ap.get("has_handwriting"):
+        marks.append("handwritten notes")
+    n_hl = len(ap.get("highlights") or [])
+    if n_hl:
+        marks.append(_plural(n_hl, "highlight"))
+    strokes = ap.get("highlighter_strokes") or []
+    if strokes:
+        colors = list(dict.fromkeys(str(h.get("color")) for h in strokes))
+        marks.append(f"{_plural(len(strokes), 'highlighter stroke')} ({', '.join(colors)})")
+    images = ap.get("images") or []
+    if images:
+        marks.append(_plural(len(images), "pasted image"))
+    summary = ", ".join(marks)
+    page_tags = ap.get("page_tags") or []
+    if page_tags:
+        tag_text = "page tags: " + ", ".join(page_tags)
+        summary = f"{summary}; {tag_text}" if summary else tag_text
+    lines = [f"Page {ap['page']}: " + (summary or "annotated")]
+
+    if show_layers:
+        for layer in layers:
+            parts = []
+            if layer.get("pen_strokes"):
+                parts.append(
+                    f"{_plural(layer['pen_strokes'], 'pen stroke')} "
+                    f"({', '.join(layer.get('pen_colors') or [])})"
+                )
+            if layer.get("highlights"):
+                parts.append(_plural(layer["highlights"], "highlight"))
+            if layer.get("highlighter_strokes"):
+                parts.append(_plural(layer["highlighter_strokes"], "highlighter stroke"))
+            if layer.get("images"):
+                parts.append(_plural(layer["images"], "pasted image"))
+            state = "" if layer.get("visible", True) else " [hidden]"
+            lines.append(f"  {layer['name']}{state}: " + (", ".join(parts) or "empty"))
+
+    details = ap.get("highlight_details")
+    if details is None:
+        details = [{"text": h} for h in ap.get("highlights") or []]
+    for h in details:
+        color = h.get("color")
+        prefix = f"[{color}] " if color else ""
+        location = f"   region {h['region']}" if h.get("region") else ""
+        lines.append(f"  • {prefix}{h['text']}{on_layer(h)}{location}")
+    for h in strokes:
+        location = f", region {h['region']}" if h.get("region") else ""
+        lines.append(f"  ~ [{h.get('color')}] highlighter stroke{location}{on_layer(h)}")
+    for image in images:
+        location = f", region {image['region']}" if image.get("region") else ""
+        lines.append(f"  + pasted image{location}{on_layer(image)}")
+    return lines
+
+
+def _descendant_items(items_by_parent: dict, parent_id: str) -> List:
+    """All items below ``parent_id`` in the folder tree, depth-first."""
+    found = []
+    stack = [parent_id]
+    seen = set()
+    while stack:
+        current = stack.pop()
+        if current in seen:
+            continue
+        seen.add(current)
+        for item in items_by_parent.get(current, []):
+            found.append(item)
+            if item.is_folder:
+                stack.append(item.ID)
+    return found
+
+
+def _is_cloud_archived(item, items_by_id: Optional[dict] = None) -> bool:
+    """Check if an item is cloud-archived (not available on device).
+
+    Trashing a folder only re-parents the folder itself, so with
+    ``items_by_id`` the ancestors are checked too.
+    """
+    if _is_directly_archived(item):
+        return True
+    if not items_by_id:
+        return False
+    seen = {item.ID}
+    parent_id = getattr(item, "Parent", "")
+    while parent_id in items_by_id and parent_id not in seen:
+        seen.add(parent_id)
+        parent = items_by_id[parent_id]
+        if _is_directly_archived(parent):
+            return True
+        parent_id = getattr(parent, "Parent", "")
+    return False
 
 
 def _modified_sort_key(item) -> float:
@@ -348,6 +482,10 @@ async def remarkable_read(
       may not be synced to the cloud).
     - "annotations": Only annotations, highlights, and handwritten notes
 
+    Highlight text comes from the PDF's text layer and often misses mathematical
+    symbols and equations. When the exact highlighted content matters, render the
+    highlight's region with remarkable_image(document, page, region=...).
+
     Use pagination to read large documents without overwhelming context:
     - Start with page=1 (default)
     - Check "more" field - if true, there's more content
@@ -393,7 +531,9 @@ async def remarkable_read(
 
         root = _get_root_path()
         documents = [
-            item for item in collection if not item.is_folder and not _is_cloud_archived(item)
+            item
+            for item in collection
+            if not item.is_folder and not _is_cloud_archived(item, items_by_id)
         ]
         target_doc = _find_target_document(collection, items_by_id, document)
 
@@ -538,6 +678,7 @@ async def remarkable_read(
                     target_doc.ID,
                     include_ocr=True,
                     ocr_backend=None,
+                    version=document_version(target_doc),
                 )
                 if cached and cached.get("handwritten_text"):
                     notebook_pages = cached["handwritten_text"]
@@ -562,6 +703,7 @@ async def remarkable_read(
                             tmp_path,
                             include_ocr=include_ocr,
                             doc_id=target_doc.ID,
+                            version=document_version(target_doc),
                         )
                         if content.get("handwritten_text"):
                             notebook_pages = content["handwritten_text"]
@@ -588,6 +730,7 @@ async def remarkable_read(
                                 tmp_path,
                                 include_ocr=include_ocr,
                                 doc_id=target_doc.ID,
+                                version=document_version(target_doc),
                             )
                         finally:
                             tmp_path.unlink(missing_ok=True)
@@ -604,18 +747,8 @@ async def remarkable_read(
                 if annotated_pages:
                     annotation_parts.append("\n--- Annotated pages ---")
                     for ap in annotated_pages:
-                        marks = []
-                        if ap.get("has_handwriting"):
-                            marks.append("handwritten notes")
-                        n_hl = len(ap.get("highlights") or [])
-                        if n_hl:
-                            marks.append(f"{n_hl} highlight" + ("s" if n_hl != 1 else ""))
-                        annotation_parts.append(
-                            f"Page {ap['page']}: " + (", ".join(marks) or "annotated")
-                        )
-                        for h in ap.get("highlights") or []:
-                            annotation_parts.append(f"  • {h}")
-                            shown_highlights.add(h)
+                        annotation_parts.extend(_annotated_page_lines(ap))
+                        shown_highlights.update(ap.get("highlights") or [])
                 # Highlights not covered by the per-page index above — e.g. from
                 # the legacy .highlights JSON (older firmware), which has no page
                 # attribution. Without this, a doc whose pages carry pen strokes
@@ -626,6 +759,14 @@ async def remarkable_read(
                 if other_highlights:
                     annotation_parts.append("\n--- Highlights ---")
                     annotation_parts.extend(other_highlights)
+                page_templates = content.get("page_templates") or []
+                if page_templates:
+                    annotation_parts.append("\n--- Page templates ---")
+                    for first, last, name in group_pages(
+                        [(t["page"], t["template"]) for t in page_templates]
+                    ):
+                        pages = f"Page {first}" if first == last else f"Pages {first}-{last}"
+                        annotation_parts.append(f"{pages}: {name}")
                 if content.get("handwritten_text"):
                     annotation_parts.append("\n--- Handwritten (OCR) ---")
                     annotation_parts.extend(content["handwritten_text"])
@@ -892,10 +1033,34 @@ async def remarkable_read(
             ),
         }
 
-        # Add tags if present (from listing metadata, or from extraction in USB mode)
-        tags = getattr(target_doc, "tags", None) or (content.get("tags") if content else None)
+        # Add tags if present (from extraction, or from listing metadata)
+        tags = (content.get("tags") if content else None) or _item_tags(target_doc)
         if tags:
             result["tags"] = tags
+        if content and content.get("page_templates"):
+            result["page_templates"] = content["page_templates"]
+
+        # Highlights with their colors, in page order
+        if content_type in ("text", "annotations") and content:
+            highlight_details = content.get("highlight_details")
+            if highlight_details:
+                result["highlights"] = highlight_details
+            highlighter_strokes = content.get("highlighter_strokes")
+            if highlighter_strokes:
+                result["highlighter_strokes"] = highlighter_strokes
+            pasted = content.get("images")
+            if pasted:
+                result["images"] = pasted
+        if content and content.get("page_tags"):
+            result["page_tags"] = content["page_tags"]
+        if content_type in ("text", "annotations") and content:
+            page_layers = [
+                {"page": ap["page"], "layers": ap["layers"]}
+                for ap in content.get("annotated_pages") or []
+                if _page_shows_layers(ap.get("layers") or [])
+            ]
+            if page_layers:
+                result["layers"] = page_layers
 
         if has_more:
             result["next_page"] = page + 1
@@ -959,7 +1124,9 @@ async def remarkable_browse(
     2. Search mode: Find documents by name
        - Set query="search term" to search across all documents
     3. Filter by tags: Find documents with specific tags
-       - Set tags=["tag1", "tag2"] to filter by tags
+       - Set tags=["tag1", "tag2"] to list documents carrying any of the tags,
+         as document tags or page tags
+       - In browse mode, searches the folder and all of its subfolders
        - Works in both browse and search modes
 
     Results include document names, types, modification dates, and tags.
@@ -997,19 +1164,15 @@ async def remarkable_browse(
 
             for item in collection:
                 # Skip cloud-archived items
-                if _is_cloud_archived(item):
+                if _is_cloud_archived(item, items_by_id):
                     continue
                 item_path = get_item_path(item, items_by_id)
                 # Filter by root path
                 if not _is_within_root(item_path, root):
                     continue
                 # Filter by tags if provided
-                if tags:
-                    item_tags_lower = [
-                        t.lower() for t in (item.tags if hasattr(item, "tags") else [])
-                    ]
-                    if not any(tag.lower() in item_tags_lower for tag in tags):
-                        continue
+                if tags and not _matches_item_tags(item, tags):
+                    continue
                 if query_lower in item.VissibleName.lower():
                     match_info = {
                         "name": item.VissibleName,
@@ -1020,8 +1183,12 @@ async def remarkable_browse(
                         ),
                     }
                     # Add tags if present
-                    if hasattr(item, "tags") and item.tags:
-                        match_info["tags"] = item.tags
+                    item_tags = _item_tags(item)
+                    if item_tags:
+                        match_info["tags"] = item_tags
+                    item_page_tags = _item_page_tags(item)
+                    if item_page_tags:
+                        match_info["page_tags"] = item_page_tags
                     matches.append(match_info)
 
             matches.sort(key=lambda x: x["name"])
@@ -1136,47 +1303,74 @@ async def remarkable_browse(
 
             target_parent = current_parent
 
-        items = items_by_parent.get(target_parent, [])
-
         folders = []
         documents = []
 
-        for item in sorted(items, key=lambda x: x.VissibleName.lower()):
-            # Skip cloud-archived items
-            if _is_cloud_archived(item):
-                continue
-            # Filter by tags if provided
-            if tags and not item.is_folder:
-                item_tags_lower = [t.lower() for t in (item.tags if hasattr(item, "tags") else [])]
-                if not any(tag.lower() in item_tags_lower for tag in tags):
+        if tags:
+            # Tag filter: list matching documents in this folder and all of
+            # its subfolders, each with its path.
+            for item in _descendant_items(items_by_parent, target_parent):
+                if item.is_folder or _is_cloud_archived(item, items_by_id):
                     continue
-            if item.is_folder:
-                folders.append({"name": item.VissibleName, "id": item.ID})
-            else:
+                if not _matches_item_tags(item, tags):
+                    continue
                 doc_info = {
                     "name": item.VissibleName,
                     "id": item.ID,
+                    "path": _apply_root_filter(get_item_path(item, items_by_id)),
                     "modified": (item.ModifiedClient if hasattr(item, "ModifiedClient") else None),
+                    "tags": _item_tags(item),
                 }
-                # Add tags if present
-                if hasattr(item, "tags") and item.tags:
-                    doc_info["tags"] = item.tags
+                item_page_tags = _item_page_tags(item)
+                if item_page_tags:
+                    doc_info["page_tags"] = item_page_tags
                 documents.append(doc_info)
+            documents.sort(key=lambda d: d["path"].lower())
+        else:
+            items = items_by_parent.get(target_parent, [])
+            for item in sorted(items, key=lambda x: x.VissibleName.lower()):
+                # Skip cloud-archived items
+                if _is_cloud_archived(item, items_by_id):
+                    continue
+                if item.is_folder:
+                    folders.append({"name": item.VissibleName, "id": item.ID})
+                else:
+                    doc_info = {
+                        "name": item.VissibleName,
+                        "id": item.ID,
+                        "modified": (
+                            item.ModifiedClient if hasattr(item, "ModifiedClient") else None
+                        ),
+                    }
+                    # Add tags if present
+                    item_tags = _item_tags(item)
+                    if item_tags:
+                        doc_info["tags"] = item_tags
+                    item_page_tags = _item_page_tags(item)
+                    if item_page_tags:
+                        doc_info["page_tags"] = item_page_tags
+                    documents.append(doc_info)
 
         result = {"mode": "browse", "path": path, "folders": folders, "documents": documents}
         if tags:
             result["filter_tags"] = tags
+            result["recursive"] = True
 
         # Build helpful hint
-        tag_desc = f" with tags {tags}" if tags else ""
-        hint_parts = [f"Found {len(folders)} folder(s) and {len(documents)} document(s){tag_desc}."]
+        if tags:
+            hint_parts = [
+                f"Found {len(documents)} document(s) with tags {tags} "
+                "in this folder and its subfolders."
+            ]
+        else:
+            hint_parts = [f"Found {len(folders)} folder(s) and {len(documents)} document(s)."]
 
         if documents:
             hint_parts.append(f"To read a document: remarkable_read('{documents[0]['name']}').")
         if folders:
             folder_path = f"{path.rstrip('/')}/{folders[0]['name']}"
             hint_parts.append(f"To enter a folder: remarkable_browse('{folder_path}').")
-        if not folders and not documents:
+        if not folders and not documents and not tags:
             hint_parts.append("This folder is empty.")
 
         return make_response(result, " ".join(hint_parts))
@@ -1225,7 +1419,7 @@ async def remarkable_recent(limit: int = 10, include_preview: bool = False) -> s
         # Get documents sorted by modified date (excluding archived, filtered by root)
         documents = []
         for item in collection:
-            if item.is_folder or _is_cloud_archived(item):
+            if item.is_folder or _is_cloud_archived(item, items_by_id):
                 continue
             item_path = get_item_path(item, items_by_id)
             if not _is_within_root(item_path, root):
@@ -1243,8 +1437,9 @@ async def remarkable_recent(limit: int = 10, include_preview: bool = False) -> s
                 "modified": (doc.ModifiedClient if hasattr(doc, "ModifiedClient") else None),
             }
             # Add tags if present
-            if hasattr(doc, "tags") and doc.tags:
-                doc_info["tags"] = doc.tags
+            doc_tags = _item_tags(doc)
+            if doc_tags:
+                doc_info["tags"] = doc_tags
 
             if include_preview:
                 # Download and extract preview (skip notebooks - they need slow OCR)
@@ -1266,6 +1461,7 @@ async def remarkable_recent(limit: int = 10, include_preview: bool = False) -> s
                                 tmp_path,
                                 include_ocr=False,
                                 doc_id=doc.ID,
+                                version=document_version(doc),
                             )
                             preview_text = "\n".join(content["typed_text"])[:200]
                             if preview_text:
@@ -1374,6 +1570,8 @@ async def remarkable_search(
             # Include tags if present
             if "tags" in doc:
                 doc_result["tags"] = doc["tags"]
+            if "page_tags" in doc:
+                doc_result["page_tags"] = doc["page_tags"]
 
             try:
                 read_result = await remarkable_read(
@@ -1572,10 +1770,10 @@ async def remarkable_status() -> str:
 
         root = _get_root_path()
 
-        # Count documents (not folders, filtered by root)
+        # Count documents (not folders or trashed, filtered by root)
         doc_count = 0
         for item in collection:
-            if item.is_folder:
+            if item.is_folder or _is_cloud_archived(item, items_by_id):
                 continue
             item_path = get_item_path(item, items_by_id)
             if _is_within_root(item_path, root):
@@ -1700,6 +1898,43 @@ async def remarkable_status() -> str:
         return make_response(result, hint)
 
 
+MIN_IMAGE_DPI = 36
+MAX_IMAGE_DPI = 600
+
+
+def _image_region_error(region: List[float]) -> Optional[str]:
+    """Why ``region`` is not a valid page-fraction crop box, or None."""
+    if len(region) != 4:
+        return "region needs four numbers: [left, top, right, bottom]."
+    left, top, right, bottom = region
+    if not (0.0 <= left < right <= 1.0 and 0.0 <= top < bottom <= 1.0):
+        return (
+            "region values are fractions of the page width and height and need "
+            "0 <= left < right <= 1 and 0 <= top < bottom <= 1."
+        )
+    return None
+
+
+def _crop_png(png_data: bytes, region: List[float]) -> bytes:
+    """Crop a PNG to ``[left, top, right, bottom]`` fractions of its size."""
+    import io
+
+    from PIL import Image as PILImage
+
+    image = PILImage.open(io.BytesIO(png_data))
+    width, height = image.size
+    left, top, right, bottom = region
+    box = (
+        int(round(left * width)),
+        int(round(top * height)),
+        max(int(round(right * width)), int(round(left * width)) + 1),
+        max(int(round(bottom * height)), int(round(top * height)) + 1),
+    )
+    output = io.BytesIO()
+    image.crop(box).save(output, format="PNG")
+    return output.getvalue()
+
+
 async def _render_png_page(
     client,
     target_doc,
@@ -1708,8 +1943,15 @@ async def _render_png_page(
     background: str,
     render_merged: bool,
     allow_pdf_fallback: bool,
+    layers: Optional[str] = None,
+    dpi: Optional[float] = None,
+    full_page: bool = False,
 ) -> tuple[Optional[bytes], Optional[str], bool, bool]:
-    """Render a PNG with the same fallbacks used by remarkable_image."""
+    """Render a PNG with the same fallbacks used by remarkable_image.
+
+    ``full_page`` renders annotation-only pages over the whole page instead of
+    cropping to the ink, so page coordinates (and ``dpi``) apply.
+    """
     merged_note = None
     is_merged = False
     if render_merged:
@@ -1718,14 +1960,27 @@ async def _render_png_page(
             tmp_path,
             page,
             background_color=background,
+            layers=layers,
+            dpi=dpi,
         )
         is_merged = png_data is not None and merged_note is None
+    elif full_page:
+        full = await run_blocking(
+            render_page_full_page_from_document_zip,
+            tmp_path,
+            page,
+            background_color=background,
+            layers=layers,
+            dpi=dpi,
+        )
+        png_data = full[0] if full is not None else None
     else:
         png_data = await run_blocking(
             render_page_from_document_zip,
             tmp_path,
             page,
             background_color=background,
+            layers=layers,
         )
 
     rendered_via_pdf = False
@@ -1737,7 +1992,9 @@ async def _render_png_page(
         if png_data is None and not has_source_pdf:
             pdf_bytes = await run_blocking(download_raw_file, client, target_doc, "pdf")
             if pdf_bytes:
-                png_data = await run_blocking(render_tablet_pdf_page_to_png, pdf_bytes, page)
+                png_data = await run_blocking(
+                    render_tablet_pdf_page_to_png, pdf_bytes, page, dpi=dpi
+                )
                 rendered_via_pdf = png_data is not None
 
     if png_data is None:
@@ -1746,11 +2003,22 @@ async def _render_png_page(
             tmp_path,
             page,
             background_color=background,
+            layers=layers,
+            dpi=dpi,
         )
         if full is not None:
             png_data = full[0]
 
     return png_data, merged_note, is_merged, rendered_via_pdf
+
+
+def _publish_png(png_data: bytes, title: str) -> PublishedExport[None]:
+    """Publish a rendered page image as a temporary resource."""
+
+    def write(path: Path) -> None:
+        path.write_bytes(png_data)
+
+    return export_store.publish(filename=title, output_format="png", writer=write)
 
 
 @mcp.tool(annotations=IMAGE_ANNOTATIONS)
@@ -1762,6 +2030,9 @@ async def remarkable_image(
     compatibility: bool = False,
     include_ocr: bool = False,
     render_merged: Optional[bool] = None,
+    layers: str = "visible",
+    dpi: Optional[int] = None,
+    region: Optional[List[float]] = None,
 ):
     """
     <usecase>Get an image of a specific page from a reMarkable document.</usecase>
@@ -1786,8 +2057,9 @@ async def remarkable_image(
     - SVG: Returned as TextResourceContents with SVG markup
 
     If your client doesn't support embedded resources in tool responses, set
-    compatibility=True to receive a JSON response with just the resource URI.
-    The client can then fetch the resource separately.
+    compatibility=True to receive a JSON response with just a resource URI. For
+    PNG it points to a temporary copy of the rendered image that expires after
+    15 minutes; the client can then fetch the resource separately.
 
     Optionally, enable include_ocr=True to extract text from the image using OCR.
     Google Vision is used when configured; otherwise OCR runs locally with Tesseract.
@@ -1810,6 +2082,16 @@ async def remarkable_image(
     - render_merged: PDF compositing mode for PNG: None (default) automatically
       merges PDF-backed pages, True explicitly requests merging, and False returns
       the annotation-only layer. SVG output remains annotation-only.
+    - layers: Which page layers to draw: "visible" (default) draws what the tablet
+      shows, "all" includes hidden layers, or a layer name (e.g. "Layer 3") draws
+      only that layer. remarkable_read(content_type="annotations") lists layers.
+    - dpi: PNG resolution in dots per inch of the physical page (36-600). Renders
+      the whole page rather than cropping to the ink. Use 300 to read small
+      handwriting. Default: about 1872 px on the long edge (notebooks) or 144 dpi
+      (PDF-backed pages).
+    - region: PNG crop box [left, top, right, bottom] as fractions of the page
+      (0-1), e.g. [0, 0.5, 1, 0.75] for the third quarter of the page. Combine
+      with dpi to inspect one area closely without a huge image.
     </parameters>
     <examples>
     - remarkable_image("UI Mockup")  # Get first page as embedded PNG resource
@@ -1821,6 +2103,10 @@ async def remarkable_image(
     - remarkable_image("Notes", include_ocr=True)  # Get image with OCR text extraction
     - remarkable_image("Annotated PDF")  # PDF + annotations composited automatically
     - remarkable_image("Annotated PDF", render_merged=False)  # Annotation layer only
+    - remarkable_image("Notes", page=3, layers="all")  # Include hidden layers
+    - remarkable_image("Notes", page=3, layers="Layer 3")  # One named layer
+    - remarkable_image("Worksheet", page=2, dpi=300)  # Full page at 300 dpi
+    - remarkable_image("Worksheet", page=2, dpi=300, region=[0, 0.4, 1, 0.6])  # One band
     </examples>
     """
     try:
@@ -1834,7 +2120,9 @@ async def remarkable_image(
 
         root = _get_root_path()
         documents = [
-            item for item in collection if not item.is_folder and not _is_cloud_archived(item)
+            item
+            for item in collection
+            if not item.is_folder and not _is_cloud_archived(item, items_by_id)
         ]
         target_doc = _find_target_document(collection, items_by_id, document)
 
@@ -1862,6 +2150,27 @@ async def remarkable_image(
                 message=f"Invalid format: '{output_format}'. Supported formats: png, svg",
                 suggestion="Use output_format='png' for raster or 'svg' for vectors.",
             )
+
+        if (dpi is not None or region is not None) and format_lower != "png":
+            return make_error(
+                error_type="invalid_parameter",
+                message="dpi and region apply to PNG output only.",
+                suggestion="Use output_format='png' with dpi or region.",
+            )
+        if dpi is not None and not (MIN_IMAGE_DPI <= dpi <= MAX_IMAGE_DPI):
+            return make_error(
+                error_type="invalid_parameter",
+                message=f"dpi must be between {MIN_IMAGE_DPI} and {MAX_IMAGE_DPI}.",
+                suggestion="Use dpi=300 to read handwriting; add region to keep images small.",
+            )
+        if region is not None:
+            region_error = _image_region_error(region)
+            if region_error:
+                return make_error(
+                    error_type="invalid_parameter",
+                    message=region_error,
+                    suggestion="Example: region=[0, 0.5, 1, 0.75] for the third quarter.",
+                )
 
         raw_doc = await run_blocking(client.download, target_doc)
         native_pdf = raw_doc if _is_pdf_payload(raw_doc) else None
@@ -1899,6 +2208,22 @@ async def remarkable_image(
                     suggestion=f"Use page=1 to {total_pages} to view different pages.",
                 )
 
+            layer_selection = (layers or "visible").strip()
+            if layer_selection.lower() not in ("visible", "all") and tmp_path is not None:
+                page_layers = await run_blocking(get_page_layers_from_document_zip, tmp_path, page)
+                names = [la["name"] for la in page_layers]
+                if layer_selection.lower() not in (n.lower() for n in names):
+                    return make_error(
+                        error_type="layer_not_found",
+                        message=f"Page {page} has no layer named '{layer_selection}'.",
+                        suggestion=(
+                            f"Layers on this page: {', '.join(names)}."
+                            if names
+                            else "This page has no named layers; use layers='visible'."
+                        ),
+                        did_you_mean=names or None,
+                    )
+
             # Build resource URI for this page
             doc_path = _apply_root_filter(get_item_path(target_doc, items_by_id))
             uri_path = doc_path.lstrip("/")
@@ -1928,6 +2253,7 @@ async def remarkable_image(
                     tmp_path,
                     page,
                     background_color=background,
+                    layers=layer_selection,
                 )
 
                 if svg_content is None:
@@ -1996,6 +2322,7 @@ async def remarkable_image(
                         render_tablet_pdf_page_to_png,
                         native_pdf,
                         page,
+                        dpi=dpi,
                     )
                     rendered_via_pdf = png_data is not None
                 else:
@@ -2012,6 +2339,9 @@ async def remarkable_image(
                         background,
                         use_merged,
                         render_merged is not False,
+                        layer_selection,
+                        dpi,
+                        dpi is not None or region is not None,
                     )
 
                 if png_data is None:
@@ -2026,6 +2356,14 @@ async def remarkable_image(
                             "remarkable_read() to extract text instead."
                         ),
                     )
+
+                if region is not None:
+                    png_data = await run_blocking(_crop_png, png_data, region)
+                render_info = {}
+                if dpi is not None:
+                    render_info["dpi"] = dpi
+                if region is not None:
+                    render_info["region"] = region
 
                 # Handle OCR if requested - extract text from the image
                 ocr_text = None
@@ -2052,7 +2390,6 @@ async def remarkable_image(
 
                 uri_suffix = ".merged.png" if is_merged else ".png"
                 resource_uri = f"remarkableimg:///{uri_path}.page-{page}{uri_suffix}"
-                png_base64 = base64.b64encode(png_data).decode("utf-8")
 
                 # Build OCR info for response if OCR was requested
                 ocr_info = {}
@@ -2063,13 +2400,18 @@ async def remarkable_image(
                         ocr_info["ocr_message"] = "No text detected in image"
 
                 if compatibility:
-                    # Return base64 PNG in JSON for clients without embedded resource support
-                    # Include data URI format for direct use in HTML <img> tags
-                    data_uri = f"data:image/png;base64,{png_base64}"
+                    # Clients without embedded resource support get a link to a
+                    # temporary resource holding exactly this rendered image.
+                    published = await run_blocking(
+                        _publish_png,
+                        png_data,
+                        f"{target_doc.VissibleName} page {page}",
+                    )
+                    image_resource = published.resource
                     hint = (
-                        f"Page {page}/{total_pages} as base64-encoded PNG. "
-                        f"Use 'data_uri' directly in HTML img src. "
-                        f"Use compatibility=False for embedded resource format."
+                        f"Page {page}/{total_pages} as a PNG resource; read resource_uri "
+                        f"before it expires at {image_resource.expires_at.isoformat()}. "
+                        f"Use compatibility=False to embed the image instead."
                     )
                     if include_ocr and ocr_text:
                         hint = (
@@ -2089,19 +2431,21 @@ async def remarkable_image(
                         )
 
                     response_data = {
-                        "data_uri": data_uri,
-                        "image_base64": png_base64,
                         "mime_type": "image/png",
                         "page": page,
                         "total_pages": total_pages,
-                        "resource_uri": resource_uri,
+                        "resource_uri": image_resource.uri,
+                        "size": image_resource.size,
+                        "expires_at": image_resource.expires_at.isoformat(),
                         "merged": is_merged,
                         "render_source": "tablet_pdf" if rendered_via_pdf else "strokes",
+                        **render_info,
                         **ocr_info,
                     }
                     return make_response(response_data, hint)
                 else:
                     # Return PNG as embedded BlobResourceContents with info hint
+                    png_base64 = base64.b64encode(png_data).decode("utf-8")
                     blob_resource = BlobResourceContents(
                         uri=resource_uri,
                         mime_type="image/png",
@@ -2111,6 +2455,10 @@ async def remarkable_image(
 
                     info_text = f"Page {page}/{total_pages} of '{target_doc.VissibleName}' as PNG. "
                     info_text += f"Resource URI: {resource_uri}"
+                    if dpi is not None:
+                        info_text += f"\nRendered at {dpi} dpi."
+                    if region is not None:
+                        info_text += f"\nCropped to region {region} (fractions of the page)."
                     if is_merged:
                         info_text += "\nRendered with PDF + annotation compositing."
                     if rendered_via_pdf:
@@ -2148,6 +2496,46 @@ class _DocumentExportResult:
     pdf_mode: PdfMode | None = None
 
 
+def _parse_page_spec(pages) -> List[tuple]:
+    """``(first, last)`` ranges from ``5``, ``"5"`` or ``"5-9,12"``; ValueError if malformed."""
+    if isinstance(pages, bool):
+        raise ValueError("pages must be a page number or ranges like '5-9,12'.")
+    if isinstance(pages, int):
+        parts = [str(pages)]
+    else:
+        parts = [part.strip() for part in str(pages).split(",")]
+    ranges = []
+    for part in parts:
+        first, sep, last = part.partition("-")
+        try:
+            start = int(first)
+            end = int(last) if sep else start
+        except ValueError:
+            raise ValueError(
+                f"Invalid page selection '{part}'. Use a page number or ranges like '5-9,12'."
+            )
+        if start < 1 or end < start:
+            raise ValueError(
+                f"Invalid page range '{part}'. Pages start at 1 and ranges run low to high."
+            )
+        ranges.append((start, end))
+    return ranges
+
+
+def _select_pages(ranges: List[tuple], page_count: int) -> List[int]:
+    """Pages in ``ranges``, in document order without repeats, checked against the count."""
+    out_of_range = [r for r in ranges if r[1] > page_count]
+    if out_of_range:
+        first, last = out_of_range[0]
+        label = f"{first}" if first == last else f"{first}-{last}"
+        raise _ExportRequestError(
+            "invalid_page_selection",
+            f"Page selection {label} is outside the document, which has {page_count} page(s).",
+            f"Choose pages between 1 and {page_count}.",
+        )
+    return sorted({page for first, last in ranges for page in range(first, last + 1)})
+
+
 class _ExportRequestError(Exception):
     def __init__(self, error_type: str, message: str, suggestion: str):
         super().__init__(message)
@@ -2180,8 +2568,17 @@ def _publish_document_export(
     pdf_mode: PdfMode,
     include_ocr: bool,
     background_color: str,
+    page_ranges: Optional[List[tuple]] = None,
 ) -> PublishedExport[_DocumentExportResult]:
-    """Download, build, and publish one export without touching tablet state."""
+    """Download, build, and publish one export without touching tablet state.
+
+    ``page_ranges`` (PDF only) limits the export to those physical pages.
+    """
+
+    def selection(page_count: Optional[int]) -> Optional[List[int]]:
+        if page_ranges is None or page_count is None:
+            return None
+        return _select_pages(page_ranges, page_count)
 
     def writer(destination: Path) -> _DocumentExportResult:
         raw_doc = client.download(target_doc)
@@ -2208,7 +2605,9 @@ def _publish_document_export(
                             "or newer USB firmware that exposes an rmdoc archive."
                         ),
                     )
-                build = write_native_pdf_export(raw_doc, destination, resolved)
+                build = write_native_pdf_export(
+                    raw_doc, destination, resolved, pages=selection(page_count)
+                )
                 return _DocumentExportResult(
                     build=build,
                     metadata=resolved,
@@ -2268,7 +2667,12 @@ def _publish_document_export(
                     if _is_pdf_payload(native_pdf):
                         native_pages = _count_pdf_pages(native_pdf)
                         native_metadata = replace(resolved, page_count=native_pages)
-                        build = write_native_pdf_export(native_pdf, destination, native_metadata)
+                        build = write_native_pdf_export(
+                            native_pdf,
+                            destination,
+                            native_metadata,
+                            pages=selection(native_pages),
+                        )
                         return _DocumentExportResult(
                             build=build,
                             metadata=native_metadata,
@@ -2297,6 +2701,7 @@ def _publish_document_export(
                     resolved,
                     pdf_mode=pdf_mode,
                     background_color=background_color,
+                    pages=selection(resolved.page_count),
                 )
                 return _DocumentExportResult(
                     build=build,
@@ -2312,6 +2717,7 @@ def _publish_document_export(
                     archive_path,
                     include_ocr=include_ocr,
                     doc_id=resolved.document_id,
+                    version=document_version(target_doc),
                 )
                 if resolved.page_count is None:
                     extracted_pages = int(extraction.get("pages") or 0)
@@ -2380,6 +2786,7 @@ async def remarkable_export(
     output_format: Literal["pdf", "markdown"] = "pdf",
     pdf_mode: Literal["merged", "annotations"] = "merged",
     include_ocr: bool = False,
+    pages: Optional[int | str] = None,
 ):
     """
     <usecase>Export one reMarkable document as a reusable PDF or Markdown file.</usecase>
@@ -2399,6 +2806,8 @@ async def remarkable_export(
       transport provides a document archive.
     - Pages remain in physical device order. A render failure produces a labeled
       placeholder at that ordinal and a partial-export warning; pages are not skipped.
+    - `pages` exports only the selected physical pages (same numbering as
+      remarkable_image), in document order.
 
     Markdown behavior:
     - Preserves basic source metadata and fixed source text, typed text, annotation,
@@ -2412,11 +2821,13 @@ async def remarkable_export(
     - output_format: "pdf" (default) or "markdown".
     - pdf_mode: PDF-only mode, "merged" (default) or "annotations".
     - include_ocr: Enable existing handwriting OCR for Markdown (default: False).
+    - pages: PDF only. One page (5) or ranges ("5-9,12"); default: every page.
     </parameters>
     <examples>
     - remarkable_export("Meeting Notes")
     - remarkable_export("Research Paper", output_format="pdf", pdf_mode="annotations")
     - remarkable_export("Journal", output_format="markdown", include_ocr=True)
+    - remarkable_export("Lecture Notes", pages="3-5,9")
     </examples>
     """
     if output_format == "markdown" and pdf_mode != "merged":
@@ -2431,6 +2842,22 @@ async def remarkable_export(
             message="include_ocr applies only to Markdown exports.",
             suggestion="Set include_ocr=False, or choose output_format='markdown'.",
         )
+    page_ranges = None
+    if pages is not None:
+        if output_format != "pdf":
+            return make_error(
+                error_type="invalid_export_options",
+                message="pages applies only to PDF exports.",
+                suggestion="Omit pages for Markdown, or choose output_format='pdf'.",
+            )
+        try:
+            page_ranges = _parse_page_spec(pages)
+        except ValueError as exc:
+            return make_error(
+                error_type="invalid_page_selection",
+                message=str(exc),
+                suggestion="Examples: pages=5, pages='5-9', pages='1,3,10-12'.",
+            )
 
     try:
         client = await run_blocking(get_rmapi)
@@ -2443,7 +2870,7 @@ async def remarkable_export(
                 item
                 for item in collection
                 if not item.is_folder
-                and not _is_cloud_archived(item)
+                and not _is_cloud_archived(item, items_by_id)
                 and _is_within_root(get_item_path(item, items_by_id), root)
             ]
             similar = find_similar_documents(document, candidates)
@@ -2464,7 +2891,7 @@ async def remarkable_export(
             source_type=source_type,
             page_count=None,
             modified=getattr(target_doc, "ModifiedClient", None),
-            tags=tuple(getattr(target_doc, "tags", None) or ()),
+            tags=tuple(_item_tags(target_doc)),
         )
         background = await run_blocking(get_background_color)
         published = await run_blocking(
@@ -2476,6 +2903,7 @@ async def remarkable_export(
             pdf_mode=pdf_mode,
             include_ocr=include_ocr,
             background_color=background,
+            page_ranges=page_ranges,
         )
     except _ExportRequestError as exc:
         return make_error(
@@ -2515,6 +2943,9 @@ async def remarkable_export(
     }
     if result.pdf_mode is not None:
         response["pdf_mode"] = result.pdf_mode
+    if page_ranges is not None:
+        response["selected_pages"] = _select_pages(page_ranges, result.metadata.page_count)
+        response["document_pages"] = result.metadata.page_count
     if build.ocr_backend:
         response["ocr_backend"] = build.ocr_backend
 

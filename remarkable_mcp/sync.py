@@ -26,6 +26,8 @@ from typing import Any, Dict, List, Optional
 import requests
 from requests.adapters import HTTPAdapter
 
+from remarkable_mcp.tags import document_tag_names, page_tag_names
+
 logger = logging.getLogger(__name__)
 
 # Thread-local HTTP sessions for connection pooling under parallel traversal.
@@ -338,6 +340,7 @@ class Document:
     size: int = 0
     files: List[Dict[str, Any]] = field(default_factory=list)
     tags: List[str] = field(default_factory=list)
+    page_tags: List[str] = field(default_factory=list)
 
     @property
     def is_folder(self) -> bool:
@@ -593,6 +596,7 @@ class RemarkableClient:
 
         # Find and fetch the metadata file
         metadata: Dict[str, Any] = {}
+        content_entry: Optional[Dict[str, Any]] = None
         files = []
 
         for blob_entry in blob_entries:
@@ -603,10 +607,21 @@ class RemarkableClient:
                     metadata = json.loads(meta_content.decode("utf-8"))
                 except Exception:
                     pass
+            elif blob_entry["id"].endswith(".content"):
+                content_entry = blob_entry
 
         # Skip deleted documents
         if metadata.get("deleted", False):
             return None
+
+        # Document tags live in the .content file, not .metadata.
+        content: Optional[Dict[str, Any]] = None
+        if content_entry is not None and metadata.get("type") != "CollectionType":
+            try:
+                raw_content = self._get_file(content_entry["hash"], content_entry["id"])
+                content = json.loads(raw_content.decode("utf-8"))
+            except Exception:
+                content = None
 
         # Parse last modified timestamp
         last_modified = None
@@ -628,7 +643,8 @@ class RemarkableClient:
             last_modified=last_modified,
             size=entry["size"],
             files=files,
-            tags=metadata.get("tags", []),
+            tags=document_tag_names(metadata, content),
+            page_tags=page_tag_names(content),
         )
 
     def get_doc(self, doc_id: str) -> Optional[Document]:

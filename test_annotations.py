@@ -1,0 +1,857 @@
+"""Tests for highlight colors extracted from v6 .rm scene items."""
+
+import io
+import json
+import uuid
+import zipfile
+from pathlib import Path
+
+from rmscene import scene_items as si
+from rmscene.crdt_sequence import CrdtSequenceItem
+from rmscene.scene_stream import (
+    AuthorIdsBlock,
+    MigrationInfoBlock,
+    PageInfoBlock,
+    SceneGlyphItemBlock,
+    SceneGroupItemBlock,
+    SceneLineItemBlock,
+    SceneTreeBlock,
+    TreeNodeBlock,
+    write_blocks,
+)
+from rmscene.tagged_block_common import CrdtId, LwwValue
+
+from remarkable_mcp.colors import color_info, render_color
+from remarkable_mcp.exporters import ExportMetadata, write_markdown_export
+from remarkable_mcp.extract import (
+    _page_annotation_details,
+    _render_rm_v6_to_svg,
+    extract_text_from_document_zip,
+    get_page_layers_from_document_zip,
+)
+
+ROOT_ID = CrdtId(0, 1)
+
+# (label, color id, ARGB) as written by current firmware for each highlighter.
+HIGHLIGHTER_PALETTE = [
+    ("yellow", 3, 0xFF000000),
+    ("green", 4, 0xFF000000),
+    ("pink", 5, 0xFF000000),
+    ("gray", 8, 0xFF000000),
+    ("blue", 9, 0xFFBEEAFE),
+    ("orange", 9, 0xFFFFC38C),
+]
+
+
+def rgba(argb: int) -> tuple:
+    """ARGB uint32 -> rmscene (r, g, b, a) tuple."""
+    return ((argb >> 16) & 0xFF, (argb >> 8) & 0xFF, argb & 0xFF, (argb >> 24) & 0xFF)
+
+
+def glyph(text: str, color: int, argb, y: float, x: float = 0.0) -> si.GlyphRange:
+    return si.GlyphRange(
+        start=None,
+        length=len(text),
+        text=text,
+        color=si.PenColor(color),
+        rectangles=[si.Rectangle(x=x, y=y, w=100.0, h=20.0)],
+        color_rgba=rgba(argb) if argb is not None else None,
+    )
+
+
+def stroke(color: int, tool: int, points, argb=None) -> si.Line:
+    return si.Line(
+        color=si.PenColor(color),
+        tool=si.Pen(tool),
+        points=[
+            si.Point(x=float(x), y=float(y), speed=0, direction=0, width=8, pressure=100)
+            for x, y in points
+        ],
+        thickness_scale=1.0,
+        starting_length=0.0,
+        color_rgba=rgba(argb) if argb is not None else None,
+    )
+
+
+def build_rm(layers) -> bytes:
+    """Build a v6 .rm page.
+
+    ``layers`` is a list of ``(label, visible, items)``; items are GlyphRange or
+    Line values placed on that layer.
+    """
+    counter = iter(range(10, 10_000))
+
+    def next_id() -> CrdtId:
+        return CrdtId(0, next(counter))
+
+    blocks = [
+        AuthorIdsBlock(author_uuids={1: uuid.UUID(int=1)}),
+        MigrationInfoBlock(migration_id=CrdtId(1, 1), is_device=True),
+        PageInfoBlock(loads_count=1, merges_count=0, text_chars_count=0, text_lines_count=0),
+    ]
+    node_ids = [next_id() for _ in layers]
+    for node_id in node_ids:
+        blocks.append(
+            SceneTreeBlock(tree_id=node_id, node_id=CrdtId(0, 0), is_update=True, parent_id=ROOT_ID)
+        )
+    for node_id, (label, visible, _) in zip(node_ids, layers):
+        blocks.append(
+            TreeNodeBlock(
+                group=si.Group(
+                    node_id=node_id,
+                    label=LwwValue(next_id(), label),
+                    visible=LwwValue(next_id(), visible),
+                )
+            )
+        )
+    left = CrdtId(0, 0)
+    for node_id in node_ids:
+        item_id = next_id()
+        blocks.append(
+            SceneGroupItemBlock(
+                parent_id=ROOT_ID,
+                item=CrdtSequenceItem(
+                    item_id=item_id,
+                    left_id=left,
+                    right_id=CrdtId(0, 0),
+                    deleted_length=0,
+                    value=node_id,
+                ),
+            )
+        )
+        left = item_id
+    for node_id, (_, _, items) in zip(node_ids, layers):
+        left = CrdtId(0, 0)
+        for value in items:
+            item_id = next_id()
+            block_type = (
+                SceneGlyphItemBlock if isinstance(value, si.GlyphRange) else SceneLineItemBlock
+            )
+            blocks.append(
+                block_type(
+                    parent_id=node_id,
+                    item=CrdtSequenceItem(
+                        item_id=item_id,
+                        left_id=left,
+                        right_id=CrdtId(0, 0),
+                        deleted_length=0,
+                        value=value,
+                    ),
+                )
+            )
+            left = item_id
+    buf = io.BytesIO()
+    write_blocks(buf, blocks)
+    return buf.getvalue()
+
+
+def write_document_zip(path: Path, pages: dict, content: dict) -> Path:
+    """Write a document archive with ``pages`` mapping page id -> .rm bytes."""
+    with zipfile.ZipFile(path, "w") as zf:
+        zf.writestr("doc.content", json.dumps(content))
+        for page_id, data in pages.items():
+            zf.writestr(f"doc/{page_id}.rm", data)
+    return path
+
+
+def palette_page(y0: float = 0.0) -> bytes:
+    # Written in reverse so the result order must come from page position.
+    items = [
+        glyph(f"{name} passage", color, argb, y=y0 + 50.0 * i)
+        for i, (name, color, argb) in enumerate(HIGHLIGHTER_PALETTE)
+    ]
+    return build_rm([("Layer 1", True, list(reversed(items)))])
+
+
+# --- color naming -----------------------------------------------------------
+
+
+def test_color_info_names_standard_ids_without_hex():
+    assert color_info(3, rgba(0xFF000000)) == {
+        "color": "yellow",
+        "color_id": 3,
+        "color_hex": None,
+    }
+    assert color_info(si.PenColor.PINK)["color"] == "pink"
+    assert color_info(7)["color"] == "red"
+
+
+def test_color_info_names_custom_highlighter_colors_from_argb():
+    assert color_info(9, rgba(0xFFBEEAFE)) == {
+        "color": "blue",
+        "color_id": 9,
+        "color_hex": "#beeafe",
+    }
+    assert color_info(9, rgba(0xFFFFC38C))["color"] == "orange"
+    assert color_info(9, rgba(0xFF123456))["color"] == "#123456"
+    assert color_info(9)["color"] == "highlight"
+
+
+def test_render_color_uses_argb_only_for_custom_color():
+    assert render_color(9, rgba(0xFFBEEAFE)) == "#beeafe"
+    assert render_color(3, rgba(0xFF000000)) == "#FFD700"
+    assert render_color(9) == "#FFD700"
+
+
+# --- extraction -------------------------------------------------------------
+
+
+def test_page_highlights_carry_colors_in_page_order(tmp_path):
+    rm_file = tmp_path / "page.rm"
+    rm_file.write_bytes(palette_page())
+
+    details = _page_annotation_details(rm_file)
+
+    assert [(h["text"], h["color"]) for h in details["highlights"]] == [
+        (f"{name} passage", name) for name, _, _ in HIGHLIGHTER_PALETTE
+    ]
+    assert details["highlights"][4]["color_hex"] == "#beeafe"
+    assert details["highlights"][5]["color_hex"] == "#ffc38c"
+    assert details["has_strokes"] is False
+
+
+def test_document_extraction_reports_highlight_details_per_page(tmp_path):
+    zip_path = write_document_zip(
+        tmp_path / "doc.zip",
+        {"p1": palette_page(), "p2": palette_page()},
+        {"cPages": {"pages": [{"id": "p1"}, {"id": "p2"}]}},
+    )
+
+    result = extract_text_from_document_zip(zip_path)
+
+    assert result["highlights"][:2] == ["yellow passage", "green passage"]
+    first_page = result["annotated_pages"][0]
+    assert first_page["highlights"][0] == "yellow passage"
+    assert first_page["highlight_details"][4]["color"] == "blue"
+    assert [h["page"] for h in result["highlight_details"]] == [1] * 6 + [2] * 6
+    assert result["highlight_details"][5]["color"] == "orange"
+
+
+def test_svg_render_uses_argb_for_custom_highlights(tmp_path):
+    rm_file = tmp_path / "page.rm"
+    rm_file.write_bytes(palette_page())
+
+    svg = _render_rm_v6_to_svg(rm_file)
+
+    assert 'fill="#beeafe"' in svg
+    assert 'fill="#ffc38c"' in svg
+    assert 'fill="#FF69B4"' in svg
+
+
+def test_markdown_export_labels_highlight_colors(tmp_path):
+    extraction = {
+        "highlights": ["yellow passage", "legacy passage"],
+        "highlight_details": [
+            {"page": 2, "text": "yellow passage", "color": "yellow", "color_id": 3}
+        ],
+        "annotated_pages": [
+            {
+                "page": 2,
+                "page_id": "p2",
+                "has_handwriting": False,
+                "highlights": ["yellow passage"],
+                "highlight_details": [{"text": "yellow passage", "color": "yellow"}],
+            }
+        ],
+    }
+    destination = tmp_path / "out.md"
+    write_markdown_export(
+        destination,
+        ExportMetadata(
+            document_id="doc",
+            title="Doc",
+            path="/Doc",
+            source_type="pdf",
+            page_count=2,
+            modified=None,
+        ),
+        source_text=None,
+        extraction=extraction,
+        include_ocr=False,
+    )
+    text = destination.read_text()
+
+    assert "Physical page 2; page ID `p2`: 1 highlight (yellow)" in text
+    assert "### Highlight 1 (yellow, page 2)" in text
+    assert "### Highlight 2\n" in text
+
+
+# --- remarkable_read --------------------------------------------------------
+
+
+async def _read_annotations(extraction: dict) -> dict:
+    from unittest.mock import Mock, patch
+
+    from remarkable_mcp.server import mcp
+
+    client = Mock()
+    doc = Mock()
+    doc.VissibleName = "Annotated PDF"
+    doc.ID = "pdf-123"
+    doc.Parent = ""
+    doc.ModifiedClient = None
+    doc.is_folder = False
+    doc.tags = []
+    client.get_meta_items.return_value = [doc]
+    client.download.return_value = b"unused"
+    with (
+        patch("remarkable_mcp.tools.get_rmapi", return_value=client),
+        patch("remarkable_mcp.tools.get_file_type", return_value="pdf"),
+        patch("remarkable_mcp.tools.extract_text_from_document_zip", return_value=extraction),
+    ):
+        result = await mcp.call_tool(
+            "remarkable_read", {"document": "Annotated PDF", "content_type": "annotations"}
+        )
+    return json.loads(result.content[0].text)
+
+
+async def test_read_annotations_prefixes_highlights_with_color():
+    details = [
+        {"text": "Sidereal month", "color": "yellow", "color_id": 3, "color_hex": None},
+        {"text": "Apsidal period", "color": "pink", "color_id": 5, "color_hex": None},
+    ]
+    data = await _read_annotations(
+        {
+            "typed_text": [],
+            "highlights": [d["text"] for d in details],
+            "highlight_details": [{"page": 1, **d} for d in details],
+            "handwritten_text": None,
+            "pages": 1,
+            "page_ids": ["p1"],
+            "annotated_pages": [
+                {
+                    "page": 1,
+                    "page_id": "p1",
+                    "has_handwriting": False,
+                    "highlights": [d["text"] for d in details],
+                    "highlight_details": details,
+                }
+            ],
+            "ocr_backend": None,
+            "tags": [],
+        }
+    )
+
+    assert "Page 1: 2 highlights" in data["content"]
+    assert "  • [yellow] Sidereal month" in data["content"]
+    assert "  • [pink] Apsidal period" in data["content"]
+    assert [(h["page"], h["color"]) for h in data["highlights"]] == [(1, "yellow"), (1, "pink")]
+
+
+# --- highlighter strokes ----------------------------------------------------
+
+HIGHLIGHTER = 18  # Pen.HIGHLIGHTER_2
+FINELINER = 17  # Pen.FINELINER_2
+ERASER = 6
+
+
+def test_highlighter_strokes_reported_with_color_and_bbox(tmp_path):
+    rm_file = tmp_path / "page.rm"
+    rm_file.write_bytes(
+        build_rm(
+            [
+                (
+                    "Layer 1",
+                    True,
+                    [
+                        stroke(3, HIGHLIGHTER, [(10, 400), (200, 410)]),
+                        stroke(5, HIGHLIGHTER, [(-50, 100), (150, 120)]),
+                        stroke(9, HIGHLIGHTER, [(0, 700), (90, 705)], argb=0xFFFFC38C),
+                        stroke(6, ERASER, [(0, 0), (5, 5)]),
+                    ],
+                )
+            ]
+        )
+    )
+
+    details = _page_annotation_details(rm_file)
+
+    assert [h["color"] for h in details["highlighter_strokes"]] == ["pink", "yellow", "orange"]
+    # Padded by half the pen width (point width 8 -> 2 stroke units).
+    assert details["highlighter_strokes"][0]["bbox"] == [-51.0, 99.0, 151.0, 121.0]
+    assert details["has_strokes"] is False
+
+
+def test_pen_strokes_stay_handwriting(tmp_path):
+    rm_file = tmp_path / "page.rm"
+    rm_file.write_bytes(build_rm([("Layer 1", True, [stroke(0, FINELINER, [(0, 0), (10, 10)])])]))
+
+    details = _page_annotation_details(rm_file)
+
+    assert details["has_strokes"] is True
+    assert details["highlighter_strokes"] == []
+
+
+def test_document_extraction_indexes_highlighter_only_pages(tmp_path):
+    page = build_rm([("Layer 1", True, [stroke(5, HIGHLIGHTER, [(0, 10), (50, 12)])])])
+    zip_path = write_document_zip(
+        tmp_path / "doc.zip",
+        {"p2": page},
+        {"cPages": {"pages": [{"id": "p1"}, {"id": "p2"}]}},
+    )
+
+    result = extract_text_from_document_zip(zip_path)
+
+    assert [ap["page"] for ap in result["annotated_pages"]] == [2]
+    assert result["annotated_pages"][0]["has_handwriting"] is False
+    stroke_entry = result["highlighter_strokes"][0]
+    assert stroke_entry["page"] == 2
+    assert stroke_entry["color"] == "pink"
+    assert "bbox" not in stroke_entry
+    # x is centered on the 1404-unit page; 0.3177 pt per unit.
+    assert stroke_entry["region"] == [0.499, 0.005, 0.536, 0.007]
+    assert stroke_entry["bbox_mm"] == [78.6, 1.0, 84.4, 1.5]
+
+
+async def test_read_annotations_summarizes_highlighter_strokes():
+    strokes = [
+        {"color": "pink", "color_id": 5, "color_hex": None, "region": [0.1, 0.2, 0.5, 0.25]},
+        {"color": "yellow", "color_id": 3, "color_hex": None, "region": [0.1, 0.4, 0.4, 0.45]},
+    ]
+    data = await _read_annotations(
+        {
+            "typed_text": [],
+            "highlights": [],
+            "highlight_details": [],
+            "highlighter_strokes": [{"page": 2, **h} for h in strokes],
+            "handwritten_text": None,
+            "pages": 2,
+            "page_ids": ["p1", "p2"],
+            "annotated_pages": [
+                {
+                    "page": 2,
+                    "page_id": "p2",
+                    "has_handwriting": True,
+                    "highlights": [],
+                    "highlight_details": [],
+                    "highlighter_strokes": strokes,
+                }
+            ],
+            "ocr_backend": None,
+            "tags": [],
+        }
+    )
+
+    assert "Page 2: handwritten notes, 2 highlighter strokes (pink, yellow)" in data["content"]
+    assert "  ~ [yellow] highlighter stroke, region [0.1, 0.4, 0.4, 0.45]" in data["content"]
+    assert [h["color"] for h in data["highlighter_strokes"]] == ["pink", "yellow"]
+
+
+# --- page tags --------------------------------------------------------------
+
+
+def test_document_extraction_maps_page_tags_to_page_numbers(tmp_path):
+    page = build_rm([("Layer 1", True, [stroke(0, FINELINER, [(0, 0), (10, 10)])])])
+    zip_path = write_document_zip(
+        tmp_path / "doc.zip",
+        {"p1": page},
+        {
+            "cPages": {"pages": [{"id": "p1"}, {"id": "p2"}, {"id": "p3"}]},
+            "tags": [{"name": "test-doc", "timestamp": 1}],
+            "pageTags": [
+                {"name": "test-page", "pageId": "p3", "timestamp": 2},
+                {"name": "review", "pageId": "p1", "timestamp": 3},
+                {"name": "orphan", "pageId": "gone", "timestamp": 4},
+            ],
+        },
+    )
+
+    result = extract_text_from_document_zip(zip_path)
+
+    assert result["page_tags"] == [
+        {"page": 1, "name": "review"},
+        {"page": 3, "name": "test-page"},
+    ]
+    by_page = {ap["page"]: ap for ap in result["annotated_pages"]}
+    assert by_page[1]["page_tags"] == ["review"]
+    assert by_page[1]["has_handwriting"] is True
+    assert by_page[3]["page_tags"] == ["test-page"]
+    assert by_page[3]["page_id"] == "p3"
+    assert by_page[3]["has_handwriting"] is False
+
+
+def test_page_tags_use_legacy_pages_order(tmp_path):
+    zip_path = write_document_zip(
+        tmp_path / "doc.zip",
+        {},
+        {"pages": ["a", "b"], "pageTags": [{"name": "t", "pageId": "b"}]},
+    )
+
+    assert extract_text_from_document_zip(zip_path)["page_tags"] == [{"page": 2, "name": "t"}]
+
+
+async def test_read_annotations_shows_page_tags():
+    data = await _read_annotations(
+        {
+            "typed_text": [],
+            "highlights": [],
+            "handwritten_text": None,
+            "pages": 3,
+            "page_ids": ["p1", "p2", "p3"],
+            "annotated_pages": [
+                {
+                    "page": 3,
+                    "page_id": "p3",
+                    "has_handwriting": True,
+                    "highlights": [],
+                    "page_tags": ["test-page"],
+                }
+            ],
+            "ocr_backend": None,
+            "tags": [{"name": "test-doc", "timestamp": 1}],
+            "page_tags": [{"page": 3, "name": "test-page"}],
+        }
+    )
+
+    assert "Page 3: handwritten notes; page tags: test-page" in data["content"]
+    assert data["page_tags"] == [{"page": 3, "name": "test-page"}]
+    assert data["tags"] == [{"name": "test-doc", "timestamp": 1}]
+
+
+# --- layers -----------------------------------------------------------------
+
+BALLPOINT = 15  # Pen.BALLPOINT_2
+
+
+def three_layer_page() -> bytes:
+    """Like S0.2-06 page 3: layers 1 and 2 visible, layer 3 hidden."""
+    return build_rm(
+        [
+            (
+                "Layer 1",
+                True,
+                [
+                    stroke(0, BALLPOINT, [(0, 100), (100, 100)]),
+                    stroke(6, BALLPOINT, [(0, 200), (100, 200)]),
+                    glyph("layer one passage", 3, 0xFF000000, y=500),
+                ],
+            ),
+            ("Layer 2", True, [stroke(7, BALLPOINT, [(0, 300), (100, 300)])]),
+            (
+                "Layer 3",
+                False,
+                [
+                    stroke(4, BALLPOINT, [(0, 400), (100, 400)]),
+                    stroke(5, HIGHLIGHTER, [(0, 600), (100, 610)]),
+                ],
+            ),
+        ]
+    )
+
+
+def test_page_layers_listed_with_visibility_and_contents(tmp_path):
+    rm_file = tmp_path / "page.rm"
+    rm_file.write_bytes(three_layer_page())
+
+    details = _page_annotation_details(rm_file)
+
+    assert [(la["name"], la["visible"]) for la in details["layers"]] == [
+        ("Layer 1", True),
+        ("Layer 2", True),
+        ("Layer 3", False),
+    ]
+    assert [la["pen_colors"] for la in details["layers"]] == [
+        ["black", "blue"],
+        ["red"],
+        ["green"],
+    ]
+    assert details["layers"][0]["highlights"] == 1
+    assert details["highlights"][0]["layer"] == "Layer 1"
+    assert details["highlighter_strokes"][0]["layer"] == "Layer 3"
+
+
+def test_unlabelled_layers_named_by_position(tmp_path):
+    rm_file = tmp_path / "page.rm"
+    rm_file.write_bytes(
+        build_rm(
+            [
+                ("", True, [stroke(0, BALLPOINT, [(0, 0), (1, 1)])]),
+                ("Notes", True, []),
+                ("", True, []),
+            ]
+        )
+    )
+
+    names = [la["name"] for la in _page_annotation_details(rm_file)["layers"]]
+
+    assert names == ["Layer 1", "Notes", "Layer 3"]
+
+
+def test_render_draws_visible_layers_by_default(tmp_path):
+    rm_file = tmp_path / "page.rm"
+    rm_file.write_bytes(three_layer_page())
+
+    visible = _render_rm_v6_to_svg(rm_file)
+    everything = _render_rm_v6_to_svg(rm_file, layers="all")
+    only_two = _render_rm_v6_to_svg(rm_file, layers="layer 2")
+
+    green = 'stroke="#00A000"'
+    red = 'stroke="#E00000"'
+    assert red in visible and 'stroke="black"' in visible
+    assert green not in visible
+    assert 'stroke="#FF69B4"' not in visible  # highlighter on hidden layer
+    assert green in everything
+    assert red in only_two
+    assert 'stroke="black"' not in only_two and green not in only_two
+
+
+def test_get_page_layers_from_document_zip(tmp_path):
+    zip_path = write_document_zip(
+        tmp_path / "doc.zip",
+        {"p3": three_layer_page()},
+        {"cPages": {"pages": [{"id": "p1"}, {"id": "p2"}, {"id": "p3"}]}},
+    )
+
+    assert get_page_layers_from_document_zip(zip_path, 3) == [
+        {"name": "Layer 1", "visible": True},
+        {"name": "Layer 2", "visible": True},
+        {"name": "Layer 3", "visible": False},
+    ]
+    assert get_page_layers_from_document_zip(zip_path, 1) == []
+
+
+async def test_read_annotations_lists_layers():
+    page = {
+        "page": 3,
+        "page_id": "p3",
+        "has_handwriting": True,
+        "highlights": ["layer one passage"],
+        "highlight_details": [{"text": "layer one passage", "color": "yellow", "layer": "Layer 1"}],
+        "highlighter_strokes": [
+            {"color": "pink", "region": [0.5, 0.32, 0.57, 0.33], "layer": "Layer 3"}
+        ],
+        "layers": [
+            {
+                "name": "Layer 1",
+                "visible": True,
+                "pen_strokes": 2,
+                "pen_colors": ["black", "blue"],
+                "highlights": 1,
+                "highlighter_strokes": 0,
+            },
+            {
+                "name": "Layer 2",
+                "visible": True,
+                "pen_strokes": 1,
+                "pen_colors": ["red"],
+                "highlights": 0,
+                "highlighter_strokes": 0,
+            },
+            {
+                "name": "Layer 3",
+                "visible": False,
+                "pen_strokes": 1,
+                "pen_colors": ["green"],
+                "highlights": 0,
+                "highlighter_strokes": 1,
+            },
+        ],
+    }
+    data = await _read_annotations(
+        {
+            "typed_text": [],
+            "highlights": ["layer one passage"],
+            "handwritten_text": None,
+            "pages": 3,
+            "page_ids": ["p1", "p2", "p3"],
+            "annotated_pages": [page],
+            "ocr_backend": None,
+            "tags": [],
+        }
+    )
+
+    content = data["content"]
+    assert "  Layer 1: 2 pen strokes (black, blue), 1 highlight" in content
+    assert "  Layer 2: 1 pen stroke (red)" in content
+    assert "  Layer 3 [hidden]: 1 pen stroke (green), 1 highlighter stroke" in content
+    assert "  • [yellow] layer one passage (Layer 1)" in content
+    assert "region [0.5, 0.32, 0.57, 0.33] (Layer 3, hidden)" in content
+    assert data["layers"] == [{"page": 3, "layers": page["layers"]}]
+
+
+async def test_read_annotations_omits_single_default_layer():
+    data = await _read_annotations(
+        {
+            "typed_text": [],
+            "highlights": ["x"],
+            "handwritten_text": None,
+            "pages": 1,
+            "page_ids": ["p1"],
+            "annotated_pages": [
+                {
+                    "page": 1,
+                    "page_id": "p1",
+                    "has_handwriting": False,
+                    "highlights": ["x"],
+                    "highlight_details": [{"text": "x", "color": "pink", "layer": "Layer 1"}],
+                    "layers": [{"name": "Layer 1", "visible": True, "highlights": 1}],
+                }
+            ],
+            "ocr_backend": None,
+            "tags": [],
+        }
+    )
+
+    assert "  • [pink] x\n" in data["content"] + "\n"
+    assert "Layer 1:" not in data["content"]
+    assert "layers" not in data
+
+
+async def _image(zip_bytes: bytes, **arguments) -> dict:
+    from unittest.mock import Mock, patch
+
+    from remarkable_mcp.server import mcp
+
+    client = Mock()
+    doc = Mock()
+    doc.VissibleName = "Layers"
+    doc.ID = "doc"
+    doc.Parent = ""
+    doc.ModifiedClient = None
+    doc.is_folder = False
+    doc.tags = []
+    client.get_meta_items.return_value = [doc]
+    client.download.return_value = zip_bytes
+    with patch("remarkable_mcp.tools.get_rmapi", return_value=client):
+        result = await mcp.call_tool(
+            "remarkable_image",
+            {"document": "Layers", "output_format": "svg", "compatibility": True, **arguments},
+        )
+    return json.loads(result.content[0].text)
+
+
+async def test_image_layers_parameter(tmp_path):
+    zip_bytes = write_document_zip(
+        tmp_path / "doc.zip",
+        {"p1": three_layer_page()},
+        {"fileType": "notebook", "cPages": {"pages": [{"id": "p1"}]}},
+    ).read_bytes()
+
+    default = await _image(zip_bytes)
+    everything = await _image(zip_bytes, layers="all")
+    missing = await _image(zip_bytes, layers="Layer 9")
+
+    assert 'stroke="#00A000"' not in default["svg"]
+    assert 'stroke="#00A000"' in everything["svg"]
+    assert missing["_error"]["type"] == "layer_not_found"
+    assert "Layer 3" in missing["_error"]["suggestion"]
+
+
+def test_page_tags_skip_deleted_pages(tmp_path):
+    zip_path = write_document_zip(
+        tmp_path / "doc.zip",
+        {},
+        {
+            "cPages": {
+                "pages": [
+                    {"id": "p1"},
+                    {"id": "gone", "deleted": {"timestamp": "1:9", "value": 1}},
+                    {"id": "p3"},
+                ]
+            },
+            "pageTags": [
+                {"name": "on-deleted", "pageId": "gone"},
+                {"name": "test-page", "pageId": "p3"},
+            ],
+        },
+    )
+
+    result = extract_text_from_document_zip(zip_path)
+
+    assert result["page_tags"] == [{"page": 2, "name": "test-page"}]
+
+
+# --- highlight positions ----------------------------------------------------
+
+
+def _two_line_glyph() -> si.GlyphRange:
+    text = "a highlight that wraps onto a second line"
+    return si.GlyphRange(
+        start=None,
+        length=len(text),
+        text=text,
+        color=si.PenColor(5),
+        rectangles=[
+            si.Rectangle(x=100.0, y=500.0, w=300.0, h=24.0),
+            si.Rectangle(x=-600.0, y=530.0, w=110.0, h=24.0),
+        ],
+    )
+
+
+def test_highlight_positions_per_piece_and_overall(tmp_path):
+    zip_path = write_document_zip(
+        tmp_path / "doc.zip",
+        {"p1": build_rm([("Layer 1", True, [_two_line_glyph()])])},
+        {"pages": ["p1"]},
+    )
+
+    highlight = extract_text_from_document_zip(zip_path)["highlight_details"][0]
+
+    assert "rects" not in highlight
+    assert len(highlight["rects_mm"]) == 2
+    # 0.3177 pt per unit; x is centered on the 1404-unit page.
+    assert highlight["rects_mm"][0] == [89.9, 56.0, 123.5, 58.7]
+    assert highlight["rects_mm"][1] == [11.4, 59.4, 23.8, 62.1]
+    assert highlight["bbox_mm"] == [11.4, 56.0, 123.5, 62.1]
+    assert highlight["region"] == [0.073, 0.267, 0.785, 0.296]
+
+
+async def test_read_annotations_shows_highlight_region():
+    details = [
+        {
+            "text": "Estimate the remainder for a Taylor series",
+            "color": "pink",
+            "region": [0.177, 0.206, 0.479, 0.219],
+        },
+        {
+            "text": "Therefore, at the",
+            "color": "blue",
+            "region": [0.096, 0.674, 0.27, 0.687],
+        },
+    ]
+    data = await _read_annotations(
+        {
+            "typed_text": [],
+            "highlights": [d["text"] for d in details],
+            "highlight_details": [{"page": 2, **d} for d in details],
+            "handwritten_text": None,
+            "pages": 2,
+            "page_ids": ["p1", "p2"],
+            "annotated_pages": [
+                {
+                    "page": 2,
+                    "page_id": "p2",
+                    "has_handwriting": False,
+                    "highlights": [d["text"] for d in details],
+                    "highlight_details": details,
+                }
+            ],
+            "ocr_backend": None,
+            "tags": [],
+        }
+    )
+
+    assert (
+        "  • [pink] Estimate the remainder for a Taylor series"
+        "   region [0.177, 0.206, 0.479, 0.219]" in data["content"]
+    )
+    assert "  • [blue] Therefore, at the   region [0.096, 0.674, 0.27, 0.687]" in data["content"]
+
+
+def test_highlighter_stroke_position_follows_text_anchor(tmp_path):
+    """Strokes in a group anchored to typed text are placed like the renderer places them."""
+    from unittest.mock import patch
+
+    rm_file = tmp_path / "page.rm"
+    rm_file.write_bytes(
+        build_rm([("Layer 1", True, [stroke(5, HIGHLIGHTER, [(-50, 100), (150, 120)])])])
+    )
+    layer_node = CrdtId(0, 10)
+
+    with patch(
+        "remarkable_mcp.extract._v6_anchor_offsets",
+        return_value={layer_node: (-464.0, 300.0)},
+    ):
+        details = _page_annotation_details(rm_file)
+
+    assert details["highlighter_strokes"][0]["bbox"] == [-515.0, 399.0, -313.0, 421.0]

@@ -26,6 +26,7 @@ from remarkable_mcp.api import (
     get_items_by_id,
     register_and_get_token,
 )
+from remarkable_mcp.export_resources import export_store
 from remarkable_mcp.extract import (
     extract_text_from_document_zip,
     extract_text_from_rm_file,
@@ -36,6 +37,21 @@ from remarkable_mcp.responses import (
     make_response,
 )
 from remarkable_mcp.server import mcp
+
+
+def _has_typed_text(svg: str) -> bool:
+    """Typed text renders as glyph outlines, or as <text> without the font."""
+    return 'class="typed-text"' in svg or "<text " in svg
+
+
+def _text_baseline(element: str) -> float:
+    """Baseline y of a rendered typed-text line."""
+    import re
+
+    match = re.search(r'class="typed-text"[^>]*translate\([-\d.]+ ([-\d.]+)\)', element)
+    if match is None:
+        match = re.search(r'y="([-\d.]+)"', element)
+    return float(match.group(1))
 
 
 async def _call_tool(name: str, arguments: dict):
@@ -244,6 +260,21 @@ class TestHelperFunctions:
 
         path = get_item_path(child_doc, items_by_id)
         assert path == "/Test Folder/Child Doc"
+
+    def test_get_item_path_trashed_document(self):
+        """A trashed document must not look like a root-level document."""
+        doc = Mock(VissibleName="Morning Pages", ID="doc-trash", Parent="trash", is_folder=False)
+
+        path = get_item_path(doc, {doc.ID: doc})
+        assert path == "/trash/Morning Pages"
+
+    def test_get_item_path_inside_trashed_folder(self):
+        """Items nested in a trashed folder are reported under /trash."""
+        folder = Mock(VissibleName="Old Work", ID="folder-trash", Parent="trash", is_folder=True)
+        doc = Mock(VissibleName="Notes", ID="doc-nested", Parent=folder.ID, is_folder=False)
+
+        path = get_item_path(doc, {folder.ID: folder, doc.ID: doc})
+        assert path == "/trash/Old Work/Notes"
 
 
 # =============================================================================
@@ -953,7 +984,9 @@ class TestRemarkableImage:
         assert any(isinstance(content, EmbeddedResource) for content in embedded.content)
         compatible_data = json.loads(compatible.content[0].text)
         assert compatible_data["mime_type"] == "image/png"
-        assert compatible_data["image_base64"]
+        assert "image_base64" not in compatible_data
+        assert compatible_data["resource_uri"].startswith("remarkableexport:///png/")
+        assert export_store.read_bytes(compatible_data["resource_uri"].rsplit("/", 1)[-1], "png")
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
@@ -1199,7 +1232,7 @@ class TestMergedRendering:
 
         data = json.loads(result.content[0].text)
         assert data.get("merged") is True
-        assert data.get("resource_uri", "").endswith(".merged.png")
+        assert data.get("resource_uri", "").startswith("remarkableexport:///png/")
         hint = data.get("_hint", "")
         assert "PDF" in hint and "annotation" in hint.lower()
         # The merged renderer should have been called once for this page
@@ -1419,7 +1452,7 @@ class TestRenderTabletPdfFallback:
         data = json.loads(result.content[0].text)
         assert "_error" not in data
         assert data.get("render_source") == "tablet_pdf"
-        assert data.get("image_base64")
+        assert export_store.read_bytes(data["resource_uri"].rsplit("/", 1)[-1], "png")
         assert "native PDF export" in data.get("_hint", "")
         mock_download_raw.assert_called_once()
 
@@ -1514,7 +1547,7 @@ class TestRenderTabletPdfFallback:
 
         data = json.loads(result.content[0].text)
         assert "_error" not in data
-        assert data.get("image_base64")
+        assert export_store.read_bytes(data["resource_uri"].rsplit("/", 1)[-1], "png")
         mock_full.assert_called_once()
 
 
@@ -3044,12 +3077,12 @@ class TestWriteTools:
         ]
 
         for tool_name in write_tool_names:
-            assert tool_name in tool_names, (
-                f"Write tool {tool_name} should be registered by default"
-            )
-        assert "remarkable_author" not in tool_names, (
-            "remarkable_author is SSH-only and must be hidden in cloud mode"
-        )
+            assert (
+                tool_name in tool_names
+            ), f"Write tool {tool_name} should be registered by default"
+        assert (
+            "remarkable_author" not in tool_names
+        ), "remarkable_author is SSH-only and must be hidden in cloud mode"
 
     @pytest.mark.asyncio
     async def test_write_tools_registered_when_enabled(self):
@@ -3467,6 +3500,72 @@ class TestWriteTools:
                 assert "remarkable_author" not in names
             finally:
                 mcp._tool_manager._tools.pop("remarkable_author", None)
+
+
+class TestWriteTargetResolutionSkipsTrash:
+    """Write tools must not silently act on trashed namesakes."""
+
+    @staticmethod
+    def _item(name, item_id, parent="", is_folder=False):
+        return Mock(VissibleName=name, ID=item_id, Parent=parent, is_folder=is_folder)
+
+    def _collection(self):
+        trashed = self._item("Notes", "trashed-notes", parent="trash")
+        live = self._item("Notes", "live-notes")
+        trashed_folder = self._item("Archive", "trashed-archive", parent="trash", is_folder=True)
+        live_folder = self._item("Archive", "live-archive", is_folder=True)
+        # A real, user-created folder that happens to be named "trash".
+        user_trash = self._item("trash", "user-trash", is_folder=True)
+        user_trash_notes = self._item("Notes", "user-trash-notes", parent="user-trash")
+        return [trashed, trashed_folder, user_trash_notes, live, live_folder, user_trash]
+
+    def test_name_lookup_prefers_live_item(self):
+        from remarkable_mcp.write_tools import _resolve_document
+
+        trashed = self._item("Notes", "trashed-notes", parent="trash")
+        live = self._item("Notes", "live-notes")
+        collection = [trashed, live]
+        target = _resolve_document("Notes", collection, get_items_by_id(collection))
+        assert target.ID == "live-notes"
+
+    def test_name_lookup_ignores_trash_only_match(self):
+        from remarkable_mcp.write_tools import _resolve_document
+
+        trashed = self._item("Morning Pages", "trashed", parent="trash")
+        assert _resolve_document("Morning Pages", [trashed], {trashed.ID: trashed}) is None
+
+    def test_explicit_trash_path_still_reaches_trashed_item(self):
+        """SSH permanent delete needs to address items already in the trash."""
+        from remarkable_mcp.write_tools import _resolve_document
+
+        trashed = self._item("Morning Pages", "trashed", parent="trash")
+        target = _resolve_document("/trash/Morning Pages", [trashed], {trashed.ID: trashed})
+        assert target is trashed
+
+    def test_relative_trash_path_does_not_reach_trashed_item(self):
+        from remarkable_mcp.write_tools import _resolve_document
+
+        trashed = self._item("Morning Pages", "trashed", parent="trash")
+        assert _resolve_document("trash/Morning Pages", [trashed], {trashed.ID: trashed}) is None
+
+    def test_user_folder_named_trash_wins_over_trashed_item(self):
+        from remarkable_mcp.write_tools import _resolve_document
+
+        collection = self._collection()
+        target = _resolve_document("/trash/Notes", collection, get_items_by_id(collection))
+        assert target.ID == "user-trash-notes"
+
+    def test_parent_resolution_never_picks_trashed_folder(self):
+        from remarkable_mcp.write_tools import _resolve_parent_id
+
+        collection = self._collection()
+        items_by_id = get_items_by_id(collection)
+        assert _resolve_parent_id("/Archive", items_by_id, collection) == "live-archive"
+
+        trashed_folder = self._item("Old", "trashed-old", parent="trash", is_folder=True)
+        only_trashed = [trashed_folder]
+        by_id = get_items_by_id(only_trashed)
+        assert _resolve_parent_id("/trash/Old", by_id, only_trashed) is None
 
 
 class TestMarkdownPDFWriteback:
@@ -5776,6 +5875,37 @@ class TestSSHKeyAuth:
         assert "IdentitiesOnly=yes" not in argv
         assert "sshpass" not in argv
 
+    def test_run_process_detaches_stdin_by_default(self, monkeypatch):
+        # ssh must not inherit the server's stdin: under an MCP stdio client
+        # that handle is the JSON-RPC pipe (on Windows an overlapped named
+        # pipe), and ssh adding it to its event loop wedges the session after
+        # the remote command completes — every call then dies by timeout.
+        import remarkable_mcp.ssh as ssh_mod
+        from remarkable_mcp.ssh import SSHClient
+
+        captured = {}
+
+        class Process:
+            returncode = 0
+
+            def communicate(self, timeout=None):
+                return b"ok", b""
+
+            def poll(self):
+                return self.returncode
+
+        def popen(args, **kwargs):
+            captured["kwargs"] = kwargs
+            return Process()
+
+        monkeypatch.setattr(ssh_mod.subprocess, "Popen", popen)
+        client = SSHClient()
+        try:
+            client._ssh_command("echo ok")
+        finally:
+            client.close()
+        assert captured["kwargs"]["stdin"] == ssh_mod.subprocess.DEVNULL
+
     def test_fresh_probe_disables_ssh_multiplexing(self, monkeypatch):
         from remarkable_mcp.ssh import SSHClient
 
@@ -6122,7 +6252,7 @@ class TestFullPageRender:
             elements = _v6_text_svg_elements(_v6_blocks(rm_path))
             assert len(elements) == 2
             joined = "".join(elements)
-            assert "<text " in joined
+            assert _has_typed_text(joined)
             assert "Hello world" in joined
             assert "Second line" in joined
         finally:
@@ -6177,7 +6307,7 @@ class TestFullPageRender:
         try:
             svg = _render_rm_v6_to_svg(rm_path)
             assert svg is not None
-            assert "<text " in svg
+            assert _has_typed_text(svg)
             assert "Hello world" in svg
         finally:
             rm_path.unlink(missing_ok=True)
@@ -6239,7 +6369,6 @@ class TestFullPageRender:
     def test_typed_text_baseline_matches_device_offset(self):
         """First line sits where the device draws it (calibrated, not the old
         rmc offset that rendered text ~50 units too high)."""
-        import re
 
         from remarkable_mcp import notebooks as nb
         from remarkable_mcp.extract import _v6_blocks, _v6_text_svg_elements
@@ -6249,10 +6378,9 @@ class TestFullPageRender:
             rm_path = Path(rm_tmp.name)
         try:
             elements = _v6_text_svg_elements(_v6_blocks(rm_path))
-            y = float(re.search(r'y="([-\d.]+)"', elements[0]).group(1))
-            # pos_y(234) + TOP(-39) + line_height(70) == 265 for a 1404x1872 page;
-            # comfortably below the old value of 216.
-            assert 255 <= y <= 275
+            y = _text_baseline(elements[0])
+            # pos_y(234) + TOP(63) + line_height(70) == 367 for a 1404x1872 page.
+            assert 357 <= y <= 377
         finally:
             rm_path.unlink(missing_ok=True)
 
@@ -6280,9 +6408,9 @@ class TestFullPageRender:
             def metrics_at(page_h):
                 with patch.object(extract, "_v6_paper_size", return_value=(width, page_h)):
                     els = _v6_text_svg_elements(blocks)
-                y0 = float(re.search(r'y="([-\d.]+)"', els[0]).group(1))
-                y1 = float(re.search(r'y="([-\d.]+)"', els[1]).group(1))
-                size = float(re.search(r'font-size="([-\d.]+)"', els[0]).group(1))
+                y0 = _text_baseline(els[0])
+                y1 = _text_baseline(els[1])
+                size = float(re.search(r'(?:font-size|data-size)="([-\d.]+)"', els[0]).group(1))
                 return y1 - y0, size
 
             # Reference 1872-tall page: full-size metrics.
@@ -8299,7 +8427,7 @@ class TestTextAnchoredInk:
         assert svg is not None
         # The stroke's raw stored Y must not appear: it renders translated.
         assert f"M {raw_points[0][0]:.1f} {raw_points[0][1]:.1f}" not in svg
-        assert "<text " in svg and "<path " in svg
+        assert _has_typed_text(svg) and "<path " in svg
 
     def test_unanchored_stroke_unchanged_when_anchor_map_present(self):
         import tempfile

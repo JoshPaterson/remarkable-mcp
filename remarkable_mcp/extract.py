@@ -2,24 +2,30 @@
 Text extraction helpers for reMarkable documents.
 """
 
+import functools
 import json
 import logging
+import math
 import os
+import re
 import tempfile
 import threading
 import time
 import zipfile
 from difflib import SequenceMatcher
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 from xml.sax.saxutils import escape as _xml_escape
 
+from remarkable_mcp.colors import color_info, render_color
 from remarkable_mcp.pages import content_page_ids, deleted_page_ids, has_cpages, live_cpages_entries
+from remarkable_mcp.tags import page_tag_entries
+from remarkable_mcp.templates import BLANK_TEMPLATE, content_page_templates
 
 logger = logging.getLogger(__name__)
 
 
-def _rm_to_svg(rm_file_path: Path, output_svg_path: Path) -> bool:
+def _rm_to_svg(rm_file_path: Path, output_svg_path: Path, layers: Optional[str] = None) -> bool:
     """Convert a .rm file to SVG using the built-in rmscene renderers.
 
     The ``rmc`` dependency has been dropped: it transitively pinned
@@ -33,7 +39,7 @@ def _rm_to_svg(rm_file_path: Path, output_svg_path: Path) -> bool:
 
     Credit: khalid-hasan (PR #97), ljdutel (#95)
     """
-    svg_content = _render_rm_v6_to_svg(rm_file_path) or _render_rm_v5_to_svg(rm_file_path)
+    svg_content = _render_rm_v6_to_svg(rm_file_path, layers) or _render_rm_v5_to_svg(rm_file_path)
     if svg_content is not None:
         output_svg_path.write_text(svg_content)
         return True
@@ -64,6 +70,18 @@ def _points_per_unit(paper_size: Optional[Tuple[float, float]]) -> float:
         if key in _DEVICE_POINTS_PER_UNIT:
             return _DEVICE_POINTS_PER_UNIT[key]
     return REMARKABLE_PDF_POINTS_PER_UNIT
+
+
+def _full_page_scale(paper_w: float, paper_h: float, dpi: Optional[float]) -> float:
+    """Output pixels per stroke unit for a full-page render.
+
+    With ``dpi``, the page is sized from its physical extent (stroke units ->
+    PDF points -> inches); otherwise its long edge is
+    ``FULL_PAGE_TARGET_LONG_EDGE`` pixels.
+    """
+    if dpi:
+        return dpi / 72.0 * _points_per_unit((paper_w, paper_h))
+    return FULL_PAGE_TARGET_LONG_EDGE / max(paper_w, paper_h)
 
 
 def _annotation_page_viewbox(
@@ -156,6 +174,8 @@ CONTENT_MARGIN = 50
 # rasterised at this resolution preserving the page aspect; the displayed image
 # is then scaled by the host, so this only sets crispness, not layout.
 FULL_PAGE_TARGET_LONG_EDGE = 1872
+# Blank space kept below the lowest ink when a page is extended to hold it.
+INK_EXTENSION_MARGIN = 50.0
 
 # Cache TTL in seconds (5 minutes)
 CACHE_TTL_SECONDS = 300
@@ -170,8 +190,16 @@ _cache_generation: Dict[str, int] = {}
 _global_cache_generation = 0
 
 
-def _is_cache_valid(cached: Dict[str, Any]) -> bool:
-    """Check if a cached entry is still valid based on TTL."""
+def _is_cache_valid(cached: Dict[str, Any], version: Optional[str] = None) -> bool:
+    """Check if a cached entry is still valid.
+
+    An entry is valid within its TTL, and only for the document version it was
+    built from: ``version`` identifies the document's current content (for
+    cloud documents, its index hash), so content uploaded after the entry was
+    cached is never served from it. A ``version`` of None matches any entry.
+    """
+    if version is not None and cached.get("version") != version:
+        return False
     if "timestamp" not in cached:
         return True  # Old cache entries without timestamp are valid
     return (time.time() - cached["timestamp"]) < CACHE_TTL_SECONDS
@@ -207,6 +235,7 @@ def _cache_extraction_result_if_current(
     result: Dict[str, Any],
     include_ocr: bool,
     token: tuple[int, int],
+    version: Optional[str] = None,
 ) -> bool:
     """Cache only if no mutation invalidated this document during extraction."""
     with _cache_lock:
@@ -219,6 +248,7 @@ def _cache_extraction_result_if_current(
             "result": result,
             "include_ocr": include_ocr,
             "timestamp": time.time(),
+            "version": version,
         }
         return True
 
@@ -227,6 +257,7 @@ def get_cached_ocr_result(
     doc_id: str,
     include_ocr: bool = True,
     ocr_backend: Optional[str] = None,
+    version: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     """
     Get cached OCR result for a document if available and valid.
@@ -236,6 +267,8 @@ def get_cached_ocr_result(
         include_ocr: Whether OCR content is required
         ocr_backend: If specified, only return cache if it was produced by this backend.
                      Use "google" or "tesseract". None accepts any backend.
+        version: The document's current version (see ``_is_cache_valid``);
+                 a result cached from another version is not returned.
 
     Returns:
         Cached result dict or None if not cached/expired/wrong backend
@@ -243,7 +276,7 @@ def get_cached_ocr_result(
     with _cache_lock:
         if doc_id in _extraction_cache:
             cached = _extraction_cache[doc_id]
-            if (cached["include_ocr"] or not include_ocr) and _is_cache_valid(cached):
+            if (cached["include_ocr"] or not include_ocr) and _is_cache_valid(cached, version):
                 if ocr_backend is not None:
                     cached_backend = cached["result"].get("ocr_backend")
                     if cached_backend != ocr_backend:
@@ -256,6 +289,7 @@ def cache_ocr_result(
     doc_id: str,
     result: Dict[str, Any],
     include_ocr: bool = True,
+    version: Optional[str] = None,
 ) -> None:
     """
     Cache an OCR result for a document.
@@ -265,12 +299,14 @@ def cache_ocr_result(
         result: Extraction result dict with keys: typed_text, highlights,
                 handwritten_text, pages, page_ids, ocr_backend
         include_ocr: Whether this result includes OCR content
+        version: The document version the result was built from
     """
     with _cache_lock:
         _extraction_cache[doc_id] = {
             "result": result,
             "include_ocr": include_ocr,
             "timestamp": time.time(),
+            "version": version,
         }
 
 
@@ -466,6 +502,52 @@ def _svg_from_paths(paths: list, all_coords: list) -> Optional[str]:
     )
 
 
+# Pen stroke widths in page units. v6 points store width as a fixed-point
+# value, four times the page-unit width (rmscene reads v1 float widths as
+# ``round(width * 4)``); v5 segments store page units directly.
+V6_POINT_WIDTH_SCALE = 0.25
+MIN_PEN_STROKE_WIDTH = 0.3
+MAX_PEN_STROKE_WIDTH = 100.0
+
+
+def _pen_width(width: float) -> float:
+    return max(MIN_PEN_STROKE_WIDTH, min(width, MAX_PEN_STROKE_WIDTH))
+
+
+def _pen_stroke_paths(
+    points: List[Tuple[float, float, float]], stroke_color: str, attrs: str = ""
+) -> List[str]:
+    """SVG paths for a pen stroke given ``(x, y, width)`` points in page units.
+
+    Consecutive points of equal width (to 0.05 units) share one path, so a
+    constant-width pen yields a single path while pressure-sensitive pens keep
+    their width variation along the stroke.
+    """
+
+    def path(run: list, width: float) -> str:
+        d = f"M {run[0][0]:.1f} {run[0][1]:.1f}"
+        d += "".join(f" L {x:.1f} {y:.1f}" for x, y, _ in run[1:])
+        return (
+            f'<path d="{d}" stroke="{stroke_color}" '
+            f'stroke-width="{width:.2f}" '
+            f'fill="none" stroke-linecap="round" '
+            f'stroke-linejoin="round"{attrs}/>'
+        )
+
+    paths = []
+    run = [points[0]]
+    run_width = round(_pen_width(points[0][2]) * 20) / 20
+    for point in points[1:]:
+        width = round(_pen_width(point[2]) * 20) / 20
+        if width != run_width and len(run) > 1:
+            paths.append(path(run, run_width))
+            run = [run[-1]]
+            run_width = width
+        run.append(point)
+    paths.append(path(run, run_width))
+    return paths
+
+
 def _render_rm_v5_to_svg(rm_file_path: Path) -> Optional[str]:
     """
     Render a v5 .rm file (reMarkable .lines format) to SVG.
@@ -513,21 +595,23 @@ def _render_rm_v5_to_svg(rm_file_path: Path) -> Optional[str]:
                     if pen in ERASER_PENS:
                         continue
 
-                    is_highlighter = pen in HIGHLIGHTER_PENS
-                    if is_highlighter:
-                        stroke_color = HIGHLIGHT_COLORS.get(color, "#FFD700")
-                        avg_width = sum(s[2] for s in segments) / len(segments)
-                        stroke_width = max(10.0, min(avg_width * 2.0, 40.0))
-                        opacity = ' opacity="0.35"'
-                    else:
-                        stroke_color = STROKE_COLORS.get(color, "black")
-                        avg_width = sum(s[2] for s in segments) / len(segments)
-                        stroke_width = max(0.5, min(avg_width * 0.8, 5.0))
-                        opacity = ""
+                    all_coords.extend((s[0], s[1]) for s in segments)
+                    if pen not in HIGHLIGHTER_PENS:
+                        paths.extend(
+                            _pen_stroke_paths(
+                                [(s[0], s[1], s[2]) for s in segments],
+                                STROKE_COLORS.get(color, "black"),
+                            )
+                        )
+                        continue
+
+                    stroke_color = HIGHLIGHT_COLORS.get(color, "#FFD700")
+                    avg_width = sum(s[2] for s in segments) / len(segments)
+                    stroke_width = max(10.0, min(avg_width * 2.0, 40.0))
+                    opacity = ' opacity="0.35"'
 
                     d = f"M {segments[0][0]:.1f} {segments[0][1]:.1f}"
                     d += "".join(f" L {s[0]:.1f} {s[1]:.1f}" for s in segments[1:])
-                    all_coords.extend((s[0], s[1]) for s in segments)
 
                     paths.append(
                         f'<path d="{d}" stroke="{stroke_color}" '
@@ -576,6 +660,175 @@ def _v6_paper_size(blocks: list) -> Tuple[float, float]:
             except (TypeError, ValueError):
                 continue
     return float(REMARKABLE_WIDTH), float(REMARKABLE_HEIGHT)
+
+
+def _is_scene_group(item: Any) -> bool:
+    """True for an rmscene ``Group`` (a layer or a nested group)."""
+    return hasattr(item, "node_id") and hasattr(getattr(item, "children", None), "values")
+
+
+def _scene_items(node: Any):
+    """Yield ``(item, group_node_id)`` for every leaf item below ``node``."""
+    for child in node.children.values():
+        if _is_scene_group(child):
+            yield from _scene_items(child)
+        else:
+            yield child, node.node_id
+
+
+def _lww(value: Any, default: Any) -> Any:
+    """Value of an rmscene ``LwwValue`` (or a plain value)."""
+    value = getattr(value, "value", value)
+    return default if value is None else value
+
+
+def _v6_scene(rm_file_path: Path) -> Optional[Tuple[list, Any]]:
+    """``(blocks, scene_tree)`` for a v6 page, or None if it cannot be parsed."""
+    blocks = _v6_blocks(rm_file_path)
+    if blocks is None:
+        return None
+    tree = _v6_tree(blocks)
+    return None if tree is None else (blocks, tree)
+
+
+def _v6_tree(blocks: list) -> Optional[Any]:
+    """Build an rmscene ``SceneTree`` from v6 blocks, or None on failure."""
+    try:
+        from rmscene.scene_stream import build_tree
+        from rmscene.scene_tree import SceneTree
+
+        tree = SceneTree()
+        build_tree(tree, blocks)
+    except Exception:
+        return None
+    return tree
+
+
+def _v6_layer_order(blocks: list) -> List[Any]:
+    """Node ids of a page's live layers, in tablet order.
+
+    Layers are the groups placed directly under the scene root, ordered as a
+    CRDT sequence. Moving a layer deletes its old group item and inserts a new
+    one, so the sequence is ordered with its deleted items in place (rmscene's
+    tree drops them, which breaks the order). Deleting a layer writes a
+    scene-tree entry moving the layer's node under (0, 0); the last entry for a
+    node wins.
+    """
+    try:
+        from rmscene.crdt_sequence import toposort_items
+        from rmscene.scene_stream import SceneGroupItemBlock, SceneTreeBlock
+        from rmscene.tagged_block_common import CrdtId
+    except ImportError:
+        return []
+    root = CrdtId(0, 1)
+    detached = CrdtId(0, 0)
+
+    parents: dict = {}
+    items = []
+    for block in blocks:
+        if isinstance(block, SceneTreeBlock):
+            node = block.node_id if block.node_id != detached else block.tree_id
+            parents[node] = block.parent_id
+        elif isinstance(block, SceneGroupItemBlock) and block.parent_id == root:
+            items.append(block.item)
+
+    values = {item.item_id: item.value for item in items}
+    order = []
+    for item_id in toposort_items(items):
+        node = values.get(item_id)
+        if node is None or node in order or parents.get(node, root) == detached:
+            continue
+        order.append(node)
+    return order
+
+
+def _scene_layers(tree: Any, blocks: list) -> List[Dict[str, Any]]:
+    """Live layers of a page, in tablet order.
+
+    Each layer is ``{"name", "visible", "group"}``; layers without a label are
+    named ``Layer N`` by position, as the tablet shows them.
+    """
+    layers = []
+    for node_id in _v6_layer_order(blocks):
+        try:
+            group = tree[node_id]
+        except (KeyError, TypeError):
+            continue
+        if not _is_scene_group(group):
+            continue
+        label = _lww(getattr(group, "label", None), "")
+        layers.append(
+            {
+                "name": str(label) if label else f"Layer {len(layers) + 1}",
+                "visible": bool(_lww(getattr(group, "visible", None), True)),
+                "group": group,
+            }
+        )
+    return layers
+
+
+def _page_scene_items(tree: Any, layers: List[Dict[str, Any]]):
+    """Yield ``(item, group_node_id)`` for items on live layers or at the root."""
+    for layer in layers:
+        yield from _scene_items(layer["group"])
+    root = tree.root
+    for child in root.children.values():
+        if not _is_scene_group(child):
+            yield child, root.node_id
+
+
+# Layer selections for rendering: visible layers only (the default), every
+# layer, or a single layer given by name.
+LAYERS_VISIBLE = "visible"
+LAYERS_ALL = "all"
+
+
+def _v6_layer_node_filter(blocks: list, layers: Optional[str]) -> Optional[Callable[[Any], bool]]:
+    """Predicate on an item's group node id: should it be drawn?
+
+    Returns None when every item should be drawn: ``layers="all"``, or the page
+    has no layer structure rmscene can rebuild. Items whose group is outside
+    every layer are drawn unless a single layer is requested.
+    """
+    selection = (layers or LAYERS_VISIBLE).strip()
+    if selection.lower() == LAYERS_ALL:
+        return None
+    tree = _v6_tree(blocks)
+    if tree is None:
+        return None
+    page_layers = _scene_layers(tree, blocks)
+    if not page_layers:
+        return None
+
+    def subtree_nodes(group) -> set:
+        nodes = {group.node_id}
+        for child in group.children.values():
+            if _is_scene_group(child):
+                nodes |= subtree_nodes(child)
+        return nodes
+
+    if selection.lower() == LAYERS_VISIBLE:
+        hidden: set = set()
+        for layer in page_layers:
+            if not layer["visible"]:
+                hidden |= subtree_nodes(layer["group"])
+        return lambda node_id: node_id not in hidden
+
+    wanted = selection.lower()
+    allowed: set = set()
+    for layer in page_layers:
+        if layer["name"].lower() == wanted:
+            allowed |= subtree_nodes(layer["group"])
+    return lambda node_id: node_id in allowed
+
+
+def v6_page_layers(rm_file_path: Path) -> List[Dict[str, Any]]:
+    """``[{"name", "visible"}]`` for a v6 page's layers, in tablet order."""
+    scene = _v6_scene(rm_file_path)
+    if scene is None:
+        return []
+    blocks, tree = scene
+    return [{"name": la["name"], "visible": la["visible"]} for la in _scene_layers(tree, blocks)]
 
 
 def _v6_group_offsets(blocks: list, anchor_pos: dict) -> dict:
@@ -638,7 +891,112 @@ def _v6_group_offsets(blocks: list, anchor_pos: dict) -> dict:
     return offsets
 
 
-def _v6_paths_from_blocks(blocks: list, anchor_pos: Optional[dict] = None) -> Tuple[list, list]:
+def _page_image_dir(rm_file_path: Path) -> Path:
+    """Folder holding a page's pasted images: ``<doc id>/<page id>/``."""
+    return rm_file_path.with_suffix("")
+
+
+def _v6_draw_order(blocks: list) -> Dict[Any, int]:
+    """Drawing rank of each scene item, bottom to top.
+
+    The tablet draws a page's layers in order, and within a layer (or nested
+    group) draws its items in their CRDT sequence order, so a stroke written
+    over an image covers it. Moving an item deletes it and inserts it again
+    at the end, which brings it to the top. Deleted items stay in the sequence
+    as placeholders so the order around them is kept. Items outside the scene
+    tree are not ranked.
+    """
+    try:
+        from rmscene.crdt_sequence import toposort_items
+        from rmscene.scene_stream import SceneGroupItemBlock, SceneItemBlock
+        from rmscene.tagged_block_common import CrdtId
+
+        from remarkable_mcp.images import image_sequence_items
+    except ImportError:
+        return {}
+
+    children: Dict[Any, Dict[Any, Any]] = {}
+    groups: Dict[Any, Any] = {}
+    for block in blocks:
+        if isinstance(block, SceneItemBlock):
+            children.setdefault(block.parent_id, {})[block.item.item_id] = block.item
+            if isinstance(block, SceneGroupItemBlock) and block.item.value is not None:
+                groups[block.item.item_id] = block.item.value
+    for parent_id, item in image_sequence_items(blocks):
+        children.setdefault(parent_id, {})[item.item_id] = item
+
+    rank: Dict[Any, int] = {}
+    visited: set = set()
+
+    def visit(node: Any) -> None:
+        if node in visited:
+            return
+        visited.add(node)
+        items = children.get(node, {})
+        for item_id in toposort_items(items.values()):
+            if items[item_id].value is None:
+                continue
+            if item_id in groups:
+                visit(groups[item_id])
+            else:
+                rank[item_id] = len(rank)
+
+    visit(CrdtId(0, 1))
+    return rank
+
+
+def _v6_image_elements(
+    blocks: list,
+    image_dir: Optional[Path],
+    draw_node: Optional[Callable[[Any], bool]],
+    group_offsets: dict,
+) -> List[Tuple[Any, list, list]]:
+    """``(item_id, elements, coords)`` for each image pasted on a page.
+
+    ``image_dir`` is the page's image folder (``<doc id>/<page id>``). Each
+    image is drawn as an SVG ``<image>`` by mapping its texture corners onto
+    the page, so scaled or rotated pastes land where the tablet shows them.
+    """
+    import base64
+
+    from remarkable_mcp.images import pasted_images
+
+    if image_dir is None:
+        return []
+    drawn: List[Tuple[Any, list, list]] = []
+    for image in pasted_images(blocks).values():
+        if draw_node is not None and not draw_node(image.parent_id):
+            continue
+        corners = image.corners()
+        if corners is None or not image.file_name:
+            continue
+        path = image_dir / Path(image.file_name).name
+        try:
+            data = path.read_bytes()
+        except OSError:
+            continue
+        dx, dy = group_offsets.get(image.parent_id, (0.0, 0.0))
+        (x0, y0), (x1, y1), (x2, y2) = corners
+        matrix = (
+            f"{x1 - x0:.3f} {y1 - y0:.3f} {x2 - x0:.3f} {y2 - y0:.3f} "
+            f"{x0 + dx:.3f} {y0 + dy:.3f}"
+        )
+        href = "data:image/png;base64," + base64.b64encode(data).decode("ascii")
+        element = (
+            f'<image width="1" height="1" preserveAspectRatio="none" '
+            f'transform="matrix({matrix})" href="{href}"/>'
+        )
+        coords = [(x + dx, y + dy) for x, y, _, _ in image.vertices]
+        drawn.append((image.item_id, [element], coords))
+    return drawn
+
+
+def _v6_paths_from_blocks(
+    blocks: list,
+    anchor_pos: Optional[dict] = None,
+    layers: Optional[str] = None,
+    image_dir: Optional[Path] = None,
+) -> Tuple[list, list]:
     """Build SVG ``<path>`` strings + a flat coordinate list from v6 blocks.
 
     ``anchor_pos`` (from :func:`_v6_text_elements_with_bounds`) enables
@@ -646,34 +1004,44 @@ def _v6_paths_from_blocks(blocks: list, anchor_pos: Optional[dict] = None) -> Tu
     typed-text line are shifted to that line's position, matching where the
     device draws them. Without it strokes render at their stored coordinates,
     which for anchored groups is on top of the typed text block.
+
+    ``layers`` selects which layers to draw: ``"visible"`` (default) draws the
+    layers shown on the tablet, ``"all"`` includes hidden layers, and any other
+    value draws only the layer with that name (case-insensitive).
+
+    ``image_dir`` is the page's image folder; pasted images found there are
+    drawn too. Items are drawn in the tablet's stacking order (see
+    :func:`_v6_draw_order`); items it cannot rank follow in file order.
     """
     # Integer pen/color values (rmscene exposes ints on blocks).
     HIGHLIGHTER_PENS = {5, 18}  # HIGHLIGHTER_1, HIGHLIGHTER_2
     ERASER_PENS = {6, 8}  # ERASER, ERASER_AREA
-    COLOR_MAP = {
-        0: "black",  # BLACK
-        1: "#808080",  # GRAY
-        2: "white",  # WHITE
-        3: "#FFD700",  # YELLOW
-        4: "#00A000",  # GREEN
-        5: "#FF69B4",  # PINK
-        6: "#4169E1",  # BLUE
-        7: "#E00000",  # RED
-        8: "#A0A0A0",  # GRAY_OVERLAP
-        9: "#FFD700",  # HIGHLIGHT
-        10: "#00C000",  # GREEN_2
-        11: "#00CED1",  # CYAN
-        12: "#FF00FF",  # MAGENTA
-        13: "#FFD700",  # YELLOW_2
-    }
 
     group_offsets = _v6_group_offsets(blocks, anchor_pos) if anchor_pos else {}
+    draw_node = _v6_layer_node_filter(blocks, layers)
 
-    paths: list = []
-    all_coords: list = []
+    draw_rank = _v6_draw_order(blocks)
+    # (sort key, svg elements, coordinates) per drawn item
+    drawn: list = []
+
+    def add(item_id: Any, elements: list, coords: list) -> None:
+        rank = draw_rank.get(item_id)
+        key = (0, rank) if rank is not None else (1, len(drawn))
+        drawn.append((key, elements, coords))
+
+    for item_id, elements, coords in _v6_image_elements(
+        blocks, image_dir, draw_node, group_offsets
+    ):
+        add(item_id, elements, coords)
+
     for block in blocks:
         if not hasattr(block, "item") or not hasattr(block.item, "value"):
             continue
+        if draw_node is not None and not draw_node(getattr(block, "parent_id", None)):
+            continue
+        paths: list = []
+        all_coords: list = []
+        add(getattr(block.item, "item_id", None), paths, all_coords)
         line = block.item.value
         dx, dy = group_offsets.get(getattr(block, "parent_id", None), (0.0, 0.0))
 
@@ -681,9 +1049,9 @@ def _v6_paths_from_blocks(blocks: list, anchor_pos: Optional[dict] = None) -> Tu
         # (highlight boxes over selected text) rather than stroke `points`.
         # Emit a translucent filled rect per rectangle in the highlight colour.
         if getattr(line, "rectangles", None):
-            hl_color = getattr(line, "color", 9)
-            hl_color = hl_color.value if hasattr(hl_color, "value") else hl_color
-            hl_fill = COLOR_MAP.get(hl_color, "#FFD700")
+            hl_fill = render_color(
+                getattr(line, "color", 9), getattr(line, "color_rgba", None), "#FFD700"
+            )
             for r in line.rectangles:
                 paths.append(
                     f'<rect x="{r.x + dx:.1f}" y="{r.y + dy:.1f}" '
@@ -706,29 +1074,31 @@ def _v6_paths_from_blocks(blocks: list, anchor_pos: Optional[dict] = None) -> Tu
         if tool in ERASER_PENS:
             continue
 
-        is_highlighter = tool in HIGHLIGHTER_PENS
-        stroke_color = COLOR_MAP.get(color, "black")
+        stroke_color = render_color(color, getattr(line, "color_rgba", None))
+        all_coords.extend((p.x + dx, p.y + dy) for p in line.points)
 
-        if is_highlighter:
-            avg_width = (
-                sum(p.width for p in line.points) / len(line.points)
-                if all(hasattr(p, "width") for p in line.points)
-                else 20.0
+        if tool not in HIGHLIGHTER_PENS:
+            paths.extend(
+                _pen_stroke_paths(
+                    [
+                        (p.x + dx, p.y + dy, getattr(p, "width", 8) * V6_POINT_WIDTH_SCALE)
+                        for p in line.points
+                    ],
+                    stroke_color,
+                )
             )
-            stroke_width = max(10.0, min(avg_width * 2.0, 40.0))
-            opacity = ' opacity="0.35"'
-        else:
-            avg_width = (
-                sum(p.width for p in line.points) / len(line.points)
-                if all(hasattr(p, "width") for p in line.points)
-                else 2.0
-            )
-            stroke_width = max(0.5, min(avg_width * 0.8, 5.0))
-            opacity = ""
+            continue
+
+        avg_width = (
+            sum(p.width for p in line.points) / len(line.points)
+            if all(hasattr(p, "width") for p in line.points)
+            else 20.0
+        )
+        stroke_width = max(10.0, min(avg_width * 2.0, 40.0))
+        opacity = ' opacity="0.35"'
 
         d = f"M {line.points[0].x + dx:.1f} {line.points[0].y + dy:.1f}"
         d += "".join(f" L {p.x + dx:.1f} {p.y + dy:.1f}" for p in line.points[1:])
-        all_coords.extend((p.x + dx, p.y + dy) for p in line.points)
 
         paths.append(
             f'<path d="{d}" stroke="{stroke_color}" '
@@ -736,20 +1106,26 @@ def _v6_paths_from_blocks(blocks: list, anchor_pos: Optional[dict] = None) -> Tu
             f'fill="none" stroke-linecap="round" '
             f'stroke-linejoin="round"{opacity}/>'
         )
+
+    drawn.sort(key=lambda entry: entry[0])
+    paths = [element for _, elements, _ in drawn for element in elements]
+    all_coords = [point for _, _, coords in drawn for point in coords]
     return paths, all_coords
 
 
-# reMarkable typed-text layout, in raw stroke units. Calibrated against
-# device-rendered page thumbnails (a reMarkable Paper Pro / "Ferrari", which
-# normalizes typed text into the same 1404x1872 coordinate space as the rM1/2).
-# These differ from the rmc exporter's constants (github.com/ricklupton/rmc):
-# rmc lays text out in a 72/226-DPI-scaled space and its plain font (7pt) and
-# top offset (-88) render text noticeably smaller and higher than the device
-# actually draws it. Values here are in the reference 1404x1872 space and are
-# scaled by the page's real height (see ``_TEXT_REF_PAGE_HEIGHT``) so they adapt
-# to other geometries (e.g. reMarkable Move) that normalize differently.
+# reMarkable typed-text layout, in raw stroke units. Paragraph k of the text
+# block is anchored at pos_y + _TEXT_TOP_Y + 70 * k and drawn with its baseline
+# one line height below that anchor; ink anchored to the top or bottom of the
+# text (the special anchor ids) sits at the first anchor or after the last
+# paragraph. The top offset is measured from a device-written notebook page:
+# the tablet's own highlight rectangle over a typed line, and the dot-grid
+# template visible in captures of the page, both place the first anchor at
+# pos_y + 63 (rmc uses -88 and an earlier calibration here used -39; both put
+# ink anchored to the text top above the page). Values are in the reference
+# 1404x1872 space and are scaled by the page's real height (see
+# ``_TEXT_REF_PAGE_HEIGHT``) so they adapt to other geometries.
 _TEXT_REF_PAGE_HEIGHT = 1872.0
-_TEXT_TOP_Y = -39.0
+_TEXT_TOP_Y = 63.0
 _TEXT_DEFAULT_LINE_HEIGHT = 70.0
 _TEXT_DEFAULT_FONT_SIZE = 30.0
 # Continuation lines of a wrapped paragraph are spaced tighter than the gap
@@ -760,22 +1136,98 @@ _TEXT_WRAP_LINE_RATIO = 44.0 / 70.0
 _TEXT_CHAR_ADVANCE = 0.5
 
 
-def _wrap_text(text: str, max_width: float, char_advance: float) -> List[str]:
+# The tablet sets typed text in reMarkable Sans, a proprietary font. Noto Sans
+# (from the pymupdf-fonts package) at the same size comes closest in letter
+# widths among open fonts, within about 2% per word; lines carrying a
+# highlight are then fitted to the tablet's highlight boxes (see
+# _fit_lines_to_highlights). Without the package, text falls back to a generic
+# sans-serif ``<text>`` element.
+_TYPED_FONTS = {False: "notos", True: "notosbo"}
+
+
+@functools.lru_cache(maxsize=None)
+def _typed_font(bold: bool) -> Optional[Any]:
+    """The tablet's typed-text font as a PyMuPDF font, or None if unavailable."""
+    try:
+        import fitz
+
+        font = fitz.Font(_TYPED_FONTS[bold])
+    except Exception:
+        return None
+    return font if "noto sans" in font.name.lower() else None
+
+
+def _typed_font_buffer(name: str) -> Optional[bytes]:
+    font = _typed_font(name == _TYPED_FONTS[True])
+    return font.buffer if font is not None else None
+
+
+def _typed_text_width(text: str, size: float, bold: bool) -> float:
+    """Width of a typed line in stroke units, in the tablet's font when available."""
+    font = _typed_font(bold)
+    if font is not None:
+        return font.text_length(text, fontsize=size)
+    return len(text) * size * _TEXT_CHAR_ADVANCE
+
+
+def _typed_text_outline(text: str, size: float, bold: bool, key: str) -> Optional[str]:
+    """One typed line as glyph outlines in the tablet's font, or None.
+
+    PyMuPDF sets the line on a scratch page and exports it with glyphs as
+    paths, so PNG and SVG renders keep the letter widths the tablet uses. The
+    returned SVG content has its origin at the start of the line's baseline;
+    ``key`` makes its glyph ids unique within the page.
+    """
+    buffer = _typed_font_buffer(_TYPED_FONTS[bold])
+    if buffer is None:
+        return None
+    try:
+        import fitz
+    except ImportError:
+        return None
+    # Scratch page with the baseline at (pad, 2 * size), ample room around it.
+    pad = size
+    doc = fitz.open()
+    try:
+        page = doc.new_page(width=_typed_text_width(text, size, bold) + 2 * pad, height=3 * size)
+        page.insert_font(fontname=_TYPED_FONTS[bold], fontbuffer=buffer)
+        page.insert_text(
+            (pad, 2 * size), text, fontsize=size, fontname=_TYPED_FONTS[bold], color=(0, 0, 0)
+        )
+        svg = page.get_svg_image(text_as_path=True)
+    except Exception:
+        return None
+    finally:
+        doc.close()
+    inner = svg[svg.index(">") + 1 : svg.rindex("</svg>")]
+    # Plain href (SVG 2) needs no xlink namespace on the page's root element.
+    inner = inner.replace("xlink:href=", "href=")
+    inner = re.sub(r'(id="|href="#)', rf"\1typed-{key}-", inner)
+    return f'<g transform="translate({-pad:g} {-2 * size:g})">{inner}</g>'
+
+
+def _wrap_text(
+    text: str,
+    max_width: float,
+    char_advance: float,
+    measure: Optional[Callable[[str], float]] = None,
+) -> List[str]:
     """Greedily word-wrap ``text`` to ``max_width`` (stroke units).
 
     SVG ``<text>`` does not wrap, so paragraphs wider than the text box are
-    split here the way the device wraps them. Line width is approximated as
-    ``len(line) * char_advance`` -- good enough for a faithful preview without
-    embedding the device font. A single word longer than the box is left on its
-    own line rather than split. Returns ``[text]`` when no wrapping applies.
+    split here the way the device wraps them. Line width comes from
+    ``measure`` when given, otherwise it is approximated as
+    ``len(line) * char_advance``. A single word longer than the box is left on
+    its own line rather than split. Returns ``[text]`` when no wrapping applies.
     """
-    if max_width <= 0 or char_advance <= 0:
+    if max_width <= 0 or (measure is None and char_advance <= 0):
         return [text]
+    width = measure or (lambda line: len(line) * char_advance)
     lines: List[str] = []
     cur = ""
     for word in text.split(" "):
         trial = word if not cur else f"{cur} {word}"
-        if not cur or len(trial) * char_advance <= max_width:
+        if not cur or width(trial) <= max_width:
             cur = trial
         else:
             lines.append(cur)
@@ -869,6 +1321,7 @@ def _v6_text_elements_with_bounds(blocks: list) -> Tuple[list, list, dict]:
 
     elements: list = []
     coords: list = []
+    lines: List[Dict[str, Any]] = []
     anchor_pos: dict = {}
     y_offset = _TEXT_TOP_Y * scale
     anchor_pos[CrdtId(*_ANCHOR_TEXT_TOP)] = pos_y + y_offset
@@ -892,31 +1345,167 @@ def _v6_text_elements_with_bounds(blocks: list) -> Tuple[list, list, dict]:
             # A blank paragraph still consumes a line (e.g. spacing under a title).
             y_offset += line_height
             continue
-        family = "serif" if style == ParagraphStyle.HEADING else "sans-serif"
-        weight = (
-            ' font-weight="bold"' if style in (ParagraphStyle.BOLD, ParagraphStyle.HEADING) else ""
-        )
+        heading = style == ParagraphStyle.HEADING
+        bold = style == ParagraphStyle.BOLD
+        # Headings use a serif face the tablet ships but the renderer lacks;
+        # other paragraphs are measured in the tablet's own font.
+        if heading:
+            measure = None
+        else:
+            measure = lambda line, size=size, bold=bold: _typed_text_width(  # noqa: E731
+                line, size, bold
+            )
         # Wrap long paragraphs to the text box; each wrapped line takes a line,
         # with continuation lines spaced tighter than a paragraph break.
-        for idx, line in enumerate(_wrap_text(text, box_width, size * _TEXT_CHAR_ADVANCE)):
+        offset = 0
+        for idx, line in enumerate(_wrap_text(text, box_width, size * _TEXT_CHAR_ADVANCE, measure)):
             y_offset += line_height if idx == 0 else line_height * _TEXT_WRAP_LINE_RATIO
-            baseline = pos_y + y_offset
-            elements.append(
-                f'<text x="{pos_x:.1f}" y="{baseline:.1f}" '
-                f'font-family="{family}" font-size="{size:.1f}"{weight} '
-                f'fill="black" xml:space="preserve">{_xml_escape(line)}</text>'
+            offset = text.find(line, offset)
+            lines.append(
+                {
+                    "x": pos_x,
+                    "baseline": pos_y + y_offset,
+                    "text": line,
+                    "size": size,
+                    "bold": bold,
+                    "heading": heading,
+                    "paragraph": text,
+                    "start": offset,
+                }
             )
-            # Estimate the line's extent for crop sizing, capped at the box width.
-            est_width = len(line) * size * _TEXT_CHAR_ADVANCE
-            if box_width > 0:
-                est_width = min(est_width, box_width)
-            coords.append((pos_x, baseline - size))
-            coords.append((pos_x + est_width, baseline + size * 0.3))
+            offset += len(line)
     anchor_pos[CrdtId(*_ANCHOR_TEXT_BOTTOM)] = pos_y + y_offset
+    _fit_lines_to_highlights(lines, _typed_text_highlights(blocks))
+
+    for index, line in enumerate(lines):
+        outline = (
+            None
+            if line["heading"]
+            else _typed_text_outline(line["text"], line["size"], line["bold"], str(index))
+        )
+        if outline is not None:
+            label = _xml_escape(line["text"], {'"': "&quot;"})
+            stretch, shift = line.get("fit", (1.0, 0.0))
+            fit = f" scale({stretch:.4f} 1)" if stretch != 1.0 else ""
+            elements.append(
+                f'<g class="typed-text" data-text="{label}" data-size="{line["size"]:.1f}" '
+                f'transform="translate({line["x"] + shift:.1f} {line["baseline"]:.1f})'
+                f'{fit}">'
+                f"{outline}</g>"
+            )
+            continue
+        family = "serif" if line["heading"] else "sans-serif"
+        weight = ' font-weight="bold"' if line["heading"] or line["bold"] else ""
+        elements.append(
+            f'<text x="{line["x"]:.1f}" y="{line["baseline"]:.1f}" '
+            f'font-family="{family}" font-size="{line["size"]:.1f}"{weight} '
+            f'fill="black" xml:space="preserve">{_xml_escape(line["text"])}</text>'
+        )
+    for line in lines:
+        # The line's extent for crop sizing, capped at the box width.
+        width = (
+            len(line["text"]) * line["size"] * _TEXT_CHAR_ADVANCE
+            if line["heading"]
+            else _typed_text_width(line["text"], line["size"], line["bold"])
+        )
+        if box_width > 0:
+            width = min(width, box_width)
+        stretch, shift = line.get("fit", (1.0, 0.0))
+        baseline = line["baseline"]
+        coords.append((line["x"] + shift, baseline - line["size"]))
+        coords.append((line["x"] + shift + width * stretch, baseline + line["size"] * 0.3))
     return elements, coords, anchor_pos
 
 
-def _render_rm_v6_to_svg(rm_file_path: Path) -> Optional[str]:
+def _typed_text_highlights(blocks: list) -> List[Tuple[str, list]]:
+    """``(text, rectangles)`` of each live text highlight on a page.
+
+    A later block for the same item replaces an earlier one; a block without a
+    value deletes the item.
+    """
+    latest: Dict[Any, Any] = {}
+    for block in blocks:
+        item = getattr(block, "item", None)
+        if item is not None and hasattr(item, "item_id"):
+            latest[item.item_id] = getattr(item, "value", None)
+    highlights = []
+    for item in latest.values():
+        if type(item).__name__ == "GlyphRange" and getattr(item, "text", None):
+            rects = [r for r in getattr(item, "rectangles", None) or [] if r.w > 0]
+            if rects:
+                highlights.append((item.text, rects))
+    return highlights
+
+
+def _fit_lines_to_highlights(lines: List[Dict[str, Any]], highlights: list) -> None:
+    """Fit typed lines to the tablet's highlight boxes over them.
+
+    The file stores no line widths, only the text box; a highlight over typed
+    text, however, stores the tablet-computed box of the highlighted words.
+    For each line carrying such a highlight, sets ``line["fit"] = (stretch,
+    shift)``: the line is moved sideways so each highlighted span sits
+    centered in its box, as on the tablet, and squeezed only if a span is
+    wider than its box. Boxes are padded at the sides, so spans are never
+    stretched to fill them. The line's height on the page is left as the text
+    layout places it. Lines in another font than the tablet's (no outlines
+    available) are left alone.
+    """
+    for text, rects in highlights:
+        for rect in rects:
+            center = rect.y + rect.h / 2
+            line = next(
+                (
+                    candidate
+                    for candidate in lines
+                    if not candidate["heading"]
+                    and candidate["baseline"] - candidate["size"] * 1.5
+                    <= center
+                    <= candidate["baseline"] + candidate["size"] * 0.5
+                ),
+                None,
+            )
+            if line is None or _typed_font(line["bold"]) is None:
+                continue
+            span = _highlight_span_on_line(line, text)
+            if span is None:
+                continue
+            first, last = span
+
+            def width(chars: str, line=line) -> float:
+                return _typed_text_width(chars, line["size"], line["bold"])
+
+            start = width(line["text"][:first])
+            span_width = width(line["text"][first:last])
+            stretch = min(1.0, rect.w / span_width) if span_width > 0 else 1.0
+            shift = (rect.x + rect.w / 2 - line["x"]) - stretch * (start + span_width / 2)
+            line.setdefault("pairs", []).append((stretch, shift))
+    for line in lines:
+        pairs = line.pop("pairs", None)
+        if pairs:
+            stretch = min(p[0] for p in pairs)
+            shift = sum(p[1] for p in pairs) / len(pairs)
+            line["fit"] = (stretch, shift)
+
+
+def _highlight_span_on_line(line: Dict[str, Any], text: str) -> Optional[Tuple[int, int]]:
+    """Character range of a highlight's text within one wrapped line, or None.
+
+    The highlight's text is located in the line's paragraph, so a highlight
+    wrapping onto several lines yields its part on this line.
+    """
+    paragraph, line_start = line["paragraph"], line["start"]
+    line_end = line_start + len(line["text"])
+    position = paragraph.find(text.strip())
+    while position != -1:
+        end = position + len(text.strip())
+        first, last = max(position, line_start), min(end, line_end)
+        if first < last:
+            return first - line_start, last - line_start
+        position = paragraph.find(text.strip(), position + 1)
+    return None
+
+
+def _render_rm_v6_to_svg(rm_file_path: Path, layers: Optional[str] = None) -> Optional[str]:
     """
     Render a v6 .rm file to a content-cropped SVG (read-only viewing).
 
@@ -930,7 +1519,9 @@ def _render_rm_v6_to_svg(rm_file_path: Path) -> Optional[str]:
         return None
     try:
         text_elements, text_coords, anchor_pos = _v6_text_elements_with_bounds(blocks)
-        paths, all_coords = _v6_paths_from_blocks(blocks, anchor_pos)
+        paths, all_coords = _v6_paths_from_blocks(
+            blocks, anchor_pos, layers, _page_image_dir(rm_file_path)
+        )
         # Typed text is drawn under strokes (handwriting layers on top), and its
         # extent is folded into the crop so a text-only page still renders.
         return _svg_from_paths(text_elements + paths, all_coords + text_coords)
@@ -939,7 +1530,7 @@ def _render_rm_v6_to_svg(rm_file_path: Path) -> Optional[str]:
 
 
 def render_rm_file_to_png(
-    rm_file_path: Path, background_color: Optional[str] = None
+    rm_file_path: Path, background_color: Optional[str] = None, layers: Optional[str] = None
 ) -> Optional[bytes]:
     """
     Render a .rm file to PNG image bytes.
@@ -963,7 +1554,7 @@ def render_rm_file_to_png(
             tmp_svg_path = Path(tmp_svg.name)
 
         # Convert .rm to SVG via the rmscene renderers
-        if not _rm_to_svg(rm_file_path, tmp_svg_path):
+        if not _rm_to_svg(rm_file_path, tmp_svg_path, layers):
             return None
 
         # Get content bounds from SVG
@@ -1079,8 +1670,37 @@ def _svg_string_to_png(
             doc.close()
 
 
+def _extend_to_ink(paper_h: float, coords: list) -> float:
+    """Page height grown to hold ink written below the page.
+
+    On the tablet a page can be scrolled and written on past its
+    ``paper_size``; the page then extends downward. Returns ``paper_h`` when
+    all ink fits, otherwise the lowest ink plus ``INK_EXTENSION_MARGIN``.
+    """
+    if not coords:
+        return paper_h
+    bottom = max(c[1] for c in coords)
+    if bottom <= paper_h:
+        return paper_h
+    return float(math.ceil(bottom + INK_EXTENSION_MARGIN))
+
+
+def _v6_page_height(blocks: list, anchor_pos: Optional[dict], paper_h: float) -> float:
+    """Page height including ink written below it, on any layer.
+
+    Hidden layers count too, so the page frame (and ``region`` fractions)
+    stays the same whichever layers are drawn.
+    """
+    _, coords = _v6_paths_from_blocks(blocks, anchor_pos, "all")
+    return _extend_to_ink(paper_h, coords)
+
+
 def render_rm_file_full_page_png(
-    rm_file_path: Path, background_color: Optional[str] = None
+    rm_file_path: Path,
+    background_color: Optional[str] = None,
+    layers: Optional[str] = None,
+    dpi: Optional[float] = None,
+    extend_to_ink: bool = True,
 ) -> Optional[Tuple[bytes, Tuple[float, float]]]:
     """Render a v6 .rm page to a FULL-PAGE PNG (not cropped to ink).
 
@@ -1091,7 +1711,12 @@ def render_rm_file_full_page_png(
     overlay places strokes exactly where the write tool will, and blank pages
     render as a blank page instead of returning ``None``.
 
-    Returns ``(png_bytes, (paper_w, paper_h))`` or ``None`` if the file is not
+    With ``extend_to_ink`` the page grows downward to include ink written
+    below ``paper_size`` (see ``_extend_to_ink``), at the same scale; the
+    origin and top of the page are unchanged. The interactive canvas passes
+    False to keep the strict ``paper_size`` frame.
+
+    Returns ``(png_bytes, (page_w, page_h))`` or ``None`` if the file is not
     v6 or rendering dependencies are unavailable (callers should fall back).
     """
     blocks = _v6_blocks(rm_file_path)
@@ -1099,26 +1724,27 @@ def render_rm_file_full_page_png(
         return None
     try:
         text_elements, _, anchor_pos = _v6_text_elements_with_bounds(blocks)
-        paths, _ = _v6_paths_from_blocks(blocks, anchor_pos)
+        paths, _ = _v6_paths_from_blocks(blocks, anchor_pos, layers, _page_image_dir(rm_file_path))
         paper_w, paper_h = _v6_paper_size(blocks)
     except Exception:
         return None
 
+    page_h = _v6_page_height(blocks, anchor_pos, paper_h) if extend_to_ink else paper_h
     # Typed text is drawn first so handwritten strokes layer on top of it,
     # matching the device's compositing order.
-    svg = _svg_full_page(text_elements + paths, paper_w, paper_h)
-    scale = FULL_PAGE_TARGET_LONG_EDGE / max(paper_w, paper_h)
+    svg = _svg_full_page(text_elements + paths, paper_w, page_h)
+    scale = _full_page_scale(paper_w, paper_h, dpi)
     output_width = max(1, round(paper_w * scale))
-    output_height = max(1, round(paper_h * scale))
+    output_height = max(1, round(page_h * scale))
 
     png = _svg_string_to_png(svg, output_width, output_height, background_color)
     if png is None:
         return None
-    return png, (paper_w, paper_h)
+    return png, (paper_w, page_h)
 
 
 def render_rm_file_to_svg(
-    rm_file_path: Path, background_color: Optional[str] = None
+    rm_file_path: Path, background_color: Optional[str] = None, layers: Optional[str] = None
 ) -> Optional[str]:
     """
     Render a .rm file to SVG string.
@@ -1144,7 +1770,7 @@ def render_rm_file_to_svg(
             tmp_svg_path = Path(tmp_svg.name)
 
         # Convert .rm to SVG via the rmscene renderers
-        if not _rm_to_svg(rm_file_path, tmp_svg_path):
+        if not _rm_to_svg(rm_file_path, tmp_svg_path, layers):
             return None
 
         # Read SVG content
@@ -1293,8 +1919,24 @@ def _select_rm_file_for_page(tmpdir_path: Path, rm_files: List[Path], page: int)
     return None
 
 
+def get_page_layers_from_document_zip(zip_path: Path, page: int = 1) -> List[Dict[str, Any]]:
+    """``[{"name", "visible"}]`` for a page's layers; empty if it has none."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmpdir_path = Path(tmpdir)
+        with zipfile.ZipFile(zip_path, "r") as zf:
+            zf.extractall(tmpdir_path)
+        rm_files = _get_ordered_rm_files(tmpdir_path)
+        rm_file = _select_rm_file_for_page(tmpdir_path, rm_files, page)
+        if rm_file is None:
+            return []
+        return v6_page_layers(rm_file)
+
+
 def render_page_from_document_zip_svg(
-    zip_path: Path, page: int = 1, background_color: Optional[str] = None
+    zip_path: Path,
+    page: int = 1,
+    background_color: Optional[str] = None,
+    layers: Optional[str] = None,
 ) -> Optional[str]:
     """
     Render a specific page from a reMarkable document zip to SVG.
@@ -1322,11 +1964,16 @@ def render_page_from_document_zip_svg(
         if target_rm_file is None:
             return None
 
-        return render_rm_file_to_svg(target_rm_file, background_color=background_color)
+        return render_rm_file_to_svg(
+            target_rm_file, background_color=background_color, layers=layers
+        )
 
 
 def render_page_from_document_zip(
-    zip_path: Path, page: int = 1, background_color: Optional[str] = None
+    zip_path: Path,
+    page: int = 1,
+    background_color: Optional[str] = None,
+    layers: Optional[str] = None,
 ) -> Optional[bytes]:
     """
     Render a specific page from a reMarkable document zip to PNG.
@@ -1354,7 +2001,9 @@ def render_page_from_document_zip(
         if target_rm_file is None:
             return None
 
-        return render_rm_file_to_png(target_rm_file, background_color=background_color)
+        return render_rm_file_to_png(
+            target_rm_file, background_color=background_color, layers=layers
+        )
 
 
 def _document_paper_size(rm_files: List[Path]) -> Tuple[float, float]:
@@ -1371,7 +2020,12 @@ def _document_paper_size(rm_files: List[Path]) -> Tuple[float, float]:
 
 
 def render_page_full_page_from_document_zip(
-    zip_path: Path, page: int = 1, background_color: Optional[str] = None
+    zip_path: Path,
+    page: int = 1,
+    background_color: Optional[str] = None,
+    layers: Optional[str] = None,
+    dpi: Optional[float] = None,
+    extend_to_ink: bool = True,
 ) -> Optional[Tuple[bytes, Tuple[float, float]]]:
     """Full-page render of a page, addressed by cPages index.
 
@@ -1384,8 +2038,10 @@ def render_page_full_page_from_document_zip(
        have no ``.rm`` file) are present.
     2. The page is rendered full-bleed using its own ``SceneInfo.paper_size``,
        so the overlay's normalized coordinates map exactly onto stroke space.
+       The canvas passes ``extend_to_ink=False`` to keep that frame; reads and
+       exports extend the page downward to include ink written below it.
 
-    Returns ``(png_bytes, (paper_w, paper_h))`` or ``None`` (caller falls back
+    Returns ``(png_bytes, (page_w, page_h))`` or ``None`` (caller falls back
     to PDF rasterization or an error).
     """
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -1397,11 +2053,19 @@ def render_page_full_page_from_document_zip(
             tmpdir_path,
             page=page,
             background_color=background_color,
+            layers=layers,
+            dpi=dpi,
+            extend_to_ink=extend_to_ink,
         )
 
 
 def render_page_full_page_from_extracted_document(
-    tmpdir_path: Path, page: int = 1, background_color: Optional[str] = None
+    tmpdir_path: Path,
+    page: int = 1,
+    background_color: Optional[str] = None,
+    layers: Optional[str] = None,
+    dpi: Optional[float] = None,
+    extend_to_ink: bool = True,
 ) -> Optional[Tuple[bytes, Tuple[float, float]]]:
     """Render a full page from an already extracted document archive."""
     rm_files = _get_ordered_rm_files(tmpdir_path)
@@ -1418,7 +2082,13 @@ def render_page_full_page_from_extracted_document(
         rm_file = rm_files[page - 1]
 
     if rm_file is not None and rm_file.exists():
-        return render_rm_file_full_page_png(rm_file, background_color=background_color)
+        return render_rm_file_full_page_png(
+            rm_file,
+            background_color=background_color,
+            layers=layers,
+            dpi=dpi,
+            extend_to_ink=extend_to_ink,
+        )
 
     # The page exists in cPages but has no .rm layer yet (a blank page):
     # render a blank full page at the document's paper size so the viewer
@@ -1426,7 +2096,7 @@ def render_page_full_page_from_extracted_document(
     # page has a drawable layer / has been added via remarkable_add_page.)
     paper_w, paper_h = _document_paper_size(rm_files)
     svg = _svg_full_page([], paper_w, paper_h)
-    scale = FULL_PAGE_TARGET_LONG_EDGE / max(paper_w, paper_h)
+    scale = _full_page_scale(paper_w, paper_h, dpi)
     png = _svg_string_to_png(
         svg, max(1, round(paper_w * scale)), max(1, round(paper_h * scale)), background_color
     )
@@ -1586,7 +2256,10 @@ def _render_pdf_page_to_png(
 
 
 def render_tablet_pdf_page_to_png(
-    pdf_bytes: bytes, page: int = 1, target_long_edge: int = 2048
+    pdf_bytes: bytes,
+    page: int = 1,
+    target_long_edge: int = 2048,
+    dpi: Optional[float] = None,
 ) -> Optional[bytes]:
     """Rasterize one page of the tablet's native PDF export to PNG bytes.
 
@@ -1601,6 +2274,7 @@ def render_tablet_pdf_page_to_png(
         pdf_bytes: Raw bytes of the tablet-exported PDF.
         page: 1-based page number (matches notebook page ordering 1:1).
         target_long_edge: Target pixel size for the longest page edge.
+        dpi: Output resolution; overrides ``target_long_edge`` when given.
 
     Returns:
         PNG image bytes, or None on failure / out-of-range page.
@@ -1629,7 +2303,7 @@ def render_tablet_pdf_page_to_png(
             return None
         pdf_page = doc[index]
         longest_edge = max(pdf_page.rect.width, pdf_page.rect.height) or 1.0
-        zoom = target_long_edge / longest_edge
+        zoom = dpi / 72.0 if dpi else target_long_edge / longest_edge
         pix = pdf_page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
         return pix.tobytes("png")
     except Exception:
@@ -1680,6 +2354,8 @@ def render_merged_page_from_document_zip(
     background_color: Optional[str] = None,
     canvas_width: Optional[int] = None,
     canvas_height: Optional[int] = None,
+    layers: Optional[str] = None,
+    dpi: Optional[float] = None,
 ) -> tuple[Optional[bytes], Optional[str]]:
     """Render a page with the PDF underlay composited with the annotation layer.
 
@@ -1695,6 +2371,8 @@ def render_merged_page_from_document_zip(
         background_color: Background color for annotation layer
         canvas_width: Output canvas width (default: derived from PDF page)
         canvas_height: Output canvas height (default: derived from PDF page)
+        layers: Layer selection (see ``_v6_paths_from_blocks``)
+        dpi: Output resolution when no canvas size is given (default 144)
 
     Returns:
         Tuple of (png_bytes, note) where note is an informational message
@@ -1715,6 +2393,8 @@ def render_merged_page_from_document_zip(
             background_color=background_color,
             canvas_width=canvas_width,
             canvas_height=canvas_height,
+            layers=layers,
+            dpi=dpi,
         )
 
 
@@ -1724,6 +2404,8 @@ def render_merged_page_from_extracted_document(
     background_color: Optional[str] = None,
     canvas_width: Optional[int] = None,
     canvas_height: Optional[int] = None,
+    layers: Optional[str] = None,
+    dpi: Optional[float] = None,
 ) -> tuple[Optional[bytes], Optional[str]]:
     """Render a merged page from an already extracted document archive."""
     import io
@@ -1740,6 +2422,8 @@ def render_merged_page_from_extracted_document(
             tmpdir_path,
             page=page,
             background_color=background_color,
+            layers=layers,
+            dpi=dpi,
         )
         if full_page is None:
             return None, f"Page {page} has no renderable annotation layer."
@@ -1772,6 +2456,8 @@ def render_merged_page_from_extracted_document(
             tmpdir_path,
             page=page,
             background_color=background_color,
+            layers=layers,
+            dpi=dpi,
         )
         if full_page is None:
             return None, f"{reason}; page has no renderable annotation layer."
@@ -1802,8 +2488,9 @@ def render_merged_page_from_extracted_document(
         return annotation_only("Could not read PDF dimensions")
 
     # Determine output canvas size
-    out_w = canvas_width or int(pdf_w_pt * 2)
-    out_h = canvas_height or int(pdf_h_pt * 2)
+    pixels_per_point = dpi / 72.0 if dpi else 2.0
+    out_w = canvas_width or int(round(pdf_w_pt * pixels_per_point))
+    out_h = canvas_height or int(round(pdf_h_pt * pixels_per_point))
 
     # 1. Rasterize the PDF page
     pdf_png = _render_pdf_page_to_png(pdf_bytes, pdf_page_index, out_w, out_h)
@@ -1818,7 +2505,7 @@ def render_merged_page_from_extracted_document(
         with tempfile.NamedTemporaryFile(suffix=".svg", delete=False) as tmp_svg:
             ann_svg_path = Path(tmp_svg.name)
 
-        if target_rm_file is not None and _rm_to_svg(target_rm_file, ann_svg_path):
+        if target_rm_file is not None and _rm_to_svg(target_rm_file, ann_svg_path, layers):
             # rmscene coordinates use the device paper grid, not PDF points. Set
             # the root viewBox to the calibrated page rectangle before rasterizing.
             svg_content = ann_svg_path.read_text()
@@ -1933,35 +2620,226 @@ def get_document_file_type(zip_path: Path) -> str:
     return ""
 
 
-def _extract_page_annotations(rm_file: Path) -> Tuple[List[str], bool]:
-    """Extract a page's text highlights and whether it has pen strokes.
+# v6 pen ids (rmscene ``Pen``) for highlighters and erasers.
+_HIGHLIGHTER_PENS = {5, 18}
+_ERASER_PENS = {6, 8}
+
+
+def _stroke_bbox(points) -> Optional[List[float]]:
+    """``[x0, y0, x1, y1]`` of a stroke in stroke units, including the pen width.
+
+    v6 point widths are four times the width in stroke units.
+    """
+    xs = [p.x for p in points]
+    ys = [p.y for p in points]
+    if not xs:
+        return None
+    half_width = max((getattr(p, "width", 0) or 0) for p in points) / 4.0 / 2.0
+    return [
+        min(xs) - half_width,
+        min(ys) - half_width,
+        max(xs) + half_width,
+        max(ys) + half_width,
+    ]
+
+
+MM_PER_POINT = 25.4 / 72.0
+
+
+def _pdf_page_sizes(tmpdir_path: Path) -> List[Tuple[float, float]]:
+    """``(width, height)`` in points for each page of a document's PDF, if any."""
+    pdf_files = sorted(tmpdir_path.glob("**/*.pdf"))
+    if not pdf_files:
+        return []
+    content_stems = {p.stem for p in tmpdir_path.glob("*.content")}
+    matching = [p for p in pdf_files if p.stem in content_stems]
+    try:
+        import fitz
+
+        with fitz.open(matching[0] if matching else pdf_files[0]) as pdf:
+            return [(page.rect.width, page.rect.height) for page in pdf]
+    except Exception:
+        return []
+
+
+def _page_frame(
+    tmpdir_path: Path,
+    page: int,
+    rm_file: Optional[Path],
+    pdf_page_sizes: List[Tuple[float, float]],
+) -> Tuple[float, float, float]:
+    """``(width, height, points_per_unit)`` of a page as rendered, in stroke units.
+
+    PDF-backed pages span their PDF page; other pages span the scene's paper
+    size, extended downward to hold ink written below it (as rendered).
+    Stroke x coordinates are centered on the page, y starts at the top.
+    """
+    blocks = _v6_blocks(rm_file) if rm_file is not None else None
+    paper = _v6_paper_size(blocks) if blocks else (REMARKABLE_WIDTH, REMARKABLE_HEIGHT)
+    ppu = _points_per_unit(paper)
+    if pdf_page_sizes:
+        index = _resolve_pdf_page_index(tmpdir_path, page)
+        if index is not None and 0 <= index < len(pdf_page_sizes):
+            width_pt, height_pt = pdf_page_sizes[index]
+            return width_pt / ppu, height_pt / ppu, ppu
+    height = float(paper[1])
+    if blocks:
+        try:
+            _, _, anchor_pos = _v6_text_elements_with_bounds(blocks)
+            height = _v6_page_height(blocks, anchor_pos, height)
+        except Exception:
+            pass
+    return float(paper[0]), height, ppu
+
+
+def _locate_on_page(
+    bbox: List[float], frame: Tuple[float, float, float]
+) -> Tuple[List[float], List[float]]:
+    """A stroke-unit bbox as page millimetres and page fractions.
+
+    Both are ``[left, top, right, bottom]`` from the page's top-left corner.
+    The fractions are clamped to the page, matching ``remarkable_image``'s
+    ``region`` parameter.
+    """
+    width, height, ppu = frame
+    left, top = bbox[0] + width / 2.0, bbox[1]
+    right, bottom = bbox[2] + width / 2.0, bbox[3]
+    mm = [round(v * ppu * MM_PER_POINT, 1) for v in (left, top, right, bottom)]
+
+    def fraction(value: float, extent: float) -> float:
+        return round(min(max(value / extent, 0.0), 1.0), 3)
+
+    region = [
+        fraction(left, width),
+        fraction(top, height),
+        fraction(right, width),
+        fraction(bottom, height),
+    ]
+    return mm, region
+
+
+def _place_highlight(highlight: Dict[str, Any], frame: Tuple[float, float, float]) -> None:
+    """Replace a highlight's stroke-unit ``rects`` with page positions.
+
+    Adds ``rects_mm`` (one box per line or piece), and ``bbox_mm`` and
+    ``region`` for the box around all of them.
+    """
+    rects = highlight.pop("rects", None)
+    if not rects:
+        return
+    highlight["rects_mm"] = [_locate_on_page(r, frame)[0] for r in rects]
+    union = [
+        min(r[0] for r in rects),
+        min(r[1] for r in rects),
+        max(r[2] for r in rects),
+        max(r[3] for r in rects),
+    ]
+    highlight["bbox_mm"], highlight["region"] = _locate_on_page(union, frame)
+
+
+def _v6_anchor_offsets(rm_file: Path) -> dict:
+    """Group node id -> ``(dx, dy)`` text-anchor translation for a page.
+
+    The same translation the renderer applies (see :func:`_v6_group_offsets`),
+    so positions reported for marks match where they are drawn. Ink on
+    notebook pages with typed text is stored relative to the text it is
+    anchored to.
+    """
+    blocks = _v6_blocks(rm_file)
+    if not blocks:
+        return {}
+    try:
+        _, _, anchor_pos = _v6_text_elements_with_bounds(blocks)
+        return _v6_group_offsets(blocks, anchor_pos) if anchor_pos else {}
+    except Exception:
+        return {}
+
+
+def _page_annotation_details(rm_file: Path) -> Dict[str, Any]:
+    """Extract a page's highlights, highlighter strokes and pen-stroke presence.
 
     reMarkable text highlights are stored as ``GlyphRange`` scene items inside the
-    page's v6 ``.rm`` file (each carries the selected ``text`` and its bounding
-    ``rectangles``); freehand ink is stored as ``Line`` items. The legacy
-    ``.highlights`` JSON scanned elsewhere does not cover current firmware, so
-    read them here.
+    page's v6 ``.rm`` file (each carries the selected ``text``, its bounding
+    ``rectangles`` and its color); freehand ink is stored as ``Line`` items. A
+    highlighter stroke that did not snap to text is a ``Line`` drawn with a
+    highlighter pen. The legacy ``.highlights`` JSON scanned elsewhere does not
+    cover current firmware, so read them here.
 
-    Returns ``(highlighted_texts_in_reading_order, has_pen_strokes)``. Returns
-    ``([], False)`` if the file cannot be parsed.
+    Returns ``{"highlights": [...], "highlighter_strokes": [...], "has_strokes":
+    bool, "layers": [...]}``. Each highlight is ``{"text", "color", "color_id",
+    "color_hex", "layer"}`` in reading order; each highlighter stroke is
+    ``{"color", "color_id", "color_hex", "bbox", "layer"}`` ordered top to
+    bottom, with ``bbox`` as ``[x0, y0, x1, y1]`` in stroke units, padded by
+    the pen width. ``layer`` is the name of the layer the item is on (None
+    outside any layer). ``has_strokes`` covers pen strokes other than
+    highlighters and erasers. ``layers`` lists the page's layers in tablet
+    order as ``{"name", "visible", "pen_strokes", "pen_colors", "highlights",
+    "highlighter_strokes", "images"}`` counts. ``images`` lists pasted images
+    (see :mod:`remarkable_mcp.images`) as ``{"file", "bbox", "layer"}``, top to
+    bottom, with ``bbox`` in stroke units. Returns empty results if the file
+    cannot be parsed.
     """
-    try:
-        import rmscene
-    except Exception:
-        return [], False
-    try:
-        with rm_file.open("rb") as fh:
-            tree = rmscene.read_tree(fh)
-    except Exception:
-        return [], False
+    details: Dict[str, Any] = {
+        "highlights": [],
+        "highlighter_strokes": [],
+        "has_strokes": False,
+        "layers": [],
+        "images": [],
+    }
+    scene = _v6_scene(rm_file)
+    if scene is None:
+        return details
+    blocks, tree = scene
 
+    offsets = _v6_anchor_offsets(rm_file)
     highlights: list = []
-    has_strokes = False
+    highlighter_strokes: list = []
     try:
-        for item in tree.walk():
+        page_layers = _scene_layers(tree, blocks)
+        layer_of_node: Dict[Any, Dict[str, Any]] = {}
+        layer_stats = []
+        for layer in page_layers:
+            stats = {
+                "name": layer["name"],
+                "visible": layer["visible"],
+                "pen_strokes": 0,
+                "pen_colors": [],
+                "highlights": 0,
+                "highlighter_strokes": 0,
+                "images": 0,
+            }
+            layer_stats.append(stats)
+            layer_of_node[layer["group"].node_id] = stats
+            for _, node_id in _scene_items(layer["group"]):
+                layer_of_node[node_id] = stats
+        details["layers"] = layer_stats
+
+        for item, node_id in _page_scene_items(tree, page_layers):
             kind = type(item).__name__
+            stats = layer_of_node.get(node_id)
+            layer_name = stats["name"] if stats else None
             if kind == "Line":
-                has_strokes = True
+                tool = getattr(item, "tool", None)
+                tool = getattr(tool, "value", tool)
+                if tool in _ERASER_PENS:
+                    continue
+                color = color_info(getattr(item, "color", None), getattr(item, "color_rgba", None))
+                if tool not in _HIGHLIGHTER_PENS:
+                    details["has_strokes"] = True
+                    if stats:
+                        stats["pen_strokes"] += 1
+                        if color["color"] not in stats["pen_colors"]:
+                            stats["pen_colors"].append(color["color"])
+                    continue
+                bbox = _stroke_bbox(getattr(item, "points", None) or [])
+                if bbox is None:
+                    continue
+                dx, dy = offsets.get(node_id, (0.0, 0.0))
+                bbox = [bbox[0] + dx, bbox[1] + dy, bbox[2] + dx, bbox[3] + dy]
+                entry = dict(color, bbox=bbox, layer=layer_name)
+                highlighter_strokes.append(entry)
+                if stats:
+                    stats["highlighter_strokes"] += 1
             elif kind == "GlyphRange":
                 text = getattr(item, "text", None)
                 if not text:
@@ -1969,16 +2847,61 @@ def _extract_page_annotations(rm_file: Path) -> Tuple[List[str], bool]:
                 rects = getattr(item, "rectangles", None) or []
                 y = rects[0].y if rects else 0.0
                 x = rects[0].x if rects else 0.0
-                highlights.append((y, x, text))
+                entry = {"text": text}
+                entry.update(
+                    color_info(getattr(item, "color", None), getattr(item, "color_rgba", None))
+                )
+                entry["layer"] = layer_name
+                dx, dy = offsets.get(node_id, (0.0, 0.0))
+                entry["rects"] = [
+                    [
+                        r.x + dx,
+                        r.y + dy,
+                        r.x + dx + getattr(r, "w", 0.0),
+                        r.y + dy + getattr(r, "h", 0.0),
+                    ]
+                    for r in rects
+                ]
+                highlights.append((y, x, entry))
+                if stats:
+                    stats["highlights"] += 1
     except Exception:
         pass
 
     highlights.sort(key=lambda t: (t[0], t[1]))  # top-to-bottom, left-to-right
-    return [t[2] for t in highlights], has_strokes
+    details["highlights"] = [t[2] for t in highlights]
+    highlighter_strokes.sort(key=lambda h: (h["bbox"][1], h["bbox"][0]))
+    details["highlighter_strokes"] = highlighter_strokes
+
+    from remarkable_mcp.images import pasted_images
+
+    images = []
+    for image in pasted_images(blocks).values():
+        bbox = image.bbox()
+        if bbox is None:
+            continue
+        dx, dy = offsets.get(image.parent_id, (0.0, 0.0))
+        bbox = [bbox[0] + dx, bbox[1] + dy, bbox[2] + dx, bbox[3] + dy]
+        stats = layer_of_node.get(image.parent_id) if details["layers"] else None
+        if stats:
+            stats["images"] += 1
+        images.append({"file": image.file_name, "bbox": bbox, "layer": stats and stats["name"]})
+    images.sort(key=lambda i: (i["bbox"][1], i["bbox"][0]))
+    details["images"] = images
+    return details
+
+
+def _extract_page_annotations(rm_file: Path) -> Tuple[List[str], bool]:
+    """Return ``(highlighted_texts_in_reading_order, has_pen_strokes)`` for a page."""
+    details = _page_annotation_details(rm_file)
+    return [h["text"] for h in details["highlights"]], details["has_strokes"]
 
 
 def extract_text_from_document_zip(
-    zip_path: Path, include_ocr: bool = False, doc_id: Optional[str] = None
+    zip_path: Path,
+    include_ocr: bool = False,
+    doc_id: Optional[str] = None,
+    version: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Extract all text content from a reMarkable document zip.
@@ -1987,6 +2910,8 @@ def extract_text_from_document_zip(
         zip_path: Path to the document zip file
         include_ocr: Whether to run OCR on handwritten content
         doc_id: Optional document ID for caching OCR results
+        version: The document's current version (e.g. its cloud index hash);
+            a result cached for another version is not reused
 
     Returns:
         {
@@ -1995,13 +2920,36 @@ def extract_text_from_document_zip(
             "handwritten_text": [...], # From OCR (if enabled) - one per page, in order
             "pages": int,
             "page_ids": [...],         # Page UUIDs in order
+            "highlight_details": [     # GlyphRange highlights with colors
+                {"page": int, "text": str, "color": str,
+                 "color_id": int, "color_hex": str | None},
+            ],
+            "highlighter_strokes": [   # Highlighter strokes not snapped to text
+                {"page": int, "color": str, "color_id": int,
+                 "color_hex": str | None,
+                 "bbox_mm": [left, top, right, bottom],  # from page top-left
+                 "region": [left, top, right, bottom]},  # page fractions
+            ],
             "annotated_pages": [       # Only pages that carry annotations
                 {"page": int,          # 1-based page number
                  "page_id": str,
                  "has_handwriting": bool,   # page has pen strokes
-                 "highlights": [str]}, # highlighted text on the page
+                 "highlights": [str],  # highlighted text on the page
+                 "highlight_details": [dict],  # text plus color, as above
+                 "highlighter_strokes": [dict],  # as above, without "page"
+                 "layers": [dict],     # name, visibility and per-layer counts
+                 "images": [dict],     # pasted images, as below without "page"
+                 "page_tags": [str]},  # tags on this page
             ],
+            "images": [                # Images pasted onto pages (captures)
+                {"page": int, "file": str, "layer": str | None,
+                 "bbox_mm": [left, top, right, bottom], "region": [...]},
+            ],
+            "page_tags": [{"page": int, "name": str}],  # .content pageTags
             "ocr_backend": str,        # Which OCR backend was used (if any)
+            "page_templates": [        # Non-blank notebook page templates
+                {"page": int, "template": str},
+            ],
         }
     """
     cache_token = None
@@ -2012,18 +2960,27 @@ def extract_text_from_document_zip(
                 _cache_generation.get(doc_id, 0),
             )
             cached = _extraction_cache.get(doc_id)
-            if cached and (cached["include_ocr"] or not include_ocr) and _is_cache_valid(cached):
+            if (
+                cached
+                and (cached["include_ocr"] or not include_ocr)
+                and _is_cache_valid(cached, version)
+            ):
                 return cached["result"]
 
     result: Dict[str, Any] = {
         "typed_text": [],
         "highlights": [],
+        "highlight_details": [],
+        "highlighter_strokes": [],
+        "images": [],
         "handwritten_text": None,
         "pages": 0,
         "page_ids": [],
         "annotated_pages": [],
         "ocr_backend": None,
         "tags": [],
+        "page_tags": [],
+        "page_templates": [],
     }
 
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -2036,6 +2993,12 @@ def extract_text_from_document_zip(
         content_data = _read_content_json(tmpdir_path)
         page_order = content_page_ids(content_data)
         deleted = deleted_page_ids(content_data)
+        templates = content_page_templates(content_data)
+        result["page_templates"] = [
+            {"page": i + 1, "template": templates[page_id]}
+            for i, page_id in enumerate(page_order)
+            if templates.get(page_id, BLANK_TEMPLATE) != BLANK_TEMPLATE
+        ]
 
         rm_files = [f for f in tmpdir_path.glob("**/*.rm") if f.stem not in deleted]
 
@@ -2076,18 +3039,80 @@ def extract_text_from_document_zip(
         page_pos = {pid: i for i, pid in enumerate(page_order)}
         for order_pos, rm_file in enumerate(rm_files):
             page_num = page_pos.get(rm_file.stem, order_pos) + 1
-            page_highlights, has_strokes = _extract_page_annotations(rm_file)
-            if page_highlights or has_strokes:
+            details = _page_annotation_details(rm_file)
+            page_details = details["highlights"]
+            page_strokes = details["highlighter_strokes"]
+            has_strokes = details["has_strokes"]
+            if page_details or page_strokes or has_strokes or details["images"]:
+                page_highlights = [h["text"] for h in page_details]
                 result["annotated_pages"].append(
                     {
                         "page": page_num,
                         "page_id": rm_file.stem,
                         "has_handwriting": has_strokes,
                         "highlights": page_highlights,
+                        "highlight_details": page_details,
+                        "highlighter_strokes": page_strokes,
+                        "layers": details["layers"],
+                        "images": details["images"],
                     }
                 )
                 result["highlights"].extend(page_highlights)
+
+        # Page tags, attached to their pages in the annotation index
+        page_ids = page_order or [f.stem for f in rm_files]
+        result["page_tags"] = page_tag_entries(content_data, page_ids)
+        by_page = {ap["page"]: ap for ap in result["annotated_pages"]}
+        for entry in result["page_tags"]:
+            ap = by_page.get(entry["page"])
+            if ap is None:
+                ap = {
+                    "page": entry["page"],
+                    "page_id": page_ids[entry["page"] - 1],
+                    "has_handwriting": False,
+                    "highlights": [],
+                    "highlight_details": [],
+                    "highlighter_strokes": [],
+                    "images": [],
+                }
+                by_page[entry["page"]] = ap
+                result["annotated_pages"].append(ap)
+            ap.setdefault("page_tags", []).append(entry["name"])
         result["annotated_pages"].sort(key=lambda a: a["page"])
+
+        # Place highlights, highlighter strokes and pasted images on the page
+        # as rendered
+        def placed(ap: dict) -> list:
+            return ap["highlighter_strokes"] + ap.get("images", [])
+
+        if any(placed(ap) or ap["highlight_details"] for ap in result["annotated_pages"]):
+            pdf_sizes = _pdf_page_sizes(tmpdir_path)
+            rm_by_stem = {f.stem: f for f in rm_files}
+            for ap in result["annotated_pages"]:
+                if not (placed(ap) or ap["highlight_details"]):
+                    continue
+                frame = _page_frame(
+                    tmpdir_path, ap["page"], rm_by_stem.get(ap["page_id"]), pdf_sizes
+                )
+                for entry in placed(ap):
+                    entry["bbox_mm"], entry["region"] = _locate_on_page(entry.pop("bbox"), frame)
+                for highlight in ap["highlight_details"]:
+                    _place_highlight(highlight, frame)
+        result["highlight_details"] = [
+            {"page": ap["page"], **h}
+            for ap in result["annotated_pages"]
+            for h in ap["highlight_details"]
+        ]
+        result["highlighter_strokes"] = [
+            {"page": ap["page"], **h}
+            for ap in result["annotated_pages"]
+            for h in ap["highlighter_strokes"]
+        ]
+        result["images"] = [
+            {"page": ap["page"], **image}
+            for ap in result["annotated_pages"]
+            for image in ap.get("images", [])
+        ]
 
         # Extract text from .txt and .md files
         for txt_file in tmpdir_path.glob("**/*.txt"):
@@ -2139,7 +3164,7 @@ def extract_text_from_document_zip(
             result["ocr_backend"] = ocr_backend
 
     if doc_id and cache_token is not None:
-        _cache_extraction_result_if_current(doc_id, result, include_ocr, cache_token)
+        _cache_extraction_result_if_current(doc_id, result, include_ocr, cache_token, version)
 
     return result
 

@@ -44,6 +44,7 @@ from typing import Dict, List, Optional
 # exact same xochitl layout, so documents carry the same fields. Importing it
 # performs no SSH activity.
 from remarkable_mcp.ssh import Document
+from remarkable_mcp.tags import document_tag_names, page_tag_names
 
 logger = logging.getLogger(__name__)
 
@@ -125,6 +126,7 @@ class LocalDirClient:
                 except (ValueError, TypeError, OSError):
                     pass
 
+            content = self._read_content(doc_id)
             documents.append(
                 Document(
                     id=doc_id,
@@ -137,7 +139,8 @@ class LocalDirClient:
                     synced=metadata.get("synced", True),
                     last_modified=last_modified,
                     size=0,
-                    tags=metadata.get("tags", []),
+                    tags=document_tag_names(metadata, content),
+                    page_tags=page_tag_names(content),
                     local_path=str(self.base_dir / doc_id),
                 )
             )
@@ -192,6 +195,14 @@ class LocalDirClient:
         except OSError as e:
             logger.debug(f"Failed to read raw file {raw_file}: {e}")
         return None
+
+    def _read_content(self, doc_id: str) -> Optional[dict]:
+        """Parse a document's .content JSON, or None if missing or malformed."""
+        try:
+            data = json.loads((self.base_dir / f"{doc_id}.content").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        return data if isinstance(data, dict) else None
 
     def get_file_type(self, doc: Document) -> Optional[str]:
         """Read fileType from the document's .content JSON."""

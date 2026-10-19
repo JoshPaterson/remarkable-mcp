@@ -514,6 +514,9 @@ remarkable_export("Journal", output_format="markdown", include_ocr=True)
 
 # Export only full-page annotation layers when archive data is available
 remarkable_export("Research Paper", pdf_mode="annotations")
+
+# Export selected pages as a PDF
+remarkable_export("Lecture Notes", pages="3-5,9")
 ```
 
 > **Note:** PNG rendering uses PyMuPDF for both notebook SVGs and PDF pages, so
@@ -666,7 +669,7 @@ Or set the environment variable:
 
 | Tool | Description |
 |------|-------------|
-| `remarkable_upload(file_path, parent_folder, document_name, defer_restart)` | Upload a PDF or EPUB file (cloud, SSH, and USB web; USB web preserves the name but ignores `parent_folder`) |
+| `remarkable_upload(file_path \| file_content, parent_folder, document_name, defer_restart, file_format)` | Upload a PDF or EPUB from a local path or from base64 contents (cloud, SSH, and USB web; USB web preserves the name but ignores `parent_folder`) |
 | `remarkable_markdown_to_pdf(markdown, document_name, parent_folder, defer_restart)` | Render Markdown as a paginated PDF and upload it (cloud, SSH, and USB web) |
 | `remarkable_mkdir(folder_name, parent, defer_restart)` | Create a new folder (cloud and SSH) |
 | `remarkable_move(document, dest_folder, defer_restart)` | Move a document or folder (cloud and SSH) |
@@ -690,11 +693,17 @@ Or set the environment variable:
 - A multi-step SSH write that fails after any confirmed mutation returns `write_partially_persisted`, says **do not repeat**, and reports whether refresh recovery is still pending. A shared refresh failure is propagated only to participants whose own mutation was dirty; clean validation/pre-execution failures retain their original error.
 - USB HTTP requests use the same bounded operation core with `REMARKABLE_USB_MAX_CONCURRENCY` (default `2`). Cloud sync keeps its existing pooled, idempotency-aware request layer and `REMARKABLE_SYNC_WORKERS` control.
 
+- **Uploads from contents** — when the caller can't place files on the server's disk (for example a cloud workspace), pass `file_content` (base64, with or without line breaks or a `data:application/pdf;base64,` prefix) and `document_name`. The bytes must match `file_format` (`pdf` or `epub`). Decoded size is capped at 2 MB; set `REMARKABLE_MAX_INLINE_BYTES` to change it, and use `file_path` for larger files. The contents are written to a private temp directory for the upload and always removed afterwards. Results report `source` (`path` or `content`) and `size_bytes`.
+- **Staged uploads can be moved to the Trash** — off by default. Set `REMARKABLE_UPLOAD_STAGING_DIR` to an uploads folder and `remarkable_upload` gains a `trash_source_after_upload` option (the tool is then marked destructive). With it, the source file is moved to the Trash (recoverable, e.g. Finder's Put Back) after a successful upload. The file must be a regular file directly inside the staging folder (no subfolders or symlinks); it is kept if the upload fails or if its SHA-256 changed between upload and cleanup, and the result reports `source_trashed` or `source_kept_reason`. Without the variable, the option does not exist and uploads never touch the source file.
+
 ### Examples
 
 ```python
 # Upload a PDF
 remarkable_upload("paper.pdf", parent_folder="/Research")
+
+# Upload base64 contents when the file isn't on the server's machine
+remarkable_upload(file_content=pdf_base64, document_name="Week 3", parent_folder="/Course")
 
 # Render Markdown and upload the PDF without creating a local file
 remarkable_markdown_to_pdf(

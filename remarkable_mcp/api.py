@@ -6,8 +6,9 @@ import json as json_module
 import logging
 import os
 import threading
+from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -298,6 +299,21 @@ def register_and_get_token(one_time_code: str) -> str:
         raise RuntimeError(str(e))
 
 
+def document_version(doc) -> Optional[str]:
+    """A string that changes whenever a document's stored content changes.
+
+    Cloud documents carry the hash of their blob index, which changes when the
+    tablet uploads any file, even when the tablet's ``modified`` time stays the
+    same. Other transports fall back to the modified time.
+    """
+    parts = [
+        str(value)
+        for value in (getattr(doc, "hash", None), getattr(doc, "ModifiedClient", None))
+        if isinstance(value, (str, int, float, datetime)) and value
+    ]
+    return "|".join(parts) or None
+
+
 def get_items_by_id(collection) -> Dict[str, Any]:
     """Build a lookup dict of items by ID."""
     return {item.ID: item for item in collection}
@@ -314,14 +330,23 @@ def get_items_by_parent(collection) -> Dict[str, List]:
     return items_by_parent
 
 
+TRASH_PARENT_ID = "trash"
+
+
 def get_item_path(item, items_by_id: Dict[str, Any]) -> str:
-    """Get the full path of an item."""
+    """Get the full path of an item.
+
+    Trashed items (directly, or via a trashed ancestor folder) are reported
+    under ``/trash`` so they are not mistaken for root-level items.
+    """
     path_parts = [item.VissibleName]
     parent_id = item.Parent if hasattr(item, "Parent") else ""
     while parent_id and parent_id in items_by_id:
         parent = items_by_id[parent_id]
         path_parts.insert(0, parent.VissibleName)
         parent_id = parent.Parent if hasattr(parent, "Parent") else ""
+    if parent_id == TRASH_PARENT_ID:
+        path_parts.insert(0, TRASH_PARENT_ID)
     return "/" + "/".join(path_parts)
 
 

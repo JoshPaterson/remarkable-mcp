@@ -1,0 +1,87 @@
+{
+    "coverPageNumber": -1,
+    "customZoomCenterX": 0,
+    "customZoomCenterY": 936,
+    "customZoomOrientation": "portrait",
+    "customZoomPageHeight": 1872,
+    "customZoomPageWidth": 1404,
+    "customZoomScale": 1,
+    "documentMetadata": {
+    },
+    "dummyDocument": false,
+    "extraMetadata": {
+        "LastActiveTool": "primary",
+        "LastBallpointv2Color": "Black",
+        "LastBallpointv2Size": "2",
+        "LastCalligraphyColor": "Black",
+        "LastCalligraphySize": "2",
+        "LastEraseSectionColor": "Black",
+        "LastEraseSectionSize": "2",
+        "LastEraserColor": "Black",
+        "LastEraserSize": "2",
+        "LastEraserTool": "EraseSection",
+        "LastFinelinerv2Color": "Black",
+        "LastFinelinerv2Size": "1",
+        "LastHighlighterv2Color": "ArgbCode",
+        "LastHighlighterv2ColorCode": "4294962549",
+        "LastHighlighterv2Size": "1",
+        "LastMarkerv2Color": "Black",
+        "LastMarkerv2Size": "2",
+        "LastPaintbrushv2Color": "Black",
+        "LastPaintbrushv2Size": "2",
+        "LastPen": "Finelinerv2",
+        "LastPencilColor": "Black",
+        "LastPencilSize": "2",
+        "LastPencilv2Color": "Black",
+        "LastPencilv2Size": "2",
+        "LastSelectionToolColor": "Black",
+        "LastSelectionToolSize": "2",
+        "LastShadingMarkerColor": "ArgbCode",
+        "LastShadingMarkerColorCode": "1075912220",
+        "LastShadingMarkerSize": "2",
+        "LastSharpPencilv2Color": "Black",
+        "LastSharpPencilv2Size": "2",
+        "SecondaryFinelinerv2Color": "Black",
+        "SecondaryFinelinerv2Size": "2",
+        "SecondaryHighlighterv2Color": "HighlighterYellow",
+        "SecondaryHighlighterv2Size": "1",
+        "SecondaryPaintbrushv2Color": "Black",
+        "SecondaryPaintbrushv2Size": "2",
+        "SecondaryPen": "Highlighterv2"
+    },
+    "fileType": "pdf",
+    "fontName": "",
+    "formatVersion": 1,
+    "lineHeight": -1,
+    "margins": 100,
+    "orientation": "portrait",
+    "originalPageCount": 3,
+    "pageCount": 3,
+    "pageTags": [
+        {
+            "name": "test-page",
+            "pageId": "36b60bbc-6f99-4f02-9dda-f3e41dca1073",
+            "timestamp": 1791767605183
+        }
+    ],
+    "pages": [
+        "3c640b7c-7c50-4bef-9ee6-29a647fc1594",
+        "becb3d9c-21b8-49bb-a16c-c6ef6fba1319",
+        "36b60bbc-6f99-4f02-9dda-f3e41dca1073"
+    ],
+    "redirectionPageMap": [
+        0,
+        1,
+        2
+    ],
+    "sizeInBytes": "507717",
+    "tags": [
+        {
+            "name": "test-doc",
+            "timestamp": 1791767559878
+        }
+    ],
+    "textAlignment": "justify",
+    "textScale": 1,
+    "zoomMode": "bestFit"
+}
