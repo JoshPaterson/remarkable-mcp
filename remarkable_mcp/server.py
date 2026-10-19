@@ -274,18 +274,17 @@ and sync to all your devices:
 - `remarkable_tag(document, add, remove, rename, page)` - Add, rename or remove
   document or page tags
 - `remarkable_mark_pdf(document, add, remove, clear, color, dry_run, layout)` - Add
-  or remove marks (grades, notes, shapes, LaTeX equations, graphics) drawn into a
+  or remove marks (text, shapes, highlights, paths, LaTeX, graphics) drawn into a
   PDF's pages under the user's ink; each mark has an id for later removal
-- `remarkable_delete(document)` - Delete a document/folder (destructive)
 
-### Grading a Worksheet
-1. `remarkable_image("Worksheet", page=1)` and `remarkable_read` to see the answers
+### Marking Up a PDF (e.g. grading a worksheet)
+1. `remarkable_image("Worksheet", page=1)` and `remarkable_read` to see the page
 2. `remarkable_mark_pdf("Worksheet", layout=1)` for text line and ink positions
 3. `remarkable_mark_pdf("Worksheet", add=[...], dry_run=True)` to preview, then
-   repeat without dry_run. Green for check marks and full scores; red for X
-   marks, notes about mistakes and partial scores.
-4. When an answer is revised, remove the outdated marks by id and add new ones
-   in one call. `remarkable_read` lists current marks.
+   repeat without dry_run. Marks are black by default; pick colors for the task
+   (when grading: green for check marks and full scores, red for mistakes).
+4. To update, remove outdated marks by id and add new ones in one call.
+   `remarkable_read` lists current marks.
 
 ### Safety
 - **Delete is destructive** — the MCP client should confirm with the user first

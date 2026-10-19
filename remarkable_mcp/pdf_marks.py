@@ -32,11 +32,23 @@ BASE_FILE = "remarkable-mcp-original.pdf"
 MARKS_FILE = "remarkable-mcp-marks.json"
 MARKS_FORMAT = 2
 
-KINDS = ("text", "shape", "latex", "graphic", "graphic_file")
-SHAPES = ("check", "cross", "circle", "box", "line", "arrow")
+KINDS = ("text", "shape", "path", "latex", "graphic", "graphic_file")
+SHAPES = ("check", "cross", "circle", "box", "line", "arrow", "highlight")
+ANCHORS = {
+    "top-left": (0.0, 0.0),
+    "top": (0.5, 0.0),
+    "top-right": (1.0, 0.0),
+    "left": (0.0, 0.5),
+    "center": (0.5, 0.5),
+    "right": (1.0, 0.5),
+    "bottom-left": (0.0, 1.0),
+    "bottom": (0.5, 1.0),
+    "bottom-right": (1.0, 1.0),
+}
 COLORS = {
-    "red": (0.85, 0.0, 0.0),
     "black": (0.0, 0.0, 0.0),
+    "red": (0.85, 0.0, 0.0),
+    "yellow": (1.0, 0.85, 0.0),
     "blue": (0.0, 0.25, 0.8),
     "green": (0.0, 0.55, 0.0),
     "orange": (0.95, 0.45, 0.0),
@@ -47,6 +59,9 @@ DEFAULT_TEXT_SIZE = 11.0
 DEFAULT_LATEX_SIZE = 12.0
 DEFAULT_SYMBOL_SIZE = 12.0
 DEFAULT_LINE_WIDTH = 1.5
+DEFAULT_HIGHLIGHT_OPACITY = 0.35
+MAX_PATH_CHARS = 20_000
+_PATH_PATTERN = re.compile(r"^[MmLlHhVvCcSsQqTtAaZz0-9eE+\-.,\s]+$")
 LINE_SPACING = 1.2
 MAX_SVG_CHARS = 1_000_000
 MAX_GRAPHIC_BYTES = 2 * 1024 * 1024
@@ -230,9 +245,9 @@ def _hex(rgb: Sequence[float]) -> str:
 
 
 def default_color(shape: Optional[str] = None) -> List[float]:
-    """The color a mark gets when none is given: check marks are green,
-    everything else red."""
-    return list(COLORS["green" if shape == "check" else "red"])
+    """The color a mark gets when none is given: yellow for highlights,
+    black for everything else."""
+    return list(COLORS["yellow" if shape == "highlight" else "black"])
 
 
 def check_svg(svg: str) -> None:
@@ -323,6 +338,25 @@ class _Page:
         return [_round(min(max(v, 0.0), 1.0)) for v in box]
 
 
+def _opacity(value: Any, default: float) -> float:
+    if value is None:
+        return default
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0 < value <= 1:
+        raise MarkError("opacity must be a number above 0, up to 1.")
+    return float(value)
+
+
+def _place(request: dict, width: float, height: float, page: _Page, default: str) -> List[float]:
+    """The box of a ``width`` x ``height`` mark whose ``anchor`` point is ``at``."""
+    anchor = request.get("anchor", default)
+    if anchor not in ANCHORS:
+        raise MarkError(f"anchor must be one of: {', '.join(ANCHORS)}.")
+    ax, ay = page.pt(*_point(request.get("at"), "at"))
+    fx, fy = ANCHORS[anchor]
+    x0, y0 = ax - fx * width, ay - fy * height
+    return page.box(x0, y0, x0 + width, y0 + height)
+
+
 def _fit(rect: Sequence[float], width: float, height: float, page: _Page) -> List[float]:
     """The largest box of the given aspect in ``rect``, at its top-left."""
     x0, y0 = page.pt(rect[0], rect[1])
@@ -359,7 +393,6 @@ def _render_text(request: dict, color: List[float], page: _Page) -> Dict[str, An
             raise MarkError("The text does not fit its rect; make the rect larger or size smaller.")
         return dict(out, box=page.box(x0, y0, x1, y1), pdf=pdf)
 
-    at = _point(request["at"], "at")
     font = pymupdf.Font(fontname)
     lines = text.split("\n")
     ascent, descent = font.ascender * size, -font.descender * size
@@ -371,10 +404,8 @@ def _render_text(request: dict, color: List[float], page: _Page) -> Dict[str, An
             baseline = ascent + i * size * LINE_SPACING
             snippet.insert_text((0, baseline), line, fontname=fontname, fontsize=size, color=color)
 
-    x0, y0 = page.pt(*at)
-    return dict(
-        out, box=page.box(x0, y0, x0 + width, y0 + height), pdf=_snippet(width, height, draw)
-    )
+    box = _place(request, width, height, page, "top-left")
+    return dict(out, box=box, pdf=_snippet(width, height, draw))
 
 
 def _render_shape(request: dict, color: List[float], page: _Page) -> Dict[str, Any]:
@@ -386,7 +417,6 @@ def _render_shape(request: dict, color: List[float], page: _Page) -> Dict[str, A
     if shape in ("check", "cross"):
         size = _positive(request.get("size"), "size", DEFAULT_SYMBOL_SIZE)
         width = _positive(request.get("width"), "width", DEFAULT_LINE_WIDTH * 1.3)
-        cx, cy = page.pt(*_point(request.get("at"), "at"))
         half = size / 2 + width
         s = size / 2
 
@@ -399,8 +429,20 @@ def _render_shape(request: dict, color: List[float], page: _Page) -> Dict[str, A
                 snippet.draw_line(c + (-s, -s), c + (s, s), color=color, width=width)
                 snippet.draw_line(c + (-s, s), c + (s, -s), color=color, width=width)
 
-        box = page.box(cx - half, cy - half, cx + half, cy + half)
+        box = _place(request, 2 * half, 2 * half, page, "center")
         return dict(out, size=size, box=box, pdf=_snippet(2 * half, 2 * half, draw))
+
+    if shape == "highlight":
+        rect = _rect(request.get("rect"), "rect")
+        opacity = _opacity(request.get("opacity"), DEFAULT_HIGHLIGHT_OPACITY)
+        x0, y0 = page.pt(rect[0], rect[1])
+        x1, y1 = page.pt(rect[2], rect[3])
+
+        def draw(snippet):
+            snippet.draw_rect(snippet.rect, color=None, fill=color, fill_opacity=opacity)
+
+        box = page.box(x0, y0, x1, y1)
+        return dict(out, box=box, pdf=_snippet(x1 - x0, y1 - y0, draw))
 
     width = _positive(request.get("width"), "width", DEFAULT_LINE_WIDTH)
     if shape in ("circle", "box"):
@@ -476,8 +518,54 @@ def _render_latex(request: dict, color: List[float], page: _Page) -> Dict[str, A
     out: Dict[str, Any] = {"latex": source, "size": size, "pdf": pdf}
     if "rect" in request:
         return dict(out, box=_fit(_rect(request["rect"], "rect"), width, height, page))
-    x0, y0 = page.pt(*_point(request["at"], "at"))
-    return dict(out, box=page.box(x0, y0, x0 + width, y0 + height))
+    return dict(out, box=_place(request, width, height, page, "top-left"))
+
+
+def _render_path(request: dict, color: List[float], page: _Page) -> Dict[str, Any]:
+    """SVG path data in points, with its origin at ``at``."""
+    data = request["path"]
+    if not isinstance(data, str) or not data.strip():
+        raise MarkError('path must be SVG path data, e.g. "M 0 0 L 10 10".')
+    if len(data) > MAX_PATH_CHARS or not _PATH_PATTERN.match(data):
+        raise MarkError(
+            "path must be SVG path data (commands M L H V C S Q T A Z and numbers), "
+            f"up to {MAX_PATH_CHARS} characters."
+        )
+    width = _positive(request.get("width"), "width", DEFAULT_LINE_WIDTH)
+    fill = parse_color(request["fill"]) if request.get("fill") else None
+    opacity = _opacity(request.get("opacity"), 1.0)
+    ax, ay = page.pt(*_point(request.get("at"), "at"))
+    # Draw on a canvas centered on the origin, large enough for any path that
+    # stays on the page, then crop to what was drawn.
+    reach = 2 * max(page.width, page.height)
+    svg = (
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{2 * reach}" height="{2 * reach}" '
+        f'viewBox="{-reach} {-reach} {2 * reach} {2 * reach}">'
+        f'<path d="{data}" stroke="{_hex(color)}" stroke-width="{width}" '
+        f'fill="{_hex(fill) if fill else "none"}" opacity="{opacity}" '
+        'stroke-linecap="round" stroke-linejoin="round"/></svg>'
+    )
+    try:
+        with pymupdf.open(stream=svg.encode("utf-8"), filetype="svg") as doc:
+            canvas = pymupdf.open("pdf", doc.convert_to_pdf())
+    except Exception as e:
+        raise MarkError(f"The path could not be drawn: {e}") from None
+    with canvas:
+        drawings = canvas[0].get_drawings()
+        if not drawings:
+            raise MarkError("The path draws nothing.")
+        bounds = pymupdf.Rect(drawings[0]["rect"])
+        for drawing in drawings[1:]:
+            bounds |= drawing["rect"]
+        bounds += (-width, -width, width, width)
+
+        def draw(snippet):
+            snippet.show_pdf_page(snippet.rect, canvas, 0, clip=bounds)
+
+        pdf = _snippet(bounds.width, bounds.height, draw)
+    x0, y0 = ax + bounds.x0 - reach, ay + bounds.y0 - reach
+    box = page.box(x0, y0, x0 + bounds.width, y0 + bounds.height)
+    return {"path": data, "box": box, "pdf": pdf}
 
 
 def _graphic_bytes(request: dict) -> bytes:
@@ -569,10 +657,12 @@ def render_mark(
     kinds = [k for k in KINDS if k in request]
     if len(kinds) != 1:
         raise MarkError(
-            "Each mark needs exactly one of: text, shape, latex, graphic, graphic_file."
+            "Each mark needs exactly one of: text, shape, path, latex, graphic, graphic_file."
         )
     kind = "graphic" if kinds[0] == "graphic_file" else kinds[0]
     page = _Page(*page_size)
+    if "anchor" in request and "at" not in request:
+        raise MarkError("anchor applies only to marks placed with at.")
 
     if kind == "graphic":
         if "color" in request:
@@ -583,7 +673,12 @@ def render_mark(
             rgb = parse_color(request["color"])
         else:
             rgb = color or default_color(request.get("shape"))
-        render = {"text": _render_text, "shape": _render_shape, "latex": _render_latex}[kind]
+        render = {
+            "text": _render_text,
+            "shape": _render_shape,
+            "path": _render_path,
+            "latex": _render_latex,
+        }[kind]
         stored = render(request, rgb, page)
         stored["color"] = rgb
     if len(stored["pdf"]) > MAX_SNIPPET_BYTES:
@@ -598,7 +693,7 @@ def render_mark(
 def summarize(mark: Dict[str, Any], page: Optional[int]) -> Dict[str, Any]:
     """A short description of a stored mark for tool responses."""
     out: Dict[str, Any] = {"id": mark["id"], "page": page, "kind": mark["kind"]}
-    for key in ("shape", "text", "latex", "format"):
+    for key in ("shape", "text", "latex", "path", "format"):
         if key in mark:
             out[key] = mark[key]
     if mark.get("color"):

@@ -156,16 +156,66 @@ def test_default_colors():
             {"page": 1, "shape": "cross", "at": [0.2, 0.1]},
             {"page": 1, "text": "x", "at": [0.3, 0.1]},
             {"page": 1, "latex": "x^2", "at": [0.5, 0.1]},
+            {"page": 1, "path": "M 0 0 L 5 5", "at": [0.6, 0.1]},
+            {"page": 1, "shape": "highlight", "rect": [0.1, 0.2, 0.3, 0.22]},
             {"page": 1, "text": "4/4", "at": [0.4, 0.1], "color": "green"},
         ]
     )
     colors = [pdf_marks.color_name(m["color"]) for m in result["marks"]]
-    assert colors == ["green", "red", "red", "red", "green"]
-    blue = _edit(
+    assert colors == ["black", "black", "black", "black", "black", "yellow", "green"]
+    red = _edit(
         add=[{"page": 1, "shape": "check", "at": [0.1, 0.1]}],
-        color=pdf_marks.parse_color("blue"),
+        color=pdf_marks.parse_color("red"),
     )
-    assert pdf_marks.color_name(blue["marks"][0]["color"]) == "blue"
+    assert pdf_marks.color_name(red["marks"][0]["color"]) == "red"
+
+
+@pytest.mark.parametrize("anchor", ["top-left", "center", "left", "bottom-right"])
+def test_anchor_places_that_point_of_the_box_at(anchor):
+    mark = _edit(add=[{"page": 1, "text": "Note", "at": [0.5, 0.5], "anchor": anchor}])
+    left, top, right, bottom = mark["marks"][0]["box"]
+    fx, fy = pdf_marks.ANCHORS[anchor]
+    assert left + fx * (right - left) == pytest.approx(0.5, abs=1e-3)
+    assert top + fy * (bottom - top) == pytest.approx(0.5, abs=1e-3)
+
+
+def test_check_and_cross_are_centered_by_default():
+    left, top, right, bottom = _edit(add=[{"page": 1, "shape": "check", "at": [0.5, 0.5]}])[
+        "marks"
+    ][0]["box"]
+    assert (left + right) / 2 == pytest.approx(0.5, abs=1e-3)
+    assert (top + bottom) / 2 == pytest.approx(0.5, abs=1e-3)
+
+
+def test_highlight_is_a_translucent_fill():
+    mark = _edit(add=[{"page": 1, "shape": "highlight", "rect": [0.1, 0.2, 0.4, 0.25]}])["marks"][0]
+    assert mark["box"] == [0.1, 0.2, 0.4, 0.25]
+    with pymupdf.open("pdf", base64.b64decode(mark["pdf"])) as snippet:
+        (drawing,) = snippet[0].get_drawings()
+    assert drawing["fill_opacity"] == pytest.approx(pdf_marks.DEFAULT_HIGHLIGHT_OPACITY)
+    assert drawing["color"] is None
+
+
+def test_path_is_in_points_from_at():
+    mark = _edit(add=[{"page": 1, "path": "M 0 0 L 20 0 L 20 10", "at": [0.5, 0.5], "width": 1}])[
+        "marks"
+    ][0]
+    left, top, right, bottom = mark["box"]
+    # The box holds the path plus the line width on every side.
+    assert left * A4[0] == pytest.approx(0.5 * A4[0] - 1, abs=0.6)
+    assert right * A4[0] == pytest.approx(0.5 * A4[0] + 21, abs=0.6)
+    assert top * A4[1] == pytest.approx(0.5 * A4[1] - 1, abs=0.6)
+    assert bottom * A4[1] == pytest.approx(0.5 * A4[1] + 11, abs=0.6)
+    assert mark["path"] == "M 0 0 L 20 0 L 20 10"
+
+
+def test_path_with_fill():
+    mark = _edit(
+        add=[{"page": 1, "path": "M 0 0 L 10 0 L 5 8 Z", "at": [0.5, 0.5], "fill": "yellow"}]
+    )["marks"][0]
+    with pymupdf.open("pdf", base64.b64decode(mark["pdf"])) as snippet:
+        fills = [d["fill"] for d in snippet[0].get_drawings() if d.get("fill")]
+    assert fills and fills[0] == pytest.approx(pdf_marks.COLORS["yellow"], abs=0.01)
 
 
 def test_latex_renders_math_as_vectors():
@@ -218,6 +268,13 @@ def test_marks_follow_pdf_pages_not_tablet_positions():
         ({"page": 1, "graphic": SVG}, "rect"),
         ({"page": 1, "graphic_file": "/nonexistent/plot.svg", "rect": [0, 0, 1, 1]}, "not found"),
         ({"page": 3, "shape": "check", "at": [0.1, 0.1]}, "does not exist"),
+        ({"page": 1, "text": "x", "rect": [0, 0, 1, 1], "anchor": "center"}, "only to marks"),
+        ({"page": 1, "text": "x", "at": [0.5, 0.5], "anchor": "middle"}, "anchor must be"),
+        ({"page": 1, "shape": "highlight", "rect": [0, 0, 1, 1], "opacity": 2}, "opacity"),
+        ({"page": 1, "path": '"/><image href="x', "at": [0.5, 0.5]}, "SVG path data"),
+        ({"page": 1, "path": "M 0 0", "at": [0.5, 0.5]}, "draws nothing"),
+        ({"page": 1, "path": "M 0 0 L 900 0", "at": [0.5, 0.5]}, "runs off"),
+        ({"page": 1, "path": "M 0 0 L 5 5"}, "at"),
         ({"shape": "check", "at": [0.1, 0.1]}, "page number"),
         ({"page": 1, "id": "bad id!", "shape": "check", "at": [0.1, 0.1]}, "Mark ids"),
     ],
@@ -411,7 +468,7 @@ async def test_cloud_add_remove_and_clear(cloud, original):
     )
     assert data["added"] == ["q1", "q1-note"] and data["changed"]
     assert [m["page"] for m in data["marks"]] == [2, 2]
-    assert data["marks"][0]["color"] == "red"
+    assert data["marks"][0]["color"] == "black"
     assert cloud.commits == 1
     assert cloud.stored(".content") == content_before
     meta = json.loads(cloud.stored(".metadata"))

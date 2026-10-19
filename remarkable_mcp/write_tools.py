@@ -2917,13 +2917,14 @@ def register_write_tools():
                 layout: Optional[int] = None,
             ):
                 """
-                <usecase>Add or remove marks (grades, notes, check marks, shapes,
-                equations, graphics) on the pages of a PDF document, for example
-                to grade a worksheet the user filled in on the tablet.</usecase>
+                <usecase>Add or remove marks on the pages of a PDF document: text,
+                shapes, highlights, freeform paths, LaTeX equations and graphics.
+                For example to grade or comment on a worksheet the user filled in,
+                annotate a paper, or add diagrams and worked solutions.</usecase>
                 <instructions>
                 Marks are drawn into the document's PDF, under the user's ink,
                 which is not changed. Each mark has an id; removing a mark
-                rebuilds the PDF without it, so outdated notes can be replaced
+                rebuilds the PDF without it, so outdated marks can be replaced
                 cleanly. With no changes requested it lists the current marks.
                 Marks cannot be erased on the tablet, only with this tool.
 
@@ -2935,31 +2936,40 @@ def register_write_tools():
                 on it, and use dry_run=True to check the result: it returns
                 images of the changed pages without writing anything.
 
-                Name marks after what they mark (e.g. "q3", "q3-note", "score")
-                so they can be found and replaced when an answer is revised.
+                Name marks after what they mark (e.g. "q3", "q3-note", "intro-hl")
+                so they can be found and replaced later.
 
                 Each mark in `add` has a `page` (1-based), an optional `id`, and
                 exactly one of:
-                - text: string; at [x, y] (top-left of the first line, "\n"
-                  starts a new line) or rect [left, top, right, bottom] to wrap
-                  within; options size (points, default 11), bold
-                - shape: "check" or "cross" with at [x, y] (center) and option
-                  size; "circle" or "box" with rect; "line" or "arrow" with from
-                  [x, y] and to [x, y]; option width (line width in points)
-                - latex: LaTeX math, e.g. "\\frac{a}{b} = \\sqrt{2}"; at [x, y]
-                  (top-left) or rect to scale into; option size (default 12)
+                - text: string ("\n" starts a new line); at [x, y], or rect
+                  [left, top, right, bottom] to wrap within; options size
+                  (points, default 11), bold
+                - shape: "check" or "cross" with at; "circle", "box" or
+                  "highlight" with rect; "line" or "arrow" with from [x, y] and
+                  to [x, y]. Options: size (check, cross), width (line width in
+                  points), opacity (highlight, default 0.35)
+                - path: SVG path data in points with its origin at `at`, for any
+                  other shape, e.g. "M -4 4 L 0 -4 L 4 4" (a caret). Options:
+                  width, fill (a color), opacity
+                - latex: LaTeX math, e.g. "\\frac{a}{b} = \\sqrt{2}"; at, or rect
+                  to scale into; option size (default 12)
                 - graphic: content rendered elsewhere: SVG markup, or base64 PDF
                   (one page), PNG or JPEG (up to 2 MB); with rect, scaled to fit
                   and kept at the rect's top-left. SVG may only reference its own
                   elements or data: URIs.
                 - graphic_file: path of such a file on the machine running this
                   server (up to 10 MB), with rect
-                Text, shapes and latex take an optional color (name or #RRGGBB).
-                Check marks default to green, everything else to red.
+                Marks placed with `at` take an optional anchor: the point of the
+                mark placed at `at`: top-left, top, top-right, left, center,
+                right, bottom-left, bottom or bottom-right. Default center for
+                check and cross, top-left otherwise. Use anchor "left" with at
+                at the right end of a text line's middle to put a note beside it.
+                Every mark but graphics takes a color (name or #RRGGBB); the
+                default is black, and yellow for highlights.
 
-                When grading, use green for check marks and for a score with
-                full marks; use red for X marks, notes about mistakes and a
-                score below full marks (pass "color": "green" on a full score).
+                Pick colors for the task. When grading, for example, use green
+                for check marks and full scores, and red for X marks, notes about
+                mistakes and partial scores.
 
                 Removals run before additions, so a mark can be replaced in one
                 call by removing its id and adding a new mark with that id.
@@ -2973,9 +2983,8 @@ def register_write_tools():
                 - add: List of marks to add (see above)
                 - remove: Mark id or list of ids to remove
                 - clear: Remove every mark, restoring the original PDF
-                - color: Color for text, shapes and latex that set none (red,
-                  black, blue, green, orange, purple, gray, or #RRGGBB).
-                  Default: green for check marks, red for the rest.
+                - color: Color for marks in this call that set none (black, red,
+                  yellow, blue, green, orange, purple, gray, or #RRGGBB)
                 - dry_run: Return preview images of the changed pages without
                   writing
                 - layout: Tablet page number; the response adds that page's text
@@ -2984,22 +2993,31 @@ def register_write_tools():
                   with a write; use it alone or with dry_run.
                 </parameters>
                 <examples>
-                - remarkable_mark_pdf("Worksheet", add=[
+                - remarkable_mark_pdf("Worksheet", color="red", add=[
                     {"page": 1, "id": "score", "text": "3/4", "at": [0.8, 0.06],
                      "size": 24, "bold": true},
-                    {"page": 1, "id": "q1", "shape": "check", "at": [0.38, 0.2]},
+                    {"page": 1, "id": "q1", "shape": "check", "at": [0.38, 0.2],
+                     "color": "green"},
                     {"page": 1, "id": "q3", "shape": "cross", "at": [0.38, 0.33]},
                     {"page": 1, "id": "q3-note", "text": "Orange is secondary.",
-                     "rect": [0.41, 0.315, 0.75, 0.36], "size": 9}], dry_run=True)
-                - remarkable_mark_pdf("Worksheet", add=[
-                    {"page": 2, "id": "q5-fix",
+                     "at": [0.41, 0.33], "anchor": "left", "size": 9}],
+                  dry_run=True)
+                - remarkable_mark_pdf("Paper", add=[
+                    {"page": 3, "id": "key-claim", "shape": "highlight",
+                     "rect": [0.12, 0.41, 0.88, 0.43]},
+                    {"page": 3, "id": "key-claim-note", "text": "Compare with Fig. 2",
+                     "at": [0.9, 0.42], "anchor": "right", "size": 8}])
+                - remarkable_mark_pdf("Notes", add=[
+                    {"page": 2, "id": "formula",
                      "latex": "x = \\frac{-b \\pm \\sqrt{b^2-4ac}}{2a}",
                      "at": [0.45, 0.52]},
-                    {"page": 2, "id": "q5-arrow", "shape": "arrow",
-                     "from": [0.44, 0.53], "to": [0.36, 0.53]}])
-                - remarkable_mark_pdf("Worksheet", remove="q3-note", add=[
-                    {"page": 1, "id": "q3-note", "text": "Correct now.",
-                     "at": [0.41, 0.32], "color": "green"}])
+                    {"page": 2, "id": "formula-arrow", "shape": "arrow",
+                     "from": [0.44, 0.53], "to": [0.36, 0.53]},
+                    {"page": 2, "id": "brace", "path":
+                     "M 0 0 C 8 0 4 20 10 20 C 4 20 8 40 0 40", "at": [0.8, 0.3]}])
+                - remarkable_mark_pdf("Worksheet", remove=["q3", "q3-note"], add=[
+                    {"page": 1, "id": "q3", "shape": "check", "at": [0.38, 0.33],
+                     "color": "green"}])  # the answer was revised
                 - remarkable_mark_pdf("Worksheet", layout=1)  # where to place marks
                 - remarkable_mark_pdf("Worksheet")  # list marks
                 - remarkable_mark_pdf("Worksheet", clear=True)
