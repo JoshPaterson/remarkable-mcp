@@ -1287,6 +1287,139 @@ def _ssh_tag(ssh_client, target, apply, page: Optional[int], defer_restart: bool
     return _tag_response(target, page, result, "ssh", refresh_pending=not restarted)
 
 
+MARK_PREVIEW_MAX_PAGES = 4
+MARK_PREVIEW_DPI = 100
+
+
+def _mark_editor(add: list, remove: list, clear: bool, color: Optional[str], build: bool):
+    """``edit(pdf, content)`` for ``replace_document_pdf``, or a dry run."""
+    from remarkable_mcp import pdf_marks
+    from remarkable_mcp.pages import pdf_page_map
+
+    default_color = pdf_marks.parse_color(color) if color else None
+
+    def edit(pdf: bytes, content: dict) -> dict:
+        base, marks = pdf_marks.load_state(pdf)
+        page_map = pdf_page_map(content)
+        result = pdf_marks.edit_marks(
+            marks,
+            add=add,
+            remove=remove,
+            clear=clear,
+            page_map=page_map,
+            default_color=default_color,
+            max_image_bytes=pdf_marks.MAX_IMAGE_BYTES,
+        )
+        touched = {m["pdf_page"] for m in marks if m["id"] in result["removed"]}
+        touched |= {m["pdf_page"] for m in result["marks"] if m["id"] in result["added"]}
+        result["page_map"] = page_map
+        result["touched_pages"] = sorted(
+            p for p in (pdf_marks.tablet_page(i, page_map) for i in touched) if p
+        )
+        result["pdf"] = pdf_marks.build(base, result["marks"]) if result["changed"] else None
+        if not build:
+            result["preview_pdf"], result["pdf"] = result["pdf"], None
+        return result
+
+    return edit
+
+
+@contextmanager
+def _document_dir(client, files: list, pdf: bytes):
+    """A temporary directory holding a document's files from its index
+    ``files``, with ``pdf`` in place of its PDF."""
+    import tempfile
+    from pathlib import Path
+
+    with tempfile.TemporaryDirectory(prefix="remarkable-mark-") as tmp:
+        root = Path(tmp).resolve()
+        for entry in files:
+            path = (root / entry["id"]).resolve()
+            if not path.is_relative_to(root):
+                continue
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if entry["id"].endswith(".pdf"):
+                path.write_bytes(pdf)
+            else:
+                path.write_bytes(client._get_file(entry["hash"], entry["id"]))
+        yield root
+
+
+def _mark_preview_images(client, files: list, pdf: bytes, pages: list) -> list:
+    """Merged page images of a document with ``pdf`` in place of its PDF."""
+    import base64
+
+    from mcp.types import ImageContent
+
+    from remarkable_mcp.extract import render_merged_page_from_extracted_document
+
+    images = []
+    with _document_dir(client, files, pdf) as root:
+        for page in pages[:MARK_PREVIEW_MAX_PAGES]:
+            png, _ = render_merged_page_from_extracted_document(
+                root, page=page, dpi=MARK_PREVIEW_DPI
+            )
+            if png:
+                images.append(
+                    ImageContent(
+                        type="image",
+                        data=base64.b64encode(png).decode("ascii"),
+                        mimeType="image/png",
+                    )
+                )
+    return images
+
+
+def _mark_layout(client, files: list, pdf: bytes, page: int, page_map: list) -> dict:
+    """The original PDF's text lines and the user's ink on a tablet page."""
+    from remarkable_mcp.extract import page_ink_regions
+    from remarkable_mcp.pdf_marks import MarkError, original_pdf, text_lines
+
+    if not 1 <= page <= len(page_map):
+        raise MarkError(f"Page {page} does not exist; the document has {len(page_map)}.")
+    pdf_page = page_map[page - 1]
+    base = original_pdf(pdf)
+    with _document_dir(client, files, base) as root:
+        ink = page_ink_regions(root, page)
+    return {
+        "page": page,
+        "text_lines": text_lines(base, pdf_page) if pdf_page is not None else [],
+        "ink": ink,
+    }
+
+
+def _mark_response(target, result: dict, dry_run: bool) -> str:
+    from remarkable_mcp.pdf_marks import summarize, tablet_page
+
+    page_map = result["page_map"]
+    data = {
+        "document": target.VissibleName,
+        "marks": [summarize(m, tablet_page(m["pdf_page"], page_map)) for m in result["marks"]],
+        "added": result["added"],
+        "removed": result["removed"],
+        "changed": result["changed"],
+        "transport": "cloud",
+    }
+    if dry_run:
+        data["dry_run"] = True
+        data["preview_pages"] = result["touched_pages"][:MARK_PREVIEW_MAX_PAGES]
+    if result["notes"]:
+        data["notes"] = result["notes"]
+    if "layout" in result:
+        data["layout"] = result["layout"]
+    name = target.VissibleName
+    if not result["changed"]:
+        hint = f"No mark changes made on '{name}'."
+    elif dry_run:
+        hint = (
+            f"Dry run: nothing was written to '{name}'. Check the preview images, "
+            "then repeat the call without dry_run to apply it."
+        )
+    else:
+        hint = f"Marks on '{name}' updated. Changes reach the tablet on its next sync."
+    return make_response(data, hint)
+
+
 def _cloud_delete(document: str) -> str:
     """Move a document or folder to the cloud trash (recoverable on-device)."""
     client = get_rmapi()
@@ -2770,6 +2903,167 @@ def register_write_tools():
                         defer_restart=defer_restart,
                     )
             return await asyncio.to_thread(_impl)
+
+        if _is_cloud_mode():
+
+            @mcp.tool(annotations=WRITE_ANNOTATIONS)
+            async def remarkable_mark_pdf(
+                document: str,
+                add: Optional[List[Dict]] = None,
+                remove: Optional[Union[str, List[str]]] = None,
+                clear: bool = False,
+                color: Optional[str] = None,
+                dry_run: bool = False,
+                layout: Optional[int] = None,
+            ):
+                """
+                <usecase>Add or remove marks (grades, notes, check marks, shapes,
+                SVG drawings, images) on the pages of a PDF document, for example
+                to grade a worksheet the user filled in on the tablet.</usecase>
+                <instructions>
+                Marks are drawn into the document's PDF, under the user's ink,
+                which is not changed. Each mark has an id; removing a mark
+                rebuilds the PDF without it, so outdated notes can be replaced
+                cleanly. With no changes requested it lists the current marks.
+                Marks cannot be erased on the tablet, only with this tool.
+
+                Coordinates are fractions of the page (0-1 from the top-left), the
+                same frame as remarkable_image and its region. Before marking a
+                page, call with layout=<page> for the positions of the PDF's text
+                lines and of the user's ink on it, and look at the page with
+                remarkable_image. Place marks beside the user's ink rather than
+                on it, and use dry_run=True to check the result: it returns
+                images of the changed pages without writing anything.
+
+                Name marks after what they mark (e.g. "q3", "q3-note", "score")
+                so they can be found and replaced when an answer is revised.
+
+                Each mark in `add` has a `page` (1-based), an optional `id`, and
+                exactly one of:
+                - text: string, with at [x, y] (top-left of the first line) or
+                  rect [left, top, right, bottom] to wrap within; options size
+                  (points, default 11), bold
+                - check / cross: [x, y] center; options size, width
+                - circle: [left, top, right, bottom]; option width
+                - underline: [x0, y, x1]; line: [x0, y0, x1, y1]; option width
+                - svg: SVG markup, with rect; scaled to fit, aspect kept. External
+                  references are refused; embed images as data: URIs.
+                - image: base64 PNG or JPEG (up to 2 MB), with rect
+                Text and shapes take an optional color (name or #RRGGBB).
+                Check marks default to green, everything else to red.
+
+                When grading, use green for check marks and for a score with
+                full marks; use red for X marks, notes about mistakes and a
+                score below full marks (pass "color": "green" on a full score).
+
+                Removals run before additions, so a mark can be replaced in one
+                call by removing its id and adding a new mark with that id.
+                clear=True removes every mark and restores the original PDF.
+
+                Cloud mode only. PDF documents only; pages added on the tablet
+                have no PDF page and cannot be marked.
+                </instructions>
+                <parameters>
+                - document: Document name or path
+                - add: List of marks to add (see above)
+                - remove: Mark id or list of ids to remove
+                - clear: Remove every mark, restoring the original PDF
+                - color: Color for marks that set none (red, black, blue,
+                  green, orange, purple, gray, or #RRGGBB). Default: green
+                  for check marks, red for the rest.
+                - dry_run: Return preview images of the changed pages without
+                  writing
+                - layout: Tablet page number; the response adds that page's text
+                  lines (from the PDF before marks) and ink regions, each with a
+                  box [left, top, right, bottom] in page fractions. Not combined
+                  with a write; use it alone or with dry_run.
+                </parameters>
+                <examples>
+                - remarkable_mark_pdf("Worksheet", add=[
+                    {"page": 1, "id": "score", "text": "3/4", "at": [0.8, 0.06],
+                     "size": 24, "bold": true},
+                    {"page": 1, "id": "q3", "cross": [0.38, 0.33]},
+                    {"page": 1, "id": "q3-note", "text": "Orange is secondary.",
+                     "rect": [0.41, 0.315, 0.75, 0.36], "size": 9}], dry_run=True)
+                - remarkable_mark_pdf("Worksheet", remove="q3-note", add=[
+                    {"page": 1, "id": "q3-note", "text": "Correct now.",
+                     "at": [0.41, 0.32], "color": "green"}])
+                - remarkable_mark_pdf("Worksheet", layout=1)  # where to place marks
+                - remarkable_mark_pdf("Worksheet")  # list marks
+                - remarkable_mark_pdf("Worksheet", clear=True)
+                </examples>
+                """
+                from remarkable_mcp.pdf_marks import MarkError
+
+                def invalid(message: str, suggestion: str) -> str:
+                    return make_error(
+                        error_type="invalid_parameter", message=message, suggestion=suggestion
+                    )
+
+                adds, removes = add or [], _as_list(remove)
+                writing = bool(adds or removes or clear) and not dry_run
+                if layout is not None and writing:
+                    return invalid(
+                        "layout cannot be combined with a write.",
+                        "Call with layout alone (or with dry_run=True) first, then write.",
+                    )
+
+                def _impl():
+                    error = _require_managed_write_mode()
+                    if error:
+                        return error
+                    client = get_rmapi()
+                    try:
+                        collection = client.get_meta_items()
+                        items_by_id = get_items_by_id(collection)
+                        target = _resolve_document(document, collection, items_by_id)
+                        if not target:
+                            from remarkable_mcp.extract import find_similar_documents
+
+                            similar = find_similar_documents(document, collection)
+                            return make_error(
+                                error_type="document_not_found",
+                                message=f"Document not found: '{document}'",
+                                suggestion="Use remarkable_browse() to find the correct name.",
+                                did_you_mean=similar if similar else None,
+                            )
+                        if target.is_folder:
+                            return invalid(
+                                f"'{target.VissibleName}' is a folder.",
+                                "Mark a PDF document instead.",
+                            )
+                        edit = _mark_editor(adds, removes, clear, color, build=writing)
+                        if writing:
+                            result = client.replace_document_pdf(target.ID, edit)
+                            if result["changed"]:
+                                _invalidate_client_cache(client)
+                            return _mark_response(target, result, dry_run=False)
+                        pdf, content, files = client.read_document_pdf(target.ID)
+                        result = edit(pdf, content)
+                        if layout is not None:
+                            result["layout"] = _mark_layout(
+                                client, files, pdf, layout, result["page_map"]
+                            )
+                        response = _mark_response(target, result, dry_run=dry_run)
+                        preview = result.get("preview_pdf")
+                        if not dry_run or not preview:
+                            return response
+                        from mcp.types import TextContent
+
+                        images = _mark_preview_images(
+                            client, files, preview, result["touched_pages"]
+                        )
+                        return [TextContent(type="text", text=response), *images]
+                    except MarkError as e:
+                        return invalid(str(e), "Fix the mark and try again.")
+                    except Exception as e:
+                        return make_error(
+                            error_type="mark_failed",
+                            message=f"Failed to change marks: {e}",
+                            suggestion="Check that the document is a PDF and try again.",
+                        )
+
+                return await asyncio.to_thread(_impl)
 
         @mcp.tool(annotations=DELETE_ANNOTATIONS)
         async def remarkable_delete(

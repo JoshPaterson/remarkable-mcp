@@ -183,6 +183,17 @@ Where typed text is highlighted, the line is moved sideways (and squeezed if
 needed) so the highlighted words sit centered across the tablet's highlight
 box, as they do on the tablet.
 
+### Marks
+
+PDFs marked with `remarkable_mark_pdf` (grades, notes, check marks and other
+marks drawn into the PDF) keep the PDF before marking inside them. Document
+text comes from that original, so `content_type="raw"` never includes marks.
+With `"text"` and `"annotations"` the marks are listed under
+`--- Marks (added with remarkable_mark_pdf) ---`, e.g.
+`q3-note (page 1, red, text): Orange is a secondary color.`, and returned as
+`marks: [{"id", "page", "kind", "color", "text", "at" | "rect" | "points"}]`
+with positions as page fractions.
+
 ### Smart Features
 
 - **Auto-OCR**: If a notebook has no typed text and `include_ocr=False`, OCR is automatically enabled and you're notified via `_ocr_auto_enabled: true`
@@ -440,6 +451,7 @@ remarkable_status()
 | `layers` | string | `"visible"` | Layers to draw: `"visible"` (what the tablet shows), `"all"` (include hidden layers), or one layer's name, e.g. `"Layer 3"` |
 | `dpi` | int \| null | `None` | PNG resolution (36-600 dots per inch of the physical page). Renders the whole page instead of cropping to the ink; use 300 to read small handwriting |
 | `region` | list[float] \| null | `None` | PNG crop box `[left, top, right, bottom]` as fractions of the page, e.g. `[0, 0.5, 1, 0.75]` |
+| `marks` | bool | `True` | Draw marks added with `remarkable_mark_pdf`; `False` shows the page as it was before marking, with the user's ink |
 
 ### Background Colors
 

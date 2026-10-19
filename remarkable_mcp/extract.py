@@ -2718,6 +2718,72 @@ def _locate_on_page(
     return mm, region
 
 
+# Gaps (page fractions) within which ink strokes join one region: letters of
+# a word and words on a line join; separate lines of writing stay apart.
+INK_REGION_GAP_X = 0.03
+INK_REGION_GAP_Y = 0.004
+
+
+def _merge_regions(boxes: List[List[float]]) -> List[List[float]]:
+    """Merge boxes that touch or lie within the region gaps of each other."""
+    merged = [list(b) for b in boxes]
+    changed = True
+    while changed:
+        changed = False
+        for i in range(len(merged)):
+            for j in range(i + 1, len(merged)):
+                a, b = merged[i], merged[j]
+                if (
+                    a[0] - INK_REGION_GAP_X <= b[2]
+                    and b[0] - INK_REGION_GAP_X <= a[2]
+                    and a[1] - INK_REGION_GAP_Y <= b[3]
+                    and b[1] - INK_REGION_GAP_Y <= a[3]
+                ):
+                    merged[i] = [min(a[0], b[0]), min(a[1], b[1]), max(a[2], b[2]), max(a[3], b[3])]
+                    del merged[j]
+                    changed = True
+                    break
+            if changed:
+                break
+    return sorted(merged, key=lambda r: (r[1], r[0]))
+
+
+def page_ink_regions(tmpdir_path: Path, page: int) -> List[List[float]]:
+    """Boxes around the ink on a page, as page fractions.
+
+    Each box is ``[left, top, right, bottom]`` in the frame of
+    ``remarkable_image``'s ``region``, around strokes on visible layers that
+    lie close together (roughly a word or a line of writing). Empty when the
+    page has no ink.
+    """
+    rm_file = _select_rm_file_for_page(tmpdir_path, _get_ordered_rm_files(tmpdir_path), page)
+    if rm_file is None:
+        return []
+    scene = _v6_scene(rm_file)
+    if scene is None:
+        return []
+    blocks, tree = scene
+    offsets = _v6_anchor_offsets(rm_file)
+    frame = _page_frame(tmpdir_path, page, rm_file, _pdf_page_sizes(tmpdir_path))
+    boxes = []
+    for layer in _scene_layers(tree, blocks):
+        if not layer["visible"]:
+            continue
+        for item, node_id in _scene_items(layer["group"]):
+            if type(item).__name__ != "Line":
+                continue
+            tool = getattr(item, "tool", None)
+            if getattr(tool, "value", tool) in _ERASER_PENS:
+                continue
+            bbox = _stroke_bbox(getattr(item, "points", None) or [])
+            if bbox is None:
+                continue
+            dx, dy = offsets.get(node_id, (0.0, 0.0))
+            bbox = [bbox[0] + dx, bbox[1] + dy, bbox[2] + dx, bbox[3] + dy]
+            boxes.append(_locate_on_page(bbox, frame)[1])
+    return _merge_regions(boxes)
+
+
 def _place_highlight(highlight: Dict[str, Any], frame: Tuple[float, float, float]) -> None:
     """Replace a highlight's stroke-unit ``rects`` with page positions.
 

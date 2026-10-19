@@ -23,6 +23,7 @@ WRITE_TOOLS = [
     "remarkable_move",
     "remarkable_rename",
     "remarkable_tag",
+    "remarkable_mark_pdf",
     "remarkable_delete",
     "remarkable_refresh",
     "remarkable_author",

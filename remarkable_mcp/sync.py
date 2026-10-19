@@ -1018,6 +1018,67 @@ class RemarkableClient:
         self._sync_root(mutate)
         return outcome.get("result")
 
+    def read_document_pdf(self, doc_id: str) -> tuple:
+        """Return ``(pdf_bytes, content, files)`` for a PDF document.
+
+        ``files`` are the document's current index entries; ``_get_file``
+        fetches each one by ``hash`` and ``id``.
+        """
+        entries, _ = self._read_root_entries()
+        files, pdf_file, content = self._pdf_document_files(self._require_entry(entries, doc_id))
+        return self._get_file(pdf_file["hash"], pdf_file["id"]), content, files
+
+    def _pdf_document_files(self, entry: Dict[str, Any]) -> tuple:
+        doc_id = entry["id"]
+        files = self._parse_index(self._get_file(entry["hash"], f"{doc_id}.docSchema"))
+        pdf_file = next((f for f in files if f["id"] == f"{doc_id}.pdf"), None)
+        content_file = next((f for f in files if f["id"].endswith(".content")), None)
+        if pdf_file is None or content_file is None:
+            raise CloudWriteError(f"Document {doc_id} is not a PDF document.")
+        content = json.loads(self._get_file(content_file["hash"], content_file["id"]))
+        if content.get("fileType") != "pdf":
+            raise CloudWriteError(f"Document {doc_id} is not a PDF document.")
+        return files, pdf_file, content
+
+    def replace_document_pdf(self, doc_id: str, edit: "Any") -> Any:
+        """Replace one PDF document's ``.pdf`` and return ``edit``'s result.
+
+        ``edit(pdf_bytes, content)`` returns a result whose ``"pdf"`` key is
+        the new PDF, or None to leave the document unchanged. Only the PDF and
+        the metadata's ``lastModified`` change; ``.content`` and the ink
+        (``.rm``) files are left as they are, so the new PDF must keep the
+        page count and page sizes for the ink to stay in place.
+        """
+        from remarkable_mcp import tablet_json
+
+        outcome: Dict[str, Any] = {}
+
+        def mutate(entries):
+            entry = self._require_entry(entries, doc_id)
+            files, pdf_file, content = self._pdf_document_files(entry)
+            pdf = self._get_file(pdf_file["hash"], pdf_file["id"])
+            result = edit(pdf, content)
+            outcome["result"] = result
+            new_pdf = result.get("pdf")
+            if new_pdf is None or new_pdf == pdf:
+                return entries
+            meta_file = next((f for f in files if f["id"].endswith(".metadata")), None)
+            if meta_file is None:
+                raise CloudWriteError(f"Document {doc_id} has no metadata blob.")
+            metadata = json.loads(self._get_file(meta_file["hash"], meta_file["id"]))
+            metadata["lastModified"] = self._now_ms()
+            replaced = {
+                pdf_file["id"]: self._upload_file_blob(new_pdf, pdf_file["id"]),
+                meta_file["id"]: self._upload_file_blob(
+                    tablet_json.dumps(metadata).encode("utf-8"), meta_file["id"]
+                ),
+            }
+            new_files = [replaced.get(f["id"], f) for f in files]
+            return self._replace_root_entry(entries, self._upload_doc_index(doc_id, new_files))
+
+        self._sync_root(mutate)
+        return outcome.get("result")
+
     def _replace_root_entry(self, entries, new_entry):
         """Return ``entries`` with the entry matching ``new_entry['id']`` replaced."""
         return [new_entry if e["id"] == new_entry["id"] else e for e in entries]

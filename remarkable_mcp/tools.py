@@ -7,10 +7,13 @@ file on the MCP server host and returns it as a resource link.
 """
 
 import base64
+import io
+import json
 import logging
 import os
 import re
 import tempfile
+import zipfile
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
@@ -63,6 +66,7 @@ from remarkable_mcp.extract import (
     render_page_full_page_from_document_zip,
     render_tablet_pdf_page_to_png,
 )
+from remarkable_mcp.pdf_marks import original_pdf, stored_marks
 from remarkable_mcp.responses import make_error, make_response
 from remarkable_mcp.server import mcp
 from remarkable_mcp.tags import matches_tags, tag_names
@@ -581,10 +585,15 @@ async def remarkable_read(
         raw_available = False
         raw_data: Optional[bytes] = None
         page_count_note = None
+        mark_list: list = []
+        mark_summaries: list = []
 
         # Get raw PDF/EPUB content if requested or for "text" mode
         if content_type in ("text", "raw") and file_type in ("pdf", "epub"):
             raw_data = await run_blocking(download_raw_file, client, target_doc, file_type)
+            if raw_data and file_type == "pdf":
+                mark_list = stored_marks(raw_data)
+                raw_data = original_pdf(raw_data)
             if raw_data:
                 raw_available = True
                 with tempfile.NamedTemporaryFile(suffix=f".{file_type}", delete=False) as tmp:
@@ -609,6 +618,11 @@ async def remarkable_read(
                         "or content_type='annotations' for handwritten notes."
                     ),
                 )
+
+        if content_type == "annotations" and file_type == "pdf":
+            marked_pdf = await run_blocking(download_raw_file, client, target_doc, "pdf")
+            if marked_pdf:
+                mark_list = stored_marks(marked_pdf)
 
         # Get annotations/typed text (for "text" or "annotations" mode)
         notebook_pages = []  # List of page content for notebook pagination
@@ -770,6 +784,10 @@ async def remarkable_read(
                 if content.get("handwritten_text"):
                     annotation_parts.append("\n--- Handwritten (OCR) ---")
                     annotation_parts.extend(content["handwritten_text"])
+                if mark_list:
+                    mark_summaries = _mark_summaries(mark_list, await load_archive())
+                    annotation_parts.append("\n--- Marks (added with remarkable_mark_pdf) ---")
+                    annotation_parts.extend(_mark_line(m) for m in mark_summaries)
 
                 if annotation_parts:
                     if text_parts and content_type == "text":
@@ -1053,6 +1071,8 @@ async def remarkable_read(
                 result["images"] = pasted
         if content and content.get("page_tags"):
             result["page_tags"] = content["page_tags"]
+        if mark_summaries:
+            result["marks"] = mark_summaries
         if content_type in ("text", "annotations") and content:
             page_layers = [
                 {"page": ap["page"], "layers": ap["layers"]}
@@ -1713,6 +1733,7 @@ async def remarkable_status() -> str:
             "move": True,
             "rename": True,
             "tag": True,
+            "mark_pdf": True,
             "delete": True,
         },
         "ssh": {
@@ -1724,6 +1745,7 @@ async def remarkable_status() -> str:
             "move": True,
             "rename": True,
             "tag": True,
+            "mark_pdf": False,
             "delete": True,
         },
         "usb-web": {
@@ -1735,6 +1757,7 @@ async def remarkable_status() -> str:
             "move": False,
             "rename": False,
             "tag": False,
+            "mark_pdf": False,
             "delete": False,
         },
         # Local directory is strictly read-only: the folder is the desktop
@@ -1748,6 +1771,7 @@ async def remarkable_status() -> str:
             "move": False,
             "rename": False,
             "tag": False,
+            "mark_pdf": False,
             "delete": False,
         },
     }
@@ -1826,8 +1850,10 @@ async def remarkable_status() -> str:
                     "(to root). For mkdir/move/rename/delete over USB, use SSH mode."
                 )
             else:
+                marks = " mark_pdf (cloud only)," if transport == "cloud" else ""
                 hint_parts.append(
-                    "Write is enabled: upload, mkdir, move, rename, tag, and delete are available."
+                    f"Write is enabled: upload, mkdir, move, rename, tag,{marks} and "
+                    "delete are available."
                 )
         elif selected_transport == "local-dir":
             hint_parts.append(
@@ -2033,6 +2059,7 @@ async def remarkable_image(
     layers: str = "visible",
     dpi: Optional[int] = None,
     region: Optional[List[float]] = None,
+    marks: bool = True,
 ):
     """
     <usecase>Get an image of a specific page from a reMarkable document.</usecase>
@@ -2092,6 +2119,8 @@ async def remarkable_image(
     - region: PNG crop box [left, top, right, bottom] as fractions of the page
       (0-1), e.g. [0, 0.5, 1, 0.75] for the third quarter of the page. Combine
       with dpi to inspect one area closely without a huge image.
+    - marks: Draw marks added with remarkable_mark_pdf (default True). False
+      shows the page as it was before marking, with the user's ink.
     </parameters>
     <examples>
     - remarkable_image("UI Mockup")  # Get first page as embedded PNG resource
@@ -2175,6 +2204,8 @@ async def remarkable_image(
         raw_doc = await run_blocking(client.download, target_doc)
         native_pdf = raw_doc if _is_pdf_payload(raw_doc) else None
         tmp_path: Optional[Path] = None
+        if native_pdf is None and not marks:
+            raw_doc = await run_blocking(_archive_without_marks, raw_doc)
         if native_pdf is None:
             with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as tmp:
                 tmp.write(raw_doc)
@@ -2536,6 +2567,52 @@ def _select_pages(ranges: List[tuple], page_count: int) -> List[int]:
     return sorted({page for first, last in ranges for page in range(first, last + 1)})
 
 
+def _archive_without_marks(archive: bytes) -> bytes:
+    """A document archive with its PDF restored to the version before marks."""
+    out = io.BytesIO()
+    with (
+        zipfile.ZipFile(io.BytesIO(archive)) as src,
+        zipfile.ZipFile(out, "w", zipfile.ZIP_STORED) as dst,
+    ):
+        for info in src.infolist():
+            data = src.read(info)
+            if info.filename.endswith(".pdf"):
+                data = original_pdf(data)
+            dst.writestr(info, data)
+    return out.getvalue()
+
+
+def _mark_summaries(marks: list, archive: bytes) -> list:
+    """Short descriptions of a PDF's marks, with the tablet page of each."""
+    from remarkable_mcp.pages import pdf_page_map
+    from remarkable_mcp.pdf_marks import summarize, tablet_page
+
+    content = None
+    if not _is_pdf_payload(archive):
+        try:
+            with zipfile.ZipFile(io.BytesIO(archive)) as zf:
+                name = next((n for n in zf.namelist() if n.endswith(".content")), None)
+                if name:
+                    content = json.loads(zf.read(name))
+        except Exception:
+            content = None
+    page_map = pdf_page_map(content) if content else []
+    summaries = []
+    for mark in marks:
+        page = tablet_page(mark["pdf_page"], page_map) if page_map else mark["pdf_page"] + 1
+        summaries.append(summarize(mark, page))
+    return summaries
+
+
+def _mark_line(summary: dict) -> str:
+    where = f"page {summary['page']}" if summary["page"] else "page no longer shown"
+    details = ", ".join(v for v in (where, summary.get("color"), summary["kind"]) if v)
+    line = f"{summary['id']} ({details})"
+    if summary.get("text"):
+        line += f": {summary['text']}"
+    return line
+
+
 class _ExportRequestError(Exception):
     def __init__(self, error_type: str, message: str, suggestion: str):
         super().__init__(message)
@@ -2545,6 +2622,8 @@ class _ExportRequestError(Exception):
 
 
 def _extract_source_text_from_bytes(data: bytes, source_type: str) -> str:
+    if source_type == "pdf":
+        data = original_pdf(data)
     suffix = f".{source_type}"
     with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
         tmp.write(data)

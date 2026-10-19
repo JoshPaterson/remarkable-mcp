@@ -148,6 +148,10 @@ def _make_raw_resource(client, document, file_type: str):
 
             if not raw_data:
                 return f"Raw {file_type.upper()} file not found"
+            if file_type == "pdf":
+                from remarkable_mcp.pdf_marks import original_pdf
+
+                raw_data = original_pdf(raw_data)
 
             # Extract text from the raw file
             with tempfile.NamedTemporaryFile(suffix=f".{file_type}", delete=False) as tmp:

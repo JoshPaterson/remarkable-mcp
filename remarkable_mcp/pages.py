@@ -6,7 +6,7 @@ the tablet stays in that list with a ``deleted`` field (e.g.
 page ids in a flat ``pages`` list.
 """
 
-from typing import Any, Dict, List, Set
+from typing import Any, Dict, List, Optional, Set
 
 
 def _is_deleted(entry: Dict[str, Any]) -> bool:
@@ -53,3 +53,26 @@ def deleted_page_ids(content: Any) -> Set[str]:
         for p in content["cPages"]["pages"]
         if isinstance(p, dict) and p.get("id") and _is_deleted(p)
     }
+
+
+def pdf_page_map(content: Any) -> List[Optional[int]]:
+    """0-based PDF page index of each page the tablet shows, in order.
+
+    ``None`` marks a page added on the tablet, which has no PDF page behind
+    it. formatVersion 2 uses ``cPages.pages[].redir``; formatVersion 1 uses
+    ``redirectionPageMap`` (-1 for added pages), or PDF order when that is
+    missing.
+    """
+    if has_cpages(content):
+        result: List[Optional[int]] = []
+        for entry in live_cpages_entries(content):
+            redir = entry.get("redir")
+            value = redir.get("value") if isinstance(redir, dict) else None
+            result.append(value if isinstance(value, int) and value >= 0 else None)
+        return result
+    if not isinstance(content, dict):
+        return []
+    rpm = content.get("redirectionPageMap")
+    if isinstance(rpm, list) and rpm:
+        return [v if isinstance(v, int) and v >= 0 else None for v in rpm]
+    return list(range(len(content_page_ids(content))))
