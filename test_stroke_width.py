@@ -109,7 +109,7 @@ def test_v6_highlighter_width_unchanged(tmp_path):
     svg = _v6_page(tmp_path, [_line(HIGHLIGHTER, [120, 120], y=100, color=3)])
 
     assert _widths(svg) == [40.0]
-    assert 'opacity="0.35"' in svg
+    assert 'style="mix-blend-mode:darken"' in svg
 
 
 def test_v5_widths_are_page_units(tmp_path):

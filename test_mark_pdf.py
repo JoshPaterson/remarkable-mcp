@@ -712,3 +712,21 @@ def test_description_is_stored_and_listed():
     assert _mark_line(summary).endswith("[description: gold star: neat, complete working]")
     with pytest.raises(MarkError, match="at most 200"):
         _edit(add=[{"page": 1, "text": "x", "at": [0.1, 0.1], "description": "d" * 201}])
+
+
+def test_rendered_highlighter_darkens_paper_and_keeps_ink_dark():
+    from PIL import Image
+
+    from remarkable_mcp.extract import HIGHLIGHT_BLEND, _svg_string_to_png
+
+    svg = (
+        '<svg xmlns="http://www.w3.org/2000/svg" width="100" height="40" viewBox="0 0 100 40">'
+        '<rect x="10" y="10" width="20" height="20" fill="#000000"/>'
+        f'<rect x="0" y="15" width="100" height="10" fill="#FEFD60" {HIGHLIGHT_BLEND}/>'
+        "</svg>"
+    )
+    png = _svg_string_to_png(svg, 100, 40, "#FFFFFF")
+    image = Image.open(io.BytesIO(png)).convert("RGB")
+    assert image.getpixel((60, 20)) == (254, 253, 96)  # highlighter on paper
+    assert image.getpixel((20, 20)) == (0, 0, 0)  # ink under the highlighter
+    assert image.getpixel((60, 5)) == (255, 255, 255)  # paper

@@ -47,6 +47,13 @@ def _rm_to_svg(rm_file_path: Path, output_svg_path: Path, layers: Optional[str] 
     return False
 
 
+# Highlighter ink is drawn in full color with the Darken blend, as the
+# tablet's PDF export draws it: the paper takes the color and dark ink or
+# text under it stays dark. Browsers apply this style to SVG output; PNG
+# rendering applies it in _svg_string_to_png, since MuPDF ignores it.
+HIGHLIGHT_BLEND = 'style="mix-blend-mode:darken"'
+_DARKEN_ELEMENT = re.compile(r"<(?:path|rect)\b[^>]*mix-blend-mode:darken[^>]*/>")
+
 # reMarkable tablet screen dimensions (in pixels) - used as fallback
 REMARKABLE_WIDTH = 1404
 REMARKABLE_HEIGHT = 1872
@@ -608,7 +615,7 @@ def _render_rm_v5_to_svg(rm_file_path: Path) -> Optional[str]:
                     stroke_color = HIGHLIGHT_COLORS.get(color, "#FFD700")
                     avg_width = sum(s[2] for s in segments) / len(segments)
                     stroke_width = max(10.0, min(avg_width * 2.0, 40.0))
-                    opacity = ' opacity="0.35"'
+                    opacity = f" {HIGHLIGHT_BLEND}"
 
                     d = f"M {segments[0][0]:.1f} {segments[0][1]:.1f}"
                     d += "".join(f" L {s[0]:.1f} {s[1]:.1f}" for s in segments[1:])
@@ -1056,7 +1063,7 @@ def _v6_paths_from_blocks(
                 paths.append(
                     f'<rect x="{r.x + dx:.1f}" y="{r.y + dy:.1f}" '
                     f'width="{r.w:.1f}" height="{r.h:.1f}" '
-                    f'fill="{hl_fill}" opacity="0.35" stroke="none"/>'
+                    f'fill="{hl_fill}" stroke="none" {HIGHLIGHT_BLEND}/>'
                 )
                 all_coords.append((r.x + dx, r.y + dy))
                 all_coords.append((r.x + dx + r.w, r.y + dy + r.h))
@@ -1095,7 +1102,7 @@ def _v6_paths_from_blocks(
             else 20.0
         )
         stroke_width = max(10.0, min(avg_width * 2.0, 40.0))
-        opacity = ' opacity="0.35"'
+        opacity = f" {HIGHLIGHT_BLEND}"
 
         d = f"M {line.points[0].x + dx:.1f} {line.points[0].y + dy:.1f}"
         d += "".join(f" L {p.x + dx:.1f} {p.y + dy:.1f}" for p in line.points[1:])
@@ -1602,9 +1609,20 @@ def _svg_full_page(paths: list, paper_w: float, paper_h: float) -> str:
 
 
 def _svg_string_to_png(
-    svg: str, output_width: int, output_height: int, background_color: Optional[str]
+    svg: str,
+    output_width: int,
+    output_height: int,
+    background_color: Optional[str],
+    backdrop: Any = None,
 ) -> Optional[bytes]:
-    """Rasterize an SVG string to exact-size PNG bytes without system Cairo."""
+    """Rasterize an SVG string to exact-size PNG bytes without system Cairo.
+
+    ``backdrop`` (a PIL image, e.g. a rendered PDF page) is drawn under the
+    SVG instead of ``background_color``. Highlighter ink (elements styled
+    with ``HIGHLIGHT_BLEND``) darkens the background or backdrop under it,
+    and the rest of the ink is drawn over that. With a transparent result
+    and no backdrop, highlighter ink is drawn as it is, under the other ink.
+    """
     import io
 
     try:
@@ -1624,35 +1642,58 @@ def _svg_string_to_png(
         )
         return None
 
-    doc = None
-    try:
-        doc = fitz.open(stream=svg.encode("utf-8"), filetype="svg")
-        if len(doc) != 1:
-            raise ValueError(f"expected one SVG page, found {len(doc)}")
+    from PIL import Image as PILImage
+    from PIL import ImageChops
 
-        page = doc[0]
-        if page.rect.width <= 0 or page.rect.height <= 0:
-            raise ValueError(f"SVG has invalid dimensions: {page.rect}")
-
-        matrix = fitz.Matrix(
-            output_width / page.rect.width,
-            output_height / page.rect.height,
-        )
-        pixmap = page.get_pixmap(matrix=matrix, colorspace=fitz.csRGB, alpha=True)
-        png = pixmap.tobytes("png")
-
-        from PIL import Image as PILImage
-
-        image = PILImage.open(io.BytesIO(png)).convert("RGBA")
+    def rasterize(source: str):
+        doc = fitz.open(stream=source.encode("utf-8"), filetype="svg")
+        try:
+            if len(doc) != 1:
+                raise ValueError(f"expected one SVG page, found {len(doc)}")
+            page = doc[0]
+            if page.rect.width <= 0 or page.rect.height <= 0:
+                raise ValueError(f"SVG has invalid dimensions: {page.rect}")
+            matrix = fitz.Matrix(
+                output_width / page.rect.width,
+                output_height / page.rect.height,
+            )
+            pixmap = page.get_pixmap(matrix=matrix, colorspace=fitz.csRGB, alpha=True)
+        finally:
+            doc.close()
+        image = PILImage.open(io.BytesIO(pixmap.tobytes("png"))).convert("RGBA")
         if image.size != (output_width, output_height):
             image = image.resize((output_width, output_height), PILImage.Resampling.LANCZOS)
+        return image
 
-        if background_color is not None:
+    try:
+        highlights = _DARKEN_ELEMENT.findall(svg)
+        image = rasterize(_DARKEN_ELEMENT.sub("", svg) if highlights else svg)
+        highlight = None
+        if highlights:
+            close = svg.rindex("</svg>")
+            body_start = svg.index(">", svg.index("<svg")) + 1
+            highlight = rasterize(svg[:body_start] + "".join(highlights) + svg[close:])
+
+        opaque = backdrop is not None
+        if backdrop is None and background_color is not None:
             red, green, blue, alpha = _parse_hex_color(background_color)
-            background = PILImage.new("RGBA", image.size, (red, green, blue, alpha))
-            image = PILImage.alpha_composite(background, image)
-            if alpha == 255:
+            backdrop = PILImage.new("RGBA", image.size, (red, green, blue, alpha))
+            opaque = alpha == 255
+        if backdrop is not None:
+            backdrop = backdrop.convert("RGBA")
+            if backdrop.size != image.size:
+                backdrop = backdrop.resize(image.size, PILImage.Resampling.LANCZOS)
+            if highlight is not None:
+                white = PILImage.new("RGBA", image.size, (255, 255, 255, 255))
+                ink = PILImage.alpha_composite(white, highlight).convert("RGB")
+                darkened = ImageChops.darker(backdrop.convert("RGB"), ink).convert("RGBA")
+                darkened.putalpha(backdrop.getchannel("A"))
+                backdrop = darkened
+            image = PILImage.alpha_composite(backdrop, image)
+            if opaque:
                 image = image.convert("RGB")
+        elif highlight is not None:
+            image = PILImage.alpha_composite(highlight, image)
 
         output = io.BytesIO()
         image.save(output, format="PNG")
@@ -1665,9 +1706,6 @@ def _svg_string_to_png(
             exc,
         )
         return None
-    finally:
-        if doc is not None:
-            doc.close()
 
 
 def _extend_to_ink(paper_h: float, coords: list) -> float:
@@ -2531,6 +2569,7 @@ def render_merged_page_from_extracted_document(
                 out_w,
                 out_h,
                 None,
+                backdrop=PILImage.open(io.BytesIO(pdf_png)),
             )
             if ann_png_bytes is None:
                 raise RuntimeError("PyMuPDF could not rasterize the annotation SVG")
@@ -2549,10 +2588,10 @@ def render_merged_page_from_extracted_document(
         pdf_img = PILImage.open(io.BytesIO(pdf_png)).convert("RGBA")
 
         if ann_png_bytes:
-            ann_img = PILImage.open(io.BytesIO(ann_png_bytes)).convert("RGBA")
-            if ann_img.size != pdf_img.size:
-                ann_img = ann_img.resize(pdf_img.size, PILImage.LANCZOS)
-            composite = PILImage.alpha_composite(pdf_img, ann_img)
+            # The annotation layer was drawn over the PDF page (its backdrop).
+            composite = PILImage.open(io.BytesIO(ann_png_bytes)).convert("RGBA")
+            if composite.size != pdf_img.size:
+                composite = composite.resize(pdf_img.size, PILImage.LANCZOS)
             merged_note = None
         else:
             composite = pdf_img
