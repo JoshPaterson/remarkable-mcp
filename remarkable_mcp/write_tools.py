@@ -2954,7 +2954,9 @@ def register_write_tools():
                   region: the path is scaled to fit the region (aspect kept, at
                   its top-left), e.g. "M 0 10 L 5 0 L 10 10" in a small region
                   is a caret. Options: width (stays in points), fill (a color),
-                  opacity
+                  opacity. Several subpaths (each starting with M) share one
+                  style; for drawings with several colors or text, or output
+                  from other tools, use graphic.
                 - latex: LaTeX math, e.g. "\\frac{a}{b} = \\sqrt{2}"; at, or
                   region to scale into; option size (default 12)
                 - graphic: content rendered elsewhere: SVG markup, or base64 PDF
