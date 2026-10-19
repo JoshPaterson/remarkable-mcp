@@ -78,15 +78,17 @@ COLORS = {
         "magenta": "#FF00FF",
     }.items()
 }
-# Highlighter colors from the tablet's PDF export, drawn with the Darken
-# blend: on white paper they show their color, and text under them stays
-# dark.
+# Highlighter colors, drawn with the Darken blend: on white paper they show
+# their color, and text under them stays dark. Blue, orange and gray are the
+# tablet's PDF export values, which the tablet also shows as its own
+# highlighters; the others were matched by eye on a Paper Pro, since the
+# export values look different on its screen.
 HIGHLIGHT_COLORS = {
     name: _rgb(value)
     for name, value in {
         "yellow": "#FEFD60",
         "blue": "#BEEAFE",
-        "pink": "#FF55CF",
+        "pink": "#F29BFF",
         "orange": "#FFC38C",
         "green": "#A9FA5C",
         "gray": "#BFBFBF",
