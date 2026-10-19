@@ -274,7 +274,7 @@ and sync to all your devices:
 - `remarkable_tag(document, add, remove, rename, page)` - Add, rename or remove
   document or page tags
 - `remarkable_mark_pdf(document, add, remove, clear, color, dry_run, layout)` - Add
-  or remove marks (grades, notes, check marks, shapes, SVG, images) drawn into a
+  or remove marks (grades, notes, shapes, LaTeX equations, graphics) drawn into a
   PDF's pages under the user's ink; each mark has an id for later removal
 - `remarkable_delete(document)` - Delete a document/folder (destructive)
 

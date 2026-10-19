@@ -1,14 +1,16 @@
-"""Marks (grades, notes, shapes, SVG, images) drawn into a document's PDF.
+"""Marks (grades, notes, shapes, equations, graphics) drawn into a document's PDF.
 
 The tablet never changes a document's PDF; ink lives in separate ``.rm``
 files tied to page ids. Replacing the PDF with a copy of the same page count
 and page sizes therefore keeps the user's ink in place, and anything drawn
 into that copy appears under the ink.
 
-A marked PDF carries two embedded files: the original PDF and the list of
-marks. Every change rebuilds the PDF from the original plus the current
-marks, so a removed mark leaves nothing behind, and removing every mark
-restores the original bytes exactly.
+Each mark is rendered once, when it is added, into a one-page PDF snippet the
+size of its box on the page. A marked PDF carries two embedded files: the
+original PDF and the list of marks with their snippets. Every change rebuilds
+the PDF by placing the remaining snippets on the original, so a removed mark
+leaves nothing behind, removing every mark restores the original bytes
+exactly, and a mark looks the same however often the PDF is rebuilt.
 
 Mark coordinates are fractions of the page (0-1 from the top-left), the frame
 ``remarkable_image`` renders and its ``region`` uses. Marks are stored by PDF
@@ -18,17 +20,20 @@ page index, which stays stable when pages are added or moved on the tablet.
 import base64
 import binascii
 import json
+import math
 import re
 import xml.etree.ElementTree as ET
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import pymupdf
 
 BASE_FILE = "remarkable-mcp-original.pdf"
 MARKS_FILE = "remarkable-mcp-marks.json"
-MARKS_FORMAT = 1
+MARKS_FORMAT = 2
 
-KINDS = ("text", "check", "cross", "circle", "line", "underline", "svg", "image")
+KINDS = ("text", "shape", "latex", "graphic", "graphic_file")
+SHAPES = ("check", "cross", "circle", "box", "line", "arrow")
 COLORS = {
     "red": (0.85, 0.0, 0.0),
     "black": (0.0, 0.0, 0.0),
@@ -39,10 +44,14 @@ COLORS = {
     "gray": (0.45, 0.45, 0.45),
 }
 DEFAULT_TEXT_SIZE = 11.0
+DEFAULT_LATEX_SIZE = 12.0
 DEFAULT_SYMBOL_SIZE = 12.0
 DEFAULT_LINE_WIDTH = 1.5
+LINE_SPACING = 1.2
 MAX_SVG_CHARS = 1_000_000
-MAX_IMAGE_BYTES = 2 * 1024 * 1024
+MAX_GRAPHIC_BYTES = 2 * 1024 * 1024
+MAX_GRAPHIC_FILE_BYTES = 10 * 1024 * 1024
+MAX_SNIPPET_BYTES = 4 * 1024 * 1024
 _ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}$")
 _URL_PATTERN = re.compile(r"url\(\s*['\"]?([^'\")\s]*)", re.IGNORECASE)
 
@@ -68,15 +77,23 @@ def load_state(pdf_bytes: bytes) -> Tuple[bytes, List[Dict[str, Any]]]:
     marks = data.get("marks") if isinstance(data, dict) else None
     if not isinstance(marks, list):
         raise MarkError("The PDF's mark list is unreadable.")
+    if data.get("format") != MARKS_FORMAT:
+        raise MarkError(
+            "The PDF's marks were made by an older version of this tool; "
+            "clear them (clear=True) and add them again."
+        )
     return base, marks
 
 
 def original_pdf(pdf_bytes: bytes) -> bytes:
     """The PDF before any marks: ``pdf_bytes`` itself when it has none."""
     try:
-        return load_state(pdf_bytes)[0]
+        with pymupdf.open(stream=pdf_bytes, filetype="pdf") as doc:
+            if BASE_FILE in doc.embfile_names():
+                return doc.embfile_get(BASE_FILE)
     except Exception:
-        return pdf_bytes
+        pass
+    return pdf_bytes
 
 
 def stored_marks(pdf_bytes: bytes) -> List[Dict[str, Any]]:
@@ -106,12 +123,12 @@ def text_lines(pdf_bytes: bytes, pdf_page: int) -> List[Dict[str, Any]]:
                     continue
                 x0, y0, x1, y1 = line["bbox"]
                 box = [
-                    round(min(max((x0 - rect.x0) / rect.width, 0.0), 1.0), 3),
-                    round(min(max((y0 - rect.y0) / rect.height, 0.0), 1.0), 3),
-                    round(min(max((x1 - rect.x0) / rect.width, 0.0), 1.0), 3),
-                    round(min(max((y1 - rect.y0) / rect.height, 0.0), 1.0), 3),
+                    (x0 - rect.x0) / rect.width,
+                    (y0 - rect.y0) / rect.height,
+                    (x1 - rect.x0) / rect.width,
+                    (y1 - rect.y0) / rect.height,
                 ]
-                lines.append({"text": text, "box": box})
+                lines.append({"text": text, "box": [_round(min(max(v, 0.0), 1.0)) for v in box]})
     return sorted(lines, key=lambda line: (line["box"][1], line["box"][0]))
 
 
@@ -121,9 +138,9 @@ def page_sizes(pdf_bytes: bytes) -> List[Tuple[float, float]]:
 
 
 def build(base: bytes, marks: Sequence[Dict[str, Any]]) -> bytes:
-    """The PDF with ``marks`` drawn on ``base``; ``base`` itself when none.
+    """The PDF with ``marks`` placed on ``base``; ``base`` itself when none.
 
-    Raises MarkError if drawing would change the page count or a page size,
+    Raises MarkError if placing would change the page count or a page size,
     which would move the tablet's ink relative to the page.
     """
     if not marks:
@@ -135,7 +152,11 @@ def build(base: bytes, marks: Sequence[Dict[str, Any]]) -> bytes:
             index = mark["pdf_page"]
             if not 0 <= index < len(doc):
                 raise MarkError(f"Mark '{mark['id']}' is on a PDF page that does not exist.")
-            _draw(doc[index], mark)
+            page = doc[index]
+            if page.rotation:
+                raise MarkError("Rotated PDF pages are not supported.")
+            with pymupdf.open("pdf", base64.b64decode(mark["pdf"])) as snippet:
+                page.show_pdf_page(_points(page.rect, mark["box"]), snippet, 0)
         doc.embfile_add(BASE_FILE, base, filename=BASE_FILE, desc="PDF before marks")
         payload = json.dumps({"format": MARKS_FORMAT, "marks": list(marks)}, indent=1)
         doc.embfile_add(MARKS_FILE, payload.encode("utf-8"), filename=MARKS_FILE, desc="Marks")
@@ -147,7 +168,11 @@ def build(base: bytes, marks: Sequence[Dict[str, Any]]) -> bytes:
     return result
 
 
-# --- Validating marks -------------------------------------------------------
+# --- Validating requests ----------------------------------------------------
+
+
+def _round(value: float) -> float:
+    return round(value, 4)
 
 
 def _fraction(value: Any, what: str) -> float:
@@ -197,7 +222,17 @@ def color_name(rgb: Sequence[float]) -> str:
     for name, value in COLORS.items():
         if all(abs(a - b) < 1e-6 for a, b in zip(rgb, value)):
             return name
+    return _hex(rgb)
+
+
+def _hex(rgb: Sequence[float]) -> str:
     return "#" + "".join(f"{round(v * 255):02x}" for v in rgb)
+
+
+def default_color(shape: Optional[str] = None) -> List[float]:
+    """The color a mark gets when none is given: check marks are green,
+    everything else red."""
+    return list(COLORS["green" if shape == "check" else "red"])
 
 
 def check_svg(svg: str) -> None:
@@ -237,182 +272,324 @@ def check_svg(svg: str) -> None:
             raise MarkError("SVG stylesheets must not use @import.")
 
 
-def decode_image(data: Any, max_bytes: int) -> bytes:
-    """PNG or JPEG bytes from base64 text (a ``data:`` prefix is accepted)."""
-    if not isinstance(data, str) or not data.strip():
-        raise MarkError("image must be base64-encoded PNG or JPEG data.")
-    text = data.strip()
-    if text.startswith("data:"):
-        text = text.partition(",")[2]
-    try:
-        raw = base64.b64decode("".join(text.split()), validate=True)
-    except (binascii.Error, ValueError):
-        raise MarkError("image is not valid base64.") from None
-    if len(raw) > max_bytes:
-        raise MarkError(f"image is larger than {max_bytes} bytes.")
-    if not (raw.startswith(b"\x89PNG\r\n\x1a\n") or raw.startswith(b"\xff\xd8\xff")):
-        raise MarkError("image must be PNG or JPEG.")
-    try:
-        pymupdf.Pixmap(raw)
-    except Exception:
-        raise MarkError("image could not be decoded.") from None
-    return raw
-
-
-def kind_color(kind: str) -> List[float]:
-    """The color a mark of ``kind`` gets when none is given: check marks are
-    green, everything else red."""
-    return list(COLORS["green" if kind == "check" else "red"])
-
-
-def normalize_mark(
-    mark: Any, *, default_color: Optional[List[float]], max_image_bytes: int
-) -> Dict[str, Any]:
-    """A validated copy of one requested mark, without ``id`` or page.
-
-    Exactly one kind key (see ``KINDS``) gives the content; the rest are
-    options for that kind. Without its own color a mark takes
-    ``default_color``, or ``kind_color`` when that is None.
-    """
-    if not isinstance(mark, dict):
-        raise MarkError("Each mark must be an object.")
-    kinds = [k for k in KINDS if k in mark]
-    if len(kinds) != 1:
-        raise MarkError(f"Each mark needs exactly one of: {', '.join(KINDS)}.")
-    kind = kinds[0]
-    out: Dict[str, Any] = {"kind": kind}
-    if "color" in mark:
-        out["color"] = parse_color(mark["color"])
-    else:
-        out["color"] = list(default_color) if default_color else kind_color(kind)
-    value = mark[kind]
-
-    if kind == "text":
-        if not isinstance(value, str) or not value.strip():
-            raise MarkError("text must be non-empty.")
-        out["text"] = value
-        out["size"] = _positive(mark.get("size"), "size", DEFAULT_TEXT_SIZE)
-        out["bold"] = bool(mark.get("bold", False))
-        if ("at" in mark) == ("rect" in mark):
-            raise MarkError("A text mark needs either at [x, y] or rect (to wrap).")
-        if "at" in mark:
-            out["at"] = _point(mark["at"], "at")
-        else:
-            out["rect"] = _rect(mark["rect"], "rect")
-    elif kind in ("check", "cross"):
-        out["at"] = _point(value, kind)
-        out["size"] = _positive(mark.get("size"), "size", DEFAULT_SYMBOL_SIZE)
-        out["width"] = _positive(mark.get("width"), "width", DEFAULT_LINE_WIDTH * 1.3)
-    elif kind in ("circle", "line"):
-        if kind == "circle":
-            out["rect"] = _rect(value, kind)
-        else:
-            if not isinstance(value, (list, tuple)) or len(value) != 4:
-                raise MarkError("line must be [x0, y0, x1, y1] page fractions.")
-            out["points"] = [_fraction(v, "line") for v in value]
-        out["width"] = _positive(mark.get("width"), "width", DEFAULT_LINE_WIDTH)
-    elif kind == "underline":
-        if not isinstance(value, (list, tuple)) or len(value) != 3:
-            raise MarkError("underline must be [x0, y, x1] page fractions.")
-        x0, y, x1 = (_fraction(v, "underline") for v in value)
-        if x0 >= x1:
-            raise MarkError("underline must have x0 < x1.")
-        out["points"] = [x0, y, x1, y]
-        out["width"] = _positive(mark.get("width"), "width", DEFAULT_LINE_WIDTH)
-    elif kind == "svg":
-        if not isinstance(value, str):
-            raise MarkError("svg must be SVG markup.")
-        check_svg(value)
-        out["svg"] = value
-        out["rect"] = _rect(mark.get("rect"), "rect")
-        del out["color"]
-    else:
-        raw = decode_image(value, max_image_bytes)
-        out["image"] = base64.b64encode(raw).decode("ascii")
-        out["rect"] = _rect(mark.get("rect"), "rect")
-        del out["color"]
-    if kind in ("svg", "image") and "color" in mark:
-        raise MarkError(f"color does not apply to {kind} marks.")
-    return out
-
-
 def check_id(value: Any) -> str:
     if not isinstance(value, str) or not _ID_PATTERN.match(value):
         raise MarkError("Mark ids must be 1-64 characters: letters, digits, '_', '-', '.', ':'.")
     return value
 
 
-# --- Drawing ------------------------------------------------------------
+# --- Rendering marks into snippets ---------------------------------------
 
 
-def _page_point(page, x: float, y: float):
-    rect = page.rect
-    return pymupdf.Point(rect.x0 + x * rect.width, rect.y0 + y * rect.height)
+def _points(page_rect, box: Sequence[float]):
+    """A page-fraction box as a rect in page points."""
+    return pymupdf.Rect(
+        page_rect.x0 + box[0] * page_rect.width,
+        page_rect.y0 + box[1] * page_rect.height,
+        page_rect.x0 + box[2] * page_rect.width,
+        page_rect.y0 + box[3] * page_rect.height,
+    )
 
 
-def _page_rect(page, box: Sequence[float]):
-    return pymupdf.Rect(_page_point(page, box[0], box[1]), _page_point(page, box[2], box[3]))
+def _snippet(width: float, height: float, draw: Callable[[Any], None]) -> bytes:
+    """A one-page PDF of ``width`` x ``height`` points drawn by ``draw(page)``."""
+    doc = pymupdf.open()
+    try:
+        page = doc.new_page(width=max(width, 0.1), height=max(height, 0.1))
+        draw(page)
+        return doc.tobytes(garbage=3, deflate=True)
+    finally:
+        doc.close()
 
 
-def _draw(page, mark: Dict[str, Any]) -> None:
-    if page.rotation:
-        raise MarkError("Rotated PDF pages are not supported.")
-    kind = mark["kind"]
-    color = tuple(mark.get("color") or (0, 0, 0))
-    if kind == "text":
-        font = "hebo" if mark.get("bold") else "helv"
-        size = mark["size"]
-        if "at" in mark:
-            top_left = _page_point(page, *mark["at"])
-            page.insert_text(
-                top_left + (0, size * 0.8),
-                mark["text"],
-                fontname=font,
-                fontsize=size,
-                color=color,
+class _Page:
+    """Converts between page fractions and points on one PDF page."""
+
+    def __init__(self, width: float, height: float):
+        self.width, self.height = width, height
+
+    def pt(self, x: float, y: float) -> Tuple[float, float]:
+        return x * self.width, y * self.height
+
+    def box(self, x0: float, y0: float, x1: float, y1: float) -> List[float]:
+        """A box in points as page fractions; refuses one that leaves the page."""
+        box = [x0 / self.width, y0 / self.height, x1 / self.width, y1 / self.height]
+        slack = 1e-6
+        if box[0] < -slack or box[1] < -slack or box[2] > 1 + slack or box[3] > 1 + slack:
+            raise MarkError(
+                "The mark runs off the page; move it, or make it smaller "
+                "(a smaller size, or a rect to wrap text in)."
             )
-        else:
-            spare = page.insert_textbox(
-                _page_rect(page, mark["rect"]),
-                mark["text"],
-                fontname=font,
-                fontsize=size,
-                color=color,
+        return [_round(min(max(v, 0.0), 1.0)) for v in box]
+
+
+def _fit(rect: Sequence[float], width: float, height: float, page: _Page) -> List[float]:
+    """The largest box of the given aspect in ``rect``, at its top-left."""
+    x0, y0 = page.pt(rect[0], rect[1])
+    x1, y1 = page.pt(rect[2], rect[3])
+    scale = min((x1 - x0) / width, (y1 - y0) / height)
+    return page.box(x0, y0, x0 + width * scale, y0 + height * scale)
+
+
+def _render_text(request: dict, color: List[float], page: _Page) -> Dict[str, Any]:
+    text = request["text"]
+    if not isinstance(text, str) or not text.strip():
+        raise MarkError("text must be non-empty.")
+    size = _positive(request.get("size"), "size", DEFAULT_TEXT_SIZE)
+    bold = bool(request.get("bold", False))
+    fontname = "hebo" if bold else "helv"
+    if ("at" in request) == ("rect" in request):
+        raise MarkError("A text mark needs either at [x, y] or rect (to wrap within).")
+    out: Dict[str, Any] = {"text": text, "size": size, "bold": bold}
+
+    if "rect" in request:
+        rect = _rect(request["rect"], "rect")
+        x0, y0 = page.pt(rect[0], rect[1])
+        x1, y1 = page.pt(rect[2], rect[3])
+        fits = []
+
+        def draw(snippet):
+            spare = snippet.insert_textbox(
+                snippet.rect, text, fontname=fontname, fontsize=size, color=color
             )
-            if spare < 0:
-                raise MarkError(
-                    f"Text of mark '{mark['id']}' does not fit its rect; "
-                    "make the rect larger or the size smaller."
-                )
-    elif kind in ("check", "cross"):
-        c = _page_point(page, *mark["at"])
-        s = mark["size"] / 2
-        if kind == "check":
-            pts = [c + (-s, 0), c + (-s * 0.3, s * 0.7), c + (s, -s * 0.9)]
-            page.draw_polyline(pts, color=color, width=mark["width"])
-        else:
-            page.draw_line(c + (-s, -s), c + (s, s), color=color, width=mark["width"])
-            page.draw_line(c + (-s, s), c + (s, -s), color=color, width=mark["width"])
-    elif kind == "circle":
-        page.draw_oval(_page_rect(page, mark["rect"]), color=color, width=mark["width"])
-    elif kind in ("line", "underline"):
-        x0, y0, x1, y1 = mark["points"]
-        page.draw_line(
-            _page_point(page, x0, y0),
-            _page_point(page, x1, y1),
-            color=color,
-            width=mark["width"],
+            fits.append(spare >= 0)
+
+        pdf = _snippet(x1 - x0, y1 - y0, draw)
+        if not fits[0]:
+            raise MarkError("The text does not fit its rect; make the rect larger or size smaller.")
+        return dict(out, box=page.box(x0, y0, x1, y1), pdf=pdf)
+
+    at = _point(request["at"], "at")
+    font = pymupdf.Font(fontname)
+    lines = text.split("\n")
+    ascent, descent = font.ascender * size, -font.descender * size
+    width = max(font.text_length(line, fontsize=size) for line in lines)
+    height = ascent + descent + (len(lines) - 1) * size * LINE_SPACING
+
+    def draw(snippet):
+        for i, line in enumerate(lines):
+            baseline = ascent + i * size * LINE_SPACING
+            snippet.insert_text((0, baseline), line, fontname=fontname, fontsize=size, color=color)
+
+    x0, y0 = page.pt(*at)
+    return dict(
+        out, box=page.box(x0, y0, x0 + width, y0 + height), pdf=_snippet(width, height, draw)
+    )
+
+
+def _render_shape(request: dict, color: List[float], page: _Page) -> Dict[str, Any]:
+    shape = request["shape"]
+    if shape not in SHAPES:
+        raise MarkError(f"shape must be one of: {', '.join(SHAPES)}.")
+    out: Dict[str, Any] = {"shape": shape}
+
+    if shape in ("check", "cross"):
+        size = _positive(request.get("size"), "size", DEFAULT_SYMBOL_SIZE)
+        width = _positive(request.get("width"), "width", DEFAULT_LINE_WIDTH * 1.3)
+        cx, cy = page.pt(*_point(request.get("at"), "at"))
+        half = size / 2 + width
+        s = size / 2
+
+        def draw(snippet):
+            c = pymupdf.Point(half, half)
+            if shape == "check":
+                pts = [c + (-s, 0), c + (-s * 0.3, s * 0.7), c + (s, -s * 0.9)]
+                snippet.draw_polyline(pts, color=color, width=width)
+            else:
+                snippet.draw_line(c + (-s, -s), c + (s, s), color=color, width=width)
+                snippet.draw_line(c + (-s, s), c + (s, -s), color=color, width=width)
+
+        box = page.box(cx - half, cy - half, cx + half, cy + half)
+        return dict(out, size=size, box=box, pdf=_snippet(2 * half, 2 * half, draw))
+
+    width = _positive(request.get("width"), "width", DEFAULT_LINE_WIDTH)
+    if shape in ("circle", "box"):
+        rect = _rect(request.get("rect"), "rect")
+        x0, y0 = page.pt(rect[0], rect[1])
+        x1, y1 = page.pt(rect[2], rect[3])
+        w, h = x1 - x0 + width, y1 - y0 + width
+
+        def draw(snippet):
+            inner = pymupdf.Rect(width / 2, width / 2, w - width / 2, h - width / 2)
+            if shape == "circle":
+                snippet.draw_oval(inner, color=color, width=width)
+            else:
+                snippet.draw_rect(inner, color=color, width=width)
+
+        box = page.box(x0 - width / 2, y0 - width / 2, x1 + width / 2, y1 + width / 2)
+        return dict(out, box=box, pdf=_snippet(w, h, draw))
+
+    ax, ay = page.pt(*_point(request.get("from"), "from"))
+    bx, by = page.pt(*_point(request.get("to"), "to"))
+    if (ax, ay) == (bx, by):
+        raise MarkError("from and to must be different points.")
+    head = max(6.0, width * 4) if shape == "arrow" else 0.0
+    pad = width + head
+    left, top = min(ax, bx) - pad, min(ay, by) - pad
+    right, bottom = max(ax, bx) + pad, max(ay, by) + pad
+
+    def draw(snippet):
+        a = pymupdf.Point(ax - left, ay - top)
+        b = pymupdf.Point(bx - left, by - top)
+        snippet.draw_line(a, b, color=color, width=width)
+        if shape == "arrow":
+            angle = math.atan2(b.y - a.y, b.x - a.x)
+            for side in (-1, 1):
+                theta = angle + math.pi - side * math.radians(25)
+                tip = b + (head * math.cos(theta), head * math.sin(theta))
+                snippet.draw_line(b, tip, color=color, width=width)
+
+    box = _clamped_box(page, left, top, right, bottom)
+    return dict(out, box=box, pdf=_snippet(right - left, bottom - top, draw))
+
+
+def _clamped_box(page: _Page, x0: float, y0: float, x1: float, y1: float) -> List[float]:
+    """A box that may reach past the page edge only by its padding.
+
+    Lines and arrows are padded for their width and head; a line drawn along
+    the edge of the page keeps its full box so nothing is distorted.
+    """
+    box = [x0 / page.width, y0 / page.height, x1 / page.width, y1 / page.height]
+    return [_round(v) for v in box]
+
+
+def _render_latex(request: dict, color: List[float], page: _Page) -> Dict[str, Any]:
+    import ziamath
+
+    source = request["latex"]
+    if not isinstance(source, str) or not source.strip():
+        raise MarkError("latex must be non-empty.")
+    size = _positive(request.get("size"), "size", DEFAULT_LATEX_SIZE)
+    if ("at" in request) == ("rect" in request):
+        raise MarkError("A latex mark needs either at [x, y] or rect (to scale into).")
+    # SVG 1.1 output writes glyphs as plain paths; MuPDF misplaces the
+    # <symbol>/<use> references of SVG 2 output.
+    ziamath.config.svg2 = False
+    try:
+        svg = ziamath.Latex(source, size=size, color=_hex(color)).svg()
+        with pymupdf.open(stream=svg.encode("utf-8"), filetype="svg") as doc:
+            pdf = doc.convert_to_pdf()
+    except Exception as e:
+        raise MarkError(f"The LaTeX could not be rendered: {e}") from None
+    with pymupdf.open("pdf", pdf) as doc:
+        width, height = doc[0].rect.width, doc[0].rect.height
+    out: Dict[str, Any] = {"latex": source, "size": size, "pdf": pdf}
+    if "rect" in request:
+        return dict(out, box=_fit(_rect(request["rect"], "rect"), width, height, page))
+    x0, y0 = page.pt(*_point(request["at"], "at"))
+    return dict(out, box=page.box(x0, y0, x0 + width, y0 + height))
+
+
+def _graphic_bytes(request: dict) -> bytes:
+    if "graphic_file" in request:
+        value = request["graphic_file"]
+        if not isinstance(value, str) or not value.strip():
+            raise MarkError("graphic_file must be a file path.")
+        path = Path(value).expanduser()
+        if not path.is_file():
+            raise MarkError(f"graphic_file not found: {value}")
+        if path.stat().st_size > MAX_GRAPHIC_FILE_BYTES:
+            raise MarkError(f"graphic_file is larger than {MAX_GRAPHIC_FILE_BYTES} bytes.")
+        return path.read_bytes()
+    value = request["graphic"]
+    if not isinstance(value, str) or not value.strip():
+        raise MarkError("graphic must be SVG markup or base64 PDF, PNG or JPEG data.")
+    text = value.strip()
+    if text.startswith("<"):
+        return text.encode("utf-8")
+    if text.startswith("data:"):
+        text = text.partition(",")[2]
+    try:
+        raw = base64.b64decode("".join(text.split()), validate=True)
+    except (binascii.Error, ValueError):
+        raise MarkError("graphic is neither SVG markup nor valid base64.") from None
+    if len(raw) > MAX_GRAPHIC_BYTES:
+        raise MarkError(
+            f"graphic is larger than {MAX_GRAPHIC_BYTES} bytes; pass a graphic_file instead."
         )
-    elif kind == "svg":
-        try:
-            with pymupdf.open(stream=mark["svg"].encode("utf-8"), filetype="svg") as svg:
-                pdf = pymupdf.open("pdf", svg.convert_to_pdf())
-        except Exception as e:
-            raise MarkError(f"SVG of mark '{mark['id']}' could not be drawn: {e}") from None
-        with pdf:
-            page.show_pdf_page(_page_rect(page, mark["rect"]), pdf, 0)
-    elif kind == "image":
-        page.insert_image(_page_rect(page, mark["rect"]), stream=base64.b64decode(mark["image"]))
+    return raw
+
+
+def _render_graphic(request: dict, page: _Page) -> Dict[str, Any]:
+    """A graphic rendered elsewhere: SVG, a one-page PDF, PNG or JPEG."""
+    raw = _graphic_bytes(request)
+    try:
+        if raw.startswith(b"%PDF"):
+            fmt = "pdf"
+            with pymupdf.open(stream=raw, filetype="pdf") as src:
+                if len(src) != 1:
+                    raise MarkError("A graphic PDF must have exactly one page.")
+                doc = pymupdf.open()
+                doc.insert_pdf(src)
+                pdf = doc.tobytes(garbage=3, deflate=True)
+                doc.close()
+        elif raw.startswith(b"\x89PNG\r\n\x1a\n") or raw.startswith(b"\xff\xd8\xff"):
+            fmt = "png" if raw.startswith(b"\x89PNG") else "jpeg"
+            pixmap = pymupdf.Pixmap(raw)
+
+            def draw(snippet):
+                snippet.insert_image(snippet.rect, stream=raw)
+
+            pdf = _snippet(pixmap.width, pixmap.height, draw)
+        else:
+            try:
+                svg = raw.decode("utf-8-sig")
+            except UnicodeDecodeError:
+                raise MarkError("graphic must be SVG, PDF, PNG or JPEG.") from None
+            if not svg.lstrip().startswith("<"):
+                raise MarkError("graphic must be SVG, PDF, PNG or JPEG.")
+            fmt = "svg"
+            check_svg(svg.lstrip())
+            with pymupdf.open(stream=svg.lstrip().encode("utf-8"), filetype="svg") as doc:
+                pdf = doc.convert_to_pdf()
+    except MarkError:
+        raise
+    except Exception as e:
+        raise MarkError(f"The graphic could not be read: {e}") from None
+    with pymupdf.open("pdf", pdf) as doc:
+        width, height = doc[0].rect.width, doc[0].rect.height
+    box = _fit(_rect(request.get("rect"), "rect"), width, height, page)
+    return {"format": fmt, "box": box, "pdf": pdf}
+
+
+def render_mark(
+    request: Any, page_size: Tuple[float, float], color: Optional[List[float]]
+) -> Dict[str, Any]:
+    """Render one requested mark (without ``id`` or ``page``) on a page of
+    ``page_size`` points.
+
+    Exactly one kind key (see ``KINDS``) gives the content; the rest are its
+    options. Without its own color a mark takes ``color``, or
+    ``default_color`` when that is None. Returns the stored form: the kind,
+    the options needed to describe it, its ``box`` in page fractions and its
+    PDF snippet (base64).
+    """
+    if not isinstance(request, dict):
+        raise MarkError("Each mark must be an object.")
+    kinds = [k for k in KINDS if k in request]
+    if len(kinds) != 1:
+        raise MarkError(
+            "Each mark needs exactly one of: text, shape, latex, graphic, graphic_file."
+        )
+    kind = "graphic" if kinds[0] == "graphic_file" else kinds[0]
+    page = _Page(*page_size)
+
+    if kind == "graphic":
+        if "color" in request:
+            raise MarkError("color does not apply to graphic marks.")
+        stored = _render_graphic(request, page)
+    else:
+        if "color" in request:
+            rgb = parse_color(request["color"])
+        else:
+            rgb = color or default_color(request.get("shape"))
+        render = {"text": _render_text, "shape": _render_shape, "latex": _render_latex}[kind]
+        stored = render(request, rgb, page)
+        stored["color"] = rgb
+    if len(stored["pdf"]) > MAX_SNIPPET_BYTES:
+        raise MarkError(f"The rendered mark is larger than {MAX_SNIPPET_BYTES} bytes.")
+    stored["pdf"] = base64.b64encode(stored["pdf"]).decode("ascii")
+    return {"kind": kind, **stored}
 
 
 # --- Editing the mark list ----------------------------------------------
@@ -421,13 +598,12 @@ def _draw(page, mark: Dict[str, Any]) -> None:
 def summarize(mark: Dict[str, Any], page: Optional[int]) -> Dict[str, Any]:
     """A short description of a stored mark for tool responses."""
     out: Dict[str, Any] = {"id": mark["id"], "page": page, "kind": mark["kind"]}
-    if mark.get("color"):
-        out["color"] = color_name(mark["color"])
-    if mark["kind"] == "text":
-        out["text"] = mark["text"]
-    for key in ("at", "rect", "points"):
+    for key in ("shape", "text", "latex", "format"):
         if key in mark:
             out[key] = mark[key]
+    if mark.get("color"):
+        out["color"] = color_name(mark["color"])
+    out["box"] = mark["box"]
     return out
 
 
@@ -438,14 +614,15 @@ def edit_marks(
     remove: Sequence[str],
     clear: bool,
     page_map: Sequence[Optional[int]],
-    default_color: Optional[List[float]],
-    max_image_bytes: int,
+    sizes: Sequence[Tuple[float, float]],
+    color: Optional[List[float]],
 ) -> Dict[str, Any]:
     """Apply removals, then additions, to a copy of ``marks``.
 
     ``page_map`` maps each tablet page (1-based position) to its PDF page
-    index (``None`` for pages added on the tablet). Each added mark needs a
-    ``page`` and may give an ``id``; generated ids are ``mark-N``.
+    index (``None`` for pages added on the tablet); ``sizes`` are the PDF's
+    page sizes in points. Each added mark needs a ``page`` and may give an
+    ``id``; generated ids are ``mark-N``.
 
     Returns ``{"marks", "added", "removed", "notes", "changed"}``.
     """
@@ -489,9 +666,10 @@ def edit_marks(
                 counter += 1
             mark_id = f"mark-{counter}"
         options = {k: v for k, v in request.items() if k not in ("id", "page")}
-        stored = normalize_mark(
-            options, default_color=default_color, max_image_bytes=max_image_bytes
-        )
+        try:
+            stored = render_mark(options, sizes[pdf_page], color)
+        except MarkError as e:
+            raise MarkError(f"Mark '{mark_id}': {e}") from None
         result.append({"id": mark_id, "pdf_page": pdf_page, **stored})
         taken.add(mark_id)
         added.append(mark_id)

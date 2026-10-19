@@ -2606,10 +2606,12 @@ def _mark_summaries(marks: list, archive: bytes) -> list:
 
 def _mark_line(summary: dict) -> str:
     where = f"page {summary['page']}" if summary["page"] else "page no longer shown"
-    details = ", ".join(v for v in (where, summary.get("color"), summary["kind"]) if v)
+    kind = summary.get("shape") or summary["kind"]
+    details = ", ".join(v for v in (where, summary.get("color"), kind) if v)
     line = f"{summary['id']} ({details})"
-    if summary.get("text"):
-        line += f": {summary['text']}"
+    content = summary.get("text") or summary.get("latex")
+    if content:
+        line += f": {content}"
     return line
 
 

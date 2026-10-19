@@ -31,6 +31,7 @@ dependencies = [
     "markdown-it-py>=4.2.0",
     "pymupdf-fonts>=1.0.5",
     "send2trash>=1.8.3",
+    "ziamath>=0.13",
 ]
 
 [project.optional-dependencies]

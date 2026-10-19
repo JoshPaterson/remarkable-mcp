@@ -1296,7 +1296,7 @@ def _mark_editor(add: list, remove: list, clear: bool, color: Optional[str], bui
     from remarkable_mcp import pdf_marks
     from remarkable_mcp.pages import pdf_page_map
 
-    default_color = pdf_marks.parse_color(color) if color else None
+    rgb = pdf_marks.parse_color(color) if color else None
 
     def edit(pdf: bytes, content: dict) -> dict:
         base, marks = pdf_marks.load_state(pdf)
@@ -1307,8 +1307,8 @@ def _mark_editor(add: list, remove: list, clear: bool, color: Optional[str], bui
             remove=remove,
             clear=clear,
             page_map=page_map,
-            default_color=default_color,
-            max_image_bytes=pdf_marks.MAX_IMAGE_BYTES,
+            sizes=pdf_marks.page_sizes(base),
+            color=rgb,
         )
         touched = {m["pdf_page"] for m in marks if m["id"] in result["removed"]}
         touched |= {m["pdf_page"] for m in result["marks"] if m["id"] in result["added"]}
@@ -2918,7 +2918,7 @@ def register_write_tools():
             ):
                 """
                 <usecase>Add or remove marks (grades, notes, check marks, shapes,
-                SVG drawings, images) on the pages of a PDF document, for example
+                equations, graphics) on the pages of a PDF document, for example
                 to grade a worksheet the user filled in on the tablet.</usecase>
                 <instructions>
                 Marks are drawn into the document's PDF, under the user's ink,
@@ -2940,16 +2940,21 @@ def register_write_tools():
 
                 Each mark in `add` has a `page` (1-based), an optional `id`, and
                 exactly one of:
-                - text: string, with at [x, y] (top-left of the first line) or
-                  rect [left, top, right, bottom] to wrap within; options size
-                  (points, default 11), bold
-                - check / cross: [x, y] center; options size, width
-                - circle: [left, top, right, bottom]; option width
-                - underline: [x0, y, x1]; line: [x0, y0, x1, y1]; option width
-                - svg: SVG markup, with rect; scaled to fit, aspect kept. External
-                  references are refused; embed images as data: URIs.
-                - image: base64 PNG or JPEG (up to 2 MB), with rect
-                Text and shapes take an optional color (name or #RRGGBB).
+                - text: string; at [x, y] (top-left of the first line, "\n"
+                  starts a new line) or rect [left, top, right, bottom] to wrap
+                  within; options size (points, default 11), bold
+                - shape: "check" or "cross" with at [x, y] (center) and option
+                  size; "circle" or "box" with rect; "line" or "arrow" with from
+                  [x, y] and to [x, y]; option width (line width in points)
+                - latex: LaTeX math, e.g. "\\frac{a}{b} = \\sqrt{2}"; at [x, y]
+                  (top-left) or rect to scale into; option size (default 12)
+                - graphic: content rendered elsewhere: SVG markup, or base64 PDF
+                  (one page), PNG or JPEG (up to 2 MB); with rect, scaled to fit
+                  and kept at the rect's top-left. SVG may only reference its own
+                  elements or data: URIs.
+                - graphic_file: path of such a file on the machine running this
+                  server (up to 10 MB), with rect
+                Text, shapes and latex take an optional color (name or #RRGGBB).
                 Check marks default to green, everything else to red.
 
                 When grading, use green for check marks and for a score with
@@ -2968,9 +2973,9 @@ def register_write_tools():
                 - add: List of marks to add (see above)
                 - remove: Mark id or list of ids to remove
                 - clear: Remove every mark, restoring the original PDF
-                - color: Color for marks that set none (red, black, blue,
-                  green, orange, purple, gray, or #RRGGBB). Default: green
-                  for check marks, red for the rest.
+                - color: Color for text, shapes and latex that set none (red,
+                  black, blue, green, orange, purple, gray, or #RRGGBB).
+                  Default: green for check marks, red for the rest.
                 - dry_run: Return preview images of the changed pages without
                   writing
                 - layout: Tablet page number; the response adds that page's text
@@ -2982,9 +2987,16 @@ def register_write_tools():
                 - remarkable_mark_pdf("Worksheet", add=[
                     {"page": 1, "id": "score", "text": "3/4", "at": [0.8, 0.06],
                      "size": 24, "bold": true},
-                    {"page": 1, "id": "q3", "cross": [0.38, 0.33]},
+                    {"page": 1, "id": "q1", "shape": "check", "at": [0.38, 0.2]},
+                    {"page": 1, "id": "q3", "shape": "cross", "at": [0.38, 0.33]},
                     {"page": 1, "id": "q3-note", "text": "Orange is secondary.",
                      "rect": [0.41, 0.315, 0.75, 0.36], "size": 9}], dry_run=True)
+                - remarkable_mark_pdf("Worksheet", add=[
+                    {"page": 2, "id": "q5-fix",
+                     "latex": "x = \\frac{-b \\pm \\sqrt{b^2-4ac}}{2a}",
+                     "at": [0.45, 0.52]},
+                    {"page": 2, "id": "q5-arrow", "shape": "arrow",
+                     "from": [0.44, 0.53], "to": [0.36, 0.53]}])
                 - remarkable_mark_pdf("Worksheet", remove="q3-note", add=[
                     {"page": 1, "id": "q3-note", "text": "Correct now.",
                      "at": [0.41, 0.32], "color": "green"}])

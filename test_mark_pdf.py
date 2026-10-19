@@ -19,26 +19,32 @@ from remarkable_mcp.server import mcp
 from remarkable_mcp.sync import RemarkableClient, _hash_entries, _serialize_doc_index
 
 DOC_ID = "4e93be85-f688-43ca-8ca2-f0f738301f13"
-RED = pdf_marks.parse_color("red")
+A4 = (595.0, 842.0)
 
 
 def _pdf(pages=2, text="Answer: ____") -> bytes:
     doc = pymupdf.open()
     for _ in range(pages):
-        page = doc.new_page(width=595, height=842)
+        page = doc.new_page(width=A4[0], height=A4[1])
         page.insert_text((100, 200), text, fontsize=12)
     return doc.tobytes()
 
 
-def _png() -> str:
+def _png() -> bytes:
     out = io.BytesIO()
-    Image.new("RGB", (8, 4), (0, 90, 200)).save(out, "PNG")
-    return base64.b64encode(out.getvalue()).decode()
+    Image.new("RGB", (80, 40), (0, 90, 200)).save(out, "PNG")
+    return out.getvalue()
+
+
+def _one_page_pdf() -> bytes:
+    doc = pymupdf.open()
+    doc.new_page(width=200, height=100).draw_rect((10, 10, 190, 90), color=(0, 0, 1))
+    return doc.tobytes()
 
 
 SVG = (
-    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 10 10">'
-    '<path d="M1 5 L9 5" stroke="red"/></svg>'
+    '<svg xmlns="http://www.w3.org/2000/svg" width="100" height="50" viewBox="0 0 100 50">'
+    '<path d="M5 25 L95 25" stroke="red" stroke-width="3"/></svg>'
 )
 
 
@@ -49,32 +55,45 @@ def _edit(marks=(), add=(), remove=(), clear=False, page_map=(0, 1), color=None)
         remove=list(remove),
         clear=clear,
         page_map=list(page_map),
-        default_color=color,
-        max_image_bytes=pdf_marks.MAX_IMAGE_BYTES,
+        sizes=[A4, A4],
+        color=color,
     )
+
+
+def _b64(data: bytes) -> str:
+    return base64.b64encode(data).decode()
 
 
 # --- pdf_marks -------------------------------------------------------------
 
 
-def test_marks_round_trip_and_clear_restores_original():
+def test_marks_round_trip_and_clear_restores_original(tmp_path):
     original = _pdf()
+    png_file = tmp_path / "plot.png"
+    png_file.write_bytes(_png())
     result = _edit(
         add=[
             {"page": 1, "id": "score", "text": "3/4", "at": [0.8, 0.05], "size": 20},
-            {"page": 1, "id": "q1", "check": [0.4, 0.24]},
+            {"page": 1, "id": "q1", "shape": "check", "at": [0.4, 0.24]},
             {"page": 2, "id": "note", "text": "See me", "rect": [0.1, 0.5, 0.6, 0.6]},
-            {"page": 2, "circle": [0.1, 0.1, 0.3, 0.2]},
-            {"page": 2, "svg": SVG, "rect": [0.5, 0.7, 0.7, 0.8]},
-            {"page": 2, "image": _png(), "rect": [0.1, 0.8, 0.2, 0.85]},
+            {"page": 2, "shape": "circle", "rect": [0.1, 0.1, 0.3, 0.2]},
+            {"page": 2, "shape": "arrow", "from": [0.5, 0.3], "to": [0.3, 0.3]},
+            {"page": 2, "latex": r"\frac{a}{b}", "at": [0.6, 0.1]},
+            {"page": 2, "graphic": SVG, "rect": [0.5, 0.7, 0.7, 0.8]},
+            {"page": 2, "graphic": _b64(_png()), "rect": [0.1, 0.8, 0.2, 0.85]},
+            {"page": 2, "graphic": _b64(_one_page_pdf()), "rect": [0.3, 0.8, 0.5, 0.9]},
+            {"page": 2, "graphic_file": str(png_file), "rect": [0.6, 0.9, 0.7, 0.95]},
         ]
     )
-    assert result["added"] == ["score", "q1", "note", "mark-1", "mark-2", "mark-3"]
+    assert result["added"][:3] == ["score", "q1", "note"]
+    assert len(result["added"]) == 10
     marked = pdf_marks.build(original, result["marks"])
 
     base, marks = pdf_marks.load_state(marked)
     assert base == original
     assert [m["id"] for m in marks] == result["added"]
+    assert [m["kind"] for m in marks][-4:] == ["graphic"] * 4
+    assert [m["format"] for m in marks[-4:]] == ["svg", "png", "pdf", "png"]
     assert pdf_marks.page_sizes(marked) == pdf_marks.page_sizes(original)
     with pymupdf.open(stream=marked, filetype="pdf") as doc:
         assert "3/4" in doc[0].get_text()
@@ -86,68 +105,121 @@ def test_marks_round_trip_and_clear_restores_original():
     assert pdf_marks.build(base, cleared["marks"]) == original
 
 
+def test_rebuild_reuses_stored_snippets():
+    original = _pdf()
+    first = _edit(add=[{"page": 1, "id": "a", "text": "keep", "at": [0.1, 0.1]}])
+    base, marks = pdf_marks.load_state(pdf_marks.build(original, first["marks"]))
+    second = _edit(
+        marks, add=[{"page": 1, "id": "b", "shape": "box", "rect": [0.2, 0.2, 0.3, 0.3]}]
+    )
+    assert second["marks"][0]["pdf"] == first["marks"][0]["pdf"]
+
+
+def test_mark_lands_in_its_box():
+    original = _pdf()
+    result = _edit(add=[{"page": 1, "text": "HERE", "at": [0.5, 0.25], "size": 20}])
+    box = result["marks"][0]["box"]
+    assert box[0] == pytest.approx(0.5) and box[1] == pytest.approx(0.25)
+    with pymupdf.open(stream=pdf_marks.build(original, result["marks"]), filetype="pdf") as doc:
+        words = [w for w in doc[0].get_text("words") if w[4] == "HERE"]
+    x0, y0, x1, y1 = words[0][:4]
+    assert x0 == pytest.approx(0.5 * A4[0], abs=1.5)
+    assert y0 == pytest.approx(0.25 * A4[1], abs=3)
+    assert box[2] * A4[0] == pytest.approx(x1, abs=1.5)
+
+
 def test_removed_mark_leaves_nothing_behind():
     original = _pdf()
     first = _edit(
         add=[
-            {"page": 1, "id": "q3", "cross": [0.4, 0.3]},
+            {"page": 1, "id": "q3", "shape": "cross", "at": [0.4, 0.3]},
             {"page": 1, "id": "q3-note", "text": "Orange is secondary", "at": [0.45, 0.3]},
         ]
     )
-    marked = pdf_marks.build(original, first["marks"])
-    base, marks = pdf_marks.load_state(marked)
+    base, marks = pdf_marks.load_state(pdf_marks.build(original, first["marks"]))
     second = _edit(
         marks,
         remove=["q3", "q3-note"],
-        add=[{"page": 1, "id": "q3", "check": [0.4, 0.3]}],
+        add=[{"page": 1, "id": "q3", "shape": "check", "at": [0.4, 0.3]}],
     )
     assert second["removed"] == ["q3", "q3-note"] and second["added"] == ["q3"]
     rebuilt = pdf_marks.build(base, second["marks"])
     with pymupdf.open(stream=rebuilt, filetype="pdf") as doc:
         assert "Orange" not in doc[0].get_text()
-    assert [m["kind"] for m in pdf_marks.load_state(rebuilt)[1]] == ["check"]
+    assert [m["shape"] for m in pdf_marks.load_state(rebuilt)[1]] == ["check"]
 
 
-def test_default_colors_by_kind():
+def test_default_colors():
     result = _edit(
         add=[
-            {"page": 1, "check": [0.1, 0.1]},
-            {"page": 1, "cross": [0.2, 0.1]},
+            {"page": 1, "shape": "check", "at": [0.1, 0.1]},
+            {"page": 1, "shape": "cross", "at": [0.2, 0.1]},
             {"page": 1, "text": "x", "at": [0.3, 0.1]},
+            {"page": 1, "latex": "x^2", "at": [0.5, 0.1]},
             {"page": 1, "text": "4/4", "at": [0.4, 0.1], "color": "green"},
         ]
     )
     colors = [pdf_marks.color_name(m["color"]) for m in result["marks"]]
-    assert colors == ["green", "red", "red", "green"]
-    blue = _edit(add=[{"page": 1, "check": [0.1, 0.1]}], color=pdf_marks.parse_color("blue"))
+    assert colors == ["green", "red", "red", "red", "green"]
+    blue = _edit(
+        add=[{"page": 1, "shape": "check", "at": [0.1, 0.1]}],
+        color=pdf_marks.parse_color("blue"),
+    )
     assert pdf_marks.color_name(blue["marks"][0]["color"]) == "blue"
+
+
+def test_latex_renders_math_as_vectors():
+    result = _edit(
+        add=[{"page": 1, "latex": r"x = \frac{-b \pm \sqrt{b^2-4ac}}{2a}", "at": [0.1, 0.1]}]
+    )
+    mark = result["marks"][0]
+    with pymupdf.open("pdf", base64.b64decode(mark["pdf"])) as snippet:
+        assert snippet[0].get_drawings()
+        assert not snippet[0].get_images()
+    left, top, right, bottom = mark["box"]
+    assert right - left > 0.15 and bottom - top > 0.02
+
+
+def test_graphic_fits_rect_keeping_aspect():
+    result = _edit(add=[{"page": 1, "graphic": SVG, "rect": [0.1, 0.1, 0.9, 0.9]}])
+    left, top, right, bottom = result["marks"][0]["box"]
+    assert (left, top, right) == (0.1, 0.1, 0.9)
+    assert (right - left) * A4[0] / ((bottom - top) * A4[1]) == pytest.approx(2.0, rel=0.01)
 
 
 def test_marks_follow_pdf_pages_not_tablet_positions():
     # Tablet page 2 was added on the tablet; tablet page 3 shows PDF page 1.
-    result = _edit(add=[{"page": 3, "id": "a", "check": [0.5, 0.5]}], page_map=[0, None, 1])
-    mark = result["marks"][0]
-    assert mark["pdf_page"] == 1
+    result = _edit(
+        add=[{"page": 3, "id": "a", "shape": "check", "at": [0.5, 0.5]}], page_map=[0, None, 1]
+    )
+    assert result["marks"][0]["pdf_page"] == 1
     assert pdf_marks.tablet_page(1, [1, 0]) == 1
     with pytest.raises(MarkError, match="added on the tablet"):
-        _edit(add=[{"page": 2, "check": [0.5, 0.5]}], page_map=[0, None, 1])
+        _edit(add=[{"page": 2, "shape": "check", "at": [0.5, 0.5]}], page_map=[0, None, 1])
 
 
 @pytest.mark.parametrize(
     "mark, message",
     [
-        ({"page": 1, "check": [1.2, 0.5]}, "from 0 to 1"),
-        ({"page": 1, "text": "x"}, "at"),
+        ({"page": 1, "shape": "check", "at": [1.2, 0.5]}, "from 0 to 1"),
+        ({"page": 1, "shape": "star", "at": [0.5, 0.5]}, "shape must be one of"),
+        ({"page": 1, "shape": "line", "from": [0.1, 0.1], "to": [0.1, 0.1]}, "different"),
+        ({"page": 1, "shape": "circle", "rect": [0.5, 0.5, 0.4, 0.6]}, "left < right"),
+        ({"page": 1, "text": "x"}, "either"),
         ({"page": 1, "text": "x", "at": [0.1, 0.1], "rect": [0, 0, 1, 1]}, "either"),
-        ({"page": 1, "circle": [0.5, 0.5, 0.4, 0.6]}, "left < right"),
-        ({"page": 1, "check": [0.1, 0.1], "cross": [0.1, 0.1]}, "exactly one"),
-        ({"page": 1, "check": [0.1, 0.1], "color": "chartreuse"}, "Unknown color"),
-        ({"page": 1, "svg": SVG, "rect": [0, 0, 1, 1], "color": "red"}, "does not apply"),
-        ({"page": 1, "image": "not base64!", "rect": [0, 0, 1, 1]}, "base64"),
-        ({"page": 1, "image": base64.b64encode(b"GIF89a").decode(), "rect": [0, 0, 1, 1]}, "PNG"),
-        ({"page": 3, "check": [0.1, 0.1]}, "does not exist"),
-        ({"check": [0.1, 0.1]}, "page number"),
-        ({"page": 1, "id": "bad id!", "check": [0.1, 0.1]}, "Mark ids"),
+        ({"page": 1, "text": "far too long for the edge", "at": [0.95, 0.1]}, "runs off"),
+        ({"page": 1, "text": "long " * 200, "rect": [0.1, 0.1, 0.2, 0.12]}, "does not fit"),
+        ({"page": 1, "text": "x", "latex": "y", "at": [0.1, 0.1]}, "exactly one"),
+        ({"page": 1, "text": "x", "at": [0.1, 0.1], "color": "chartreuse"}, "Unknown color"),
+        ({"page": 1, "graphic": SVG, "rect": [0, 0, 1, 1], "color": "red"}, "does not apply"),
+        ({"page": 1, "graphic": "not base64!", "rect": [0, 0, 1, 1]}, "base64"),
+        ({"page": 1, "graphic": _b64(b"GIF89a...."), "rect": [0, 0, 1, 1]}, "SVG, PDF, PNG"),
+        ({"page": 1, "graphic": _b64(_pdf(2)), "rect": [0, 0, 1, 1]}, "exactly one page"),
+        ({"page": 1, "graphic": SVG}, "rect"),
+        ({"page": 1, "graphic_file": "/nonexistent/plot.svg", "rect": [0, 0, 1, 1]}, "not found"),
+        ({"page": 3, "shape": "check", "at": [0.1, 0.1]}, "does not exist"),
+        ({"shape": "check", "at": [0.1, 0.1]}, "page number"),
+        ({"page": 1, "id": "bad id!", "shape": "check", "at": [0.1, 0.1]}, "Mark ids"),
     ],
 )
 def test_invalid_marks(mark, message):
@@ -155,16 +227,17 @@ def test_invalid_marks(mark, message):
         _edit(add=[mark])
 
 
+def test_graphic_file_must_be_a_graphic(tmp_path):
+    secret = tmp_path / "notes.txt"
+    secret.write_text("private")
+    with pytest.raises(MarkError, match="SVG, PDF, PNG or JPEG"):
+        _edit(add=[{"page": 1, "graphic_file": str(secret), "rect": [0, 0, 1, 1]}])
+
+
 def test_duplicate_id_needs_removal_first():
-    first = _edit(add=[{"page": 1, "id": "q1", "check": [0.1, 0.1]}])
+    first = _edit(add=[{"page": 1, "id": "q1", "shape": "check", "at": [0.1, 0.1]}])
     with pytest.raises(MarkError, match="already used"):
-        _edit(first["marks"], add=[{"page": 1, "id": "q1", "cross": [0.1, 0.1]}])
-
-
-def test_text_that_does_not_fit_is_refused():
-    result = _edit(add=[{"page": 1, "text": "long " * 200, "rect": [0.1, 0.1, 0.2, 0.12]}])
-    with pytest.raises(MarkError, match="does not fit"):
-        pdf_marks.build(_pdf(), result["marks"])
+        _edit(first["marks"], add=[{"page": 1, "id": "q1", "shape": "cross", "at": [0.1, 0.1]}])
 
 
 @pytest.mark.parametrize(
@@ -197,6 +270,17 @@ def test_unmarked_pdf_has_no_marks():
     assert pdf_marks.load_state(original) == (original, [])
     assert pdf_marks.stored_marks(b"not a pdf") == []
     assert pdf_marks.original_pdf(b"not a pdf") == b"not a pdf"
+
+
+def test_older_mark_format_must_be_cleared():
+    original = _pdf()
+    doc = pymupdf.open(stream=original, filetype="pdf")
+    doc.embfile_add(pdf_marks.BASE_FILE, original)
+    doc.embfile_add(pdf_marks.MARKS_FILE, json.dumps({"format": 1, "marks": []}).encode())
+    old = doc.tobytes()
+    with pytest.raises(MarkError, match="older version"):
+        pdf_marks.load_state(old)
+    assert pdf_marks.original_pdf(old) == original
 
 
 def test_text_lines_are_page_fractions():
@@ -321,7 +405,7 @@ async def test_cloud_add_remove_and_clear(cloud, original):
     data, _ = await _mark_tool(
         document="Worksheet",
         add=[
-            {"page": 2, "id": "q1", "cross": [0.4, 0.3]},
+            {"page": 2, "id": "q1", "shape": "cross", "at": [0.4, 0.3]},
             {"page": 2, "id": "q1-note", "text": "Check the units", "at": [0.45, 0.3]},
         ],
     )
@@ -349,7 +433,9 @@ async def test_cloud_dry_run_writes_nothing_and_returns_preview(cloud, original)
         "remarkable_mcp.write_tools._mark_preview_images", return_value=["image"]
     ) as preview:
         data, images = await _mark_tool(
-            document="Worksheet", add=[{"page": 1, "check": [0.5, 0.5]}], dry_run=True
+            document="Worksheet",
+            add=[{"page": 1, "shape": "check", "at": [0.5, 0.5]}],
+            dry_run=True,
         )
     assert data["dry_run"] and data["added"] == ["mark-1"]
     assert data["preview_pages"] == [1]
@@ -374,8 +460,8 @@ async def test_cloud_listing_and_layout(cloud):
 @pytest.mark.parametrize(
     "arguments, message",
     [
-        ({"add": [{"page": 1, "check": [2, 0]}]}, "from 0 to 1"),
-        ({"add": [{"page": 1, "check": [0.1, 0.1]}], "layout": 1}, "layout cannot"),
+        ({"add": [{"page": 1, "shape": "check", "at": [2, 0]}]}, "from 0 to 1"),
+        ({"add": [{"page": 1, "shape": "check", "at": [0.1, 0.1]}], "layout": 1}, "layout cannot"),
         ({"layout": 5}, "does not exist"),
     ],
 )
@@ -389,7 +475,9 @@ async def test_cloud_rejects_bad_requests(cloud, arguments, message):
 async def test_cloud_refuses_non_pdf_documents(monkeypatch, cloud):
     notebook = FakeCloud(_pdf(), content={"fileType": "notebook", "pages": ["a"]})
     with patch("remarkable_mcp.write_tools.get_rmapi", return_value=notebook):
-        data, _ = await _mark_tool(document="Worksheet", add=[{"page": 1, "check": [0.1, 0.1]}])
+        data, _ = await _mark_tool(
+            document="Worksheet", add=[{"page": 1, "shape": "check", "at": [0.1, 0.1]}]
+        )
     assert data["_error"]["type"] == "mark_failed"
     assert "not a PDF" in data["_error"]["message"]
     assert notebook.commits == 0
@@ -398,7 +486,7 @@ async def test_cloud_refuses_non_pdf_documents(monkeypatch, cloud):
 def test_archive_without_marks_restores_original_pdf(original):
     from remarkable_mcp.tools import _archive_without_marks
 
-    marks = _edit(add=[{"page": 1, "check": [0.5, 0.5]}])["marks"]
+    marks = _edit(add=[{"page": 1, "shape": "check", "at": [0.5, 0.5]}])["marks"]
     archive = io.BytesIO()
     with zipfile.ZipFile(archive, "w") as zf:
         zf.writestr(f"{DOC_ID}.pdf", pdf_marks.build(original, marks))
