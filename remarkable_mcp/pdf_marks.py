@@ -72,6 +72,7 @@ DEFAULT_SYMBOL_SIZE = 12.0
 DEFAULT_LINE_WIDTH = 1.5
 DEFAULT_HIGHLIGHT_OPACITY = 0.35
 MAX_PATH_CHARS = 20_000
+MAX_DESCRIPTION_CHARS = 200
 _PATH_PATTERN = re.compile(r"^[MmLlHhVvCcSsQqTtAaZz0-9eE+\-.,\s]+$")
 LINE_SPACING = 1.2
 MAX_SVG_CHARS = 1_000_000
@@ -297,6 +298,18 @@ def check_svg(svg: str) -> None:
             check_ref(ref)
         if "@import" in (element.text or "").lower():
             raise MarkError("SVG stylesheets must not use @import.")
+
+
+def _description(value: Any) -> Optional[str]:
+    """A mark's description as one line of plain text, or None."""
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise MarkError("description must be text.")
+    text = " ".join(value.split())
+    if len(text) > MAX_DESCRIPTION_CHARS:
+        raise MarkError(f"description must be at most {MAX_DESCRIPTION_CHARS} characters.")
+    return text or None
 
 
 def check_id(value: Any) -> str:
@@ -783,6 +796,8 @@ def summarize(mark: Dict[str, Any], page: Optional[int]) -> Dict[str, Any]:
         out["from"], out["to"] = mark["from"], mark["to"]
     else:
         out["region"] = mark["box"]
+    if mark.get("description"):
+        out["description"] = mark["description"]
     return out
 
 
@@ -844,12 +859,16 @@ def edit_marks(
             while f"mark-{counter}" in taken:
                 counter += 1
             mark_id = f"mark-{counter}"
-        options = {k: v for k, v in request.items() if k not in ("id", "page")}
+        options = {k: v for k, v in request.items() if k not in ("id", "page", "description")}
         try:
+            description = _description(request.get("description"))
             stored = render_mark(options, sizes[pdf_page], color)
         except MarkError as e:
             raise MarkError(f"Mark '{mark_id}': {e}") from None
-        result.append({"id": mark_id, "pdf_page": pdf_page, **stored})
+        mark = {"id": mark_id, "pdf_page": pdf_page, **stored}
+        if description:
+            mark["description"] = description
+        result.append(mark)
         taken.add(mark_id)
         added.append(mark_id)
 

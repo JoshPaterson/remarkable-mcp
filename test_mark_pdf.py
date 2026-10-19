@@ -665,3 +665,24 @@ def test_path_stretch_and_at_placement():
     left, top, right, bottom = placed["box"]
     assert (right - left) * A4[0] == pytest.approx(20 + DEFAULT_WIDTH, abs=0.1)
     assert (left + right) / 2 == pytest.approx(0.5, abs=1e-3)
+
+
+def test_description_is_stored_and_listed():
+    from remarkable_mcp.tools import _mark_line
+
+    result = _edit(
+        add=[
+            {
+                "page": 1,
+                "id": "q5",
+                "path": "M 0 0 L 10 0 L 5 8 Z",
+                "at": [0.5, 0.5],
+                "description": "gold star:\n  neat, complete working",
+            }
+        ]
+    )
+    summary = pdf_marks.summarize(result["marks"][0], 1)
+    assert summary["description"] == "gold star: neat, complete working"
+    assert _mark_line(summary).endswith("[description: gold star: neat, complete working]")
+    with pytest.raises(MarkError, match="at most 200"):
+        _edit(add=[{"page": 1, "text": "x", "at": [0.1, 0.1], "description": "d" * 201}])

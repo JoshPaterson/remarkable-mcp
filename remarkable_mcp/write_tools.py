@@ -2940,7 +2940,11 @@ def register_write_tools():
                 images of the changed pages without writing anything.
 
                 Name marks after what they mark (e.g. "q3", "q3-note", "intro-hl")
-                so they can be found and replaced later.
+                so they can be found and replaced later. Any mark can take a
+                description (up to 200 characters) saying what it is and why,
+                for later sessions; it is shown when marks are listed and by
+                remarkable_read. Describe path marks, which are otherwise only
+                path data, e.g. "gold star: neat, complete working".
 
                 Each mark in `add` has a `page` (1-based), an optional `id`, and
                 exactly one of:

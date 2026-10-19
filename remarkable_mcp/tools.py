@@ -2612,6 +2612,8 @@ def _mark_line(summary: dict) -> str:
     content = summary.get("text") or summary.get("latex")
     if content:
         line += f": {content}"
+    if summary.get("description"):
+        line += f" [description: {summary['description']}]"
     return line
 
 
