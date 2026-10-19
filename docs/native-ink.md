@@ -74,6 +74,35 @@ the desktop apps too, become worth the extra write path.
 | First `.rm` with an empty text block | Accepted, but the stroke was re-created under the tablet's author |
 | First `.rm` without a text block | Accepted unchanged |
 
+## Cover layers (verified)
+
+A cover layer hides PDF marks on the tablet: white strokes over a mark, on a
+layer below the user's, so showing the layer hides the mark and hiding the
+layer shows it again. The user's ink on the layers above stays visible,
+including writing over a covered mark. Tested on a Paper Pro through the
+cloud (2026-10-19):
+
+- **New layer.** Under the MCP's author number `n` and next counter `c`:
+  `SceneTreeBlock(tree_id=(n, c), node_id=(0, 0), is_update=True,
+  parent_id=(0, 1))`, a `TreeNodeBlock` with `Group(node_id=(n, c),
+  label=LwwValue((n, c+1), name), visible=LwwValue((n, c+2), shown))`, and a
+  `SceneGroupItemBlock(parent_id=(0, 1))` with item `(n, c+3)` whose value is
+  the layer. Insert each after the last existing block of its type; strokes go
+  at the end with the layer as parent.
+- **Bottom of the stack.** Give the group item `left_id=(0, 0)` and
+  `right_id` = the first item of the root's layer sequence. Layers the user
+  adds later go on top; the cover stays at the bottom.
+- **Initial state.** `visible` False creates the layer hidden (marks show).
+- **Covering.** White (color 2) fineliner strokes about 5pt wide, 3.5pt apart,
+  over the mark's box plus 3pt, cover text fully.
+- **Page with no ink.** Create Layer 1 as well (as in step 4 above) and add a
+  `SceneInfo` whose `current_layer` is Layer 1 `(0, 11)`. Without a
+  `SceneInfo` the tablet selected the cover layer, so the user's writing went
+  onto it. On pages with ink, leave `SceneInfo` alone (`current_layer` may be
+  `(0, 0)`; the tablet then selects Layer 1).
+- **Concurrent edit.** A cover layer added while the tablet drew offline
+  merged: both kept.
+
 ## Edge cases
 
 - **Partial erase on the tablet** tombstones the stroke and adds the remaining
