@@ -2941,7 +2941,9 @@ def register_write_tools():
                 images of the changed pages without writing anything.
 
                 Name marks after what they mark (e.g. "q3", "q3-note", "intro-hl")
-                so they can be found and replaced later. Any mark can take a
+                so they can be found and replaced later. Listings give each mark's
+                content, color, position and style (size, bold, anchor, width
+                and so on), so it can be re-created exactly. Any mark can take a
                 description (up to 200 characters) saying what it is and why,
                 for later sessions; it is shown when marks are listed and by
                 remarkable_read. Describe path marks, which are otherwise only

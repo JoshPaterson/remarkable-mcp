@@ -926,10 +926,11 @@ def render_mark(
         }[kind]
         stored = render(request, rgb, page)
         stored["color"] = rgb
+        # The request is kept for listing a mark's style and re-drawing it;
+        # named colors can be re-drawn in another palette (see for_export).
+        stored["request"] = {k: v for k, v in request.items() if k != "color"}
         if isinstance(source, str) and source.strip().lower() in palette:
-            # Named colors can be re-drawn in another palette (see for_export).
             stored["color_name"] = source.strip().lower()
-            stored["request"] = {k: v for k, v in request.items() if k != "color"}
     if len(stored["pdf"]) > MAX_SNIPPET_BYTES:
         raise MarkError(f"The rendered mark is larger than {MAX_SNIPPET_BYTES} bytes.")
     stored["pdf"] = base64.b64encode(stored["pdf"]).decode("ascii")
@@ -937,6 +938,37 @@ def render_mark(
 
 
 # --- Editing the mark list ----------------------------------------------
+
+
+# Options listed as a mark's style, in this order.
+STYLE_KEYS = (
+    "size",
+    "bold",
+    "italic",
+    "underline",
+    "anchor",
+    "at",
+    "width",
+    "opacity",
+    "fill",
+    "stretch",
+)
+
+
+def mark_style(mark: Dict[str, Any]) -> Dict[str, Any]:
+    """The styling options a mark was drawn with.
+
+    Marks keep the request they were drawn from; older marks only kept their
+    size and text styles.
+    """
+    request = mark.get("request") if isinstance(mark.get("request"), dict) else {}
+    style: Dict[str, Any] = {}
+    for key in STYLE_KEYS:
+        if key in request:
+            style[key] = request[key]
+        elif key in ("size", "bold", "italic", "underline") and key in mark:
+            style[key] = mark[key]
+    return {k: v for k, v in style.items() if v is not False}
 
 
 def summarize(mark: Dict[str, Any], page: Optional[int]) -> Dict[str, Any]:
@@ -951,6 +983,9 @@ def summarize(mark: Dict[str, Any], page: Optional[int]) -> Dict[str, Any]:
         out["from"], out["to"] = mark["from"], mark["to"]
     else:
         out["region"] = mark["box"]
+    style = mark_style(mark)
+    if style:
+        out["style"] = style
     if mark.get("description"):
         out["description"] = mark["description"]
     return out

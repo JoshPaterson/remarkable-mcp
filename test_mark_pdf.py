@@ -825,3 +825,46 @@ def test_export_archive_uses_desktop_colors(original):
         strokes = {pdf_marks._hex(d["color"]) for d in doc[0].get_drawings() if d.get("color")}
         assert doc.embfile_count() == 0
     assert strokes == {"#304ae0"}
+
+
+def test_listing_shows_style():
+    from remarkable_mcp.tools import _mark_line
+
+    result = _edit(
+        add=[
+            {
+                "page": 1,
+                "id": "note",
+                "text": "See me",
+                "at": [0.4, 0.3],
+                "anchor": "left",
+                "size": 9,
+                "bold": True,
+                "color": "#123456",
+            },
+            {
+                "page": 1,
+                "id": "arrow",
+                "shape": "arrow",
+                "from": [0.5, 0.5],
+                "to": [0.4, 0.5],
+                "width": 2,
+            },
+            {
+                "page": 1,
+                "id": "hl",
+                "shape": "highlight",
+                "region": [0.1, 0.1, 0.3, 0.12],
+                "color": "gray",
+            },
+        ]
+    )
+    note, arrow, hl = (pdf_marks.summarize(m, 1) for m in result["marks"])
+    assert note["style"] == {"size": 9, "bold": True, "anchor": "left", "at": [0.4, 0.3]}
+    assert arrow["style"] == {"width": 2}
+    assert hl["style"]["opacity"] == pytest.approx(0.2509804)
+    assert _mark_line(note) == "note (page 1, #123456, text): See me [size 9, bold, anchor left]"
+    # Marks from before requests were stored still show their stored styles.
+    old = dict(result["marks"][0])
+    del old["request"]
+    assert pdf_marks.summarize(old, 1)["style"] == {"size": 9, "bold": True}

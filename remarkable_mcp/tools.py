@@ -2623,6 +2623,13 @@ def _mark_line(summary: dict) -> str:
     content = summary.get("text") or summary.get("latex")
     if content:
         line += f": {content}"
+    style = [
+        key if value is True else f"{key} {value}"
+        for key, value in (summary.get("style") or {}).items()
+        if key != "at"
+    ]
+    if style:
+        line += f" [{', '.join(style)}]"
     if summary.get("description"):
         line += f" [description: {summary['description']}]"
     return line
