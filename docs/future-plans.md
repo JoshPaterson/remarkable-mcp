@@ -37,11 +37,30 @@ desktop app). What is known so far:
 - Pen colors are ids 0, 1, 2, 6, 7 and 10-13; highlighter colors 3, 4, 5, 8,
   and 9 with an ARGB value for blue (`#BEEAFE`) and orange (`#FFC38C`).
 
-Open questions: ink is erasable on the tablet and edited by both sides, so CRDT
-ids must not collide with the tablet's (the cloud copy test reused tablet
-bytes; generated strokes have not been synced through the cloud yet); the tool
-needs a record of which strokes it added so it can remove them; text and LaTeX
-would stay in the PDF or be drawn as strokes.
+Stroke ids are `(author, counter)`: `author` is a file-local number (one
+byte in ids, 1-255; 0 is structure) mapped to a UUID by the `AuthorIdsBlock`;
+`counter` is a varuint. Findings from cloud tests on a Paper Pro:
+
+- A stroke appended through the cloud under the tablet's own author, with the
+  next counter, synced and appeared, placed exactly as `_page_frame` predicts.
+- **Collision:** while the tablet was offline, it and the cloud each added a
+  stroke with the same id `(1, 18)`. After syncing, each side kept its own
+  stroke and dropped the other's, silently: the tablet and the cloud (and the
+  desktop app) disagreed, with no error. Never write under another device's
+  author.
+- **How a second writer joins:** the desktop app, editing typed text, added
+  itself as author `2` (its own UUID) to the existing `AuthorIdsBlock`, used
+  counter `max over all ids + 1`, and changed only the author, text and
+  page-info blocks; every other block stayed byte-identical. rmscene re-encodes
+  the `AuthorIdsBlock` exactly.
+
+Plan: one random UUID per installation, stored in the config; reuse its
+author number in a file or take the lowest free one; counter = max over all ids
++ 1; replace only the `AuthorIdsBlock` (add the entry) and append strokes,
+copying every other block's bytes. The MCP's strokes are then those with its
+author, so removing them needs no separate record. `remarkable_author` (SSH)
+still writes under the tablet's author and should move to this too. Text and
+LaTeX would stay in the PDF or be drawn as strokes.
 
 ### Export
 
