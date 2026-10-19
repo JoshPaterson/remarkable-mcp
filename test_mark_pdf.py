@@ -4,6 +4,7 @@ import base64
 import hashlib
 import io
 import json
+import math
 import zipfile
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -920,7 +921,7 @@ def test_near_avoids_marks_placed_earlier_in_the_call():
 
 
 def test_leader_line_is_drawn_and_removed_with_its_mark():
-    ink = [[0.0, 0.3, 1.0, 0.6]]
+    ink = [[0.0, 0.4, 1.0, 0.5]]
     result = _near_edit(
         [{"page": 1, "id": "n", "text": "note", "near": [0.5, 0.45], "leader": True}], ink
     )
@@ -962,3 +963,16 @@ def test_near_reports_when_nothing_fits():
 def test_near_needs_obstacles():
     with pytest.raises(MarkError, match="not available"):
         _edit(add=[{"page": 1, "text": "x", "near": [0.5, 0.5]}])
+
+
+def test_leader_does_not_run_across_its_target():
+    # The point is deep inside a wide line of writing: a leader may reach in a
+    # little, but not along the whole line.
+    ink = [[0.1, 0.4, 0.9, 0.45]]
+    result = _near_edit(
+        [{"page": 1, "id": "n", "text": "note", "near": [0.85, 0.425], "leader": True}], ink
+    )
+    leader = result["marks"][0]["leader"]
+    (x0, y0), (x1, y1) = leader["from"], leader["to"]
+    length = math.hypot(x1 - x0, y1 - y0)
+    assert length < 0.2

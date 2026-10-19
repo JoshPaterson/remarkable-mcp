@@ -140,11 +140,13 @@ MAX_DESCRIPTION_CHARS = 200
 # within NEAR_RADIUS of the point. Leader lines are LEADER_WIDTH points wide
 # and stop LEADER_GAP short of the point.
 PAGE_BOUNDS = (0.02, 0.02, 0.98, 0.98)
-CLEARANCE = 0.006
+CLEARANCE = 0.003
 NEAR_RADIUS = 0.4
 NEAR_STEP = 0.004
 LEADER_WIDTH = 0.75
 LEADER_GAP = 0.008
+# How far a leader may run inside the region holding its point.
+LEADER_ENTRY = 0.06
 FREE_GRID = (120, 170)
 _PATH_PATTERN = re.compile(r"^[MmLlHhVvCcSsQqTtAaZz0-9eE+\-.,\s]+$")
 LINE_SPACING = 1.2
@@ -1111,38 +1113,62 @@ def _place_near(
     leader: bool,
 ) -> List[float]:
     """Top-left of the closest ``width`` x ``height`` box to ``near`` that is
-    clear of ``obstacles``; with ``leader``, positions whose leader would
-    cross an obstacle count as much farther away."""
+    clear of ``obstacles``; with ``leader``, also one whose leader line
+    crosses none of them.
+
+    Positions are tried on a grid around the point and flush against the
+    edges of nearby obstacles, so narrow gaps between lines are found.
+    """
     left, top, right, bottom = PAGE_BOUNDS
-    best, best_cost = None, math.inf
     span = int(NEAR_RADIUS / NEAR_STEP)
-    for i in range(-span, span + 1):
-        x0 = near[0] + i * NEAR_STEP - width / 2
-        if x0 < left or x0 + width > right:
+    xs = {near[0] + i * NEAR_STEP - width / 2 for i in range(-span, span + 1)}
+    ys = {near[1] + j * NEAR_STEP - height / 2 for j in range(-span, span + 1)}
+    for o in obstacles:
+        xs |= {o[2] + CLEARANCE + 1e-6, o[0] - CLEARANCE - width - 1e-6}
+        ys |= {o[3] + CLEARANCE + 1e-6, o[1] - CLEARANCE - height - 1e-6}
+    xs = [
+        x for x in xs if left <= x and x + width <= right and abs(x - near[0]) < NEAR_RADIUS + width
+    ]
+    ys = [
+        y
+        for y in ys
+        if top <= y and y + height <= bottom and abs(y - near[1]) < NEAR_RADIUS + height
+    ]
+    # A leader may run LEADER_ENTRY into what it points at (the region
+    # holding the point), not across it.
+    targets = [o for o in obstacles if o[0] <= near[0] <= o[2] and o[1] <= near[1] <= o[3]]
+    crossable = [o for o in obstacles if o not in targets]
+
+    def distance(x0: float, y0: float) -> float:
+        dx = max(x0 - near[0], 0, near[0] - (x0 + width))
+        dy = max(y0 - near[1], 0, near[1] - (y0 + height))
+        return math.hypot(dx, dy)
+
+    candidates = sorted((distance(x, y), x, y) for x in xs for y in ys)
+    for cost, x0, y0 in candidates:
+        if cost > NEAR_RADIUS:
+            break
+        box = (x0, y0, x0 + width, y0 + height)
+        if any(_overlaps(box, o, CLEARANCE) for o in obstacles):
             continue
-        for j in range(-span, span + 1):
-            y0 = near[1] + j * NEAR_STEP - height / 2
-            if y0 < top or y0 + height > bottom:
-                continue
-            box = (x0, y0, x0 + width, y0 + height)
-            dx = max(box[0] - near[0], 0, near[0] - box[2])
-            dy = max(box[1] - near[1], 0, near[1] - box[3])
-            cost = math.hypot(dx, dy)
-            if cost >= best_cost or any(_overlaps(box, o, CLEARANCE) for o in obstacles):
-                continue
-            if leader:
-                ends = _leader_ends(box, near)
-                if ends and any(_segment_hits(ends[0], ends[1], o) for o in obstacles):
-                    cost += 0.5
-                    if cost >= best_cost:
+        if leader:
+            ends = _leader_ends(box, near)
+            if ends:
+                if any(_segment_hits(ends[0], ends[1], o) for o in crossable):
+                    continue
+                (bx, by), (ex, ey) = ends
+                length = math.hypot(ex - bx, ey - by)
+                if length > LEADER_ENTRY:
+                    t = (length - LEADER_ENTRY) / length
+                    outside = (bx + (ex - bx) * t, by + (ey - by) * t)
+                    if any(_segment_hits((bx, by), outside, o) for o in targets):
                         continue
-            best, best_cost = [x0, y0], cost
-    if best is None:
-        raise MarkError(
-            "No free space near that point fits the mark; make it smaller or shorter, "
-            "or place it with at."
-        )
-    return best
+        return [x0, y0]
+    why = " with a leader that crosses no writing" if leader else ""
+    raise MarkError(
+        f"No free space near that point fits the mark{why}; make it smaller or "
+        "shorter, or place it with at."
+    )
 
 
 def _render_near(
