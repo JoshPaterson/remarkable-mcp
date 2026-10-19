@@ -3027,10 +3027,10 @@ def register_write_tools():
                 rounded border (as with "border": true), which needs a little
                 more room, so keep such notes short. Use near (with a leader when
                 the free space is not right beside it) on pages full of writing;
-                give the point of what the
-                mark is about, at its edge (such as the end of an answer) rather
-                than its middle. A leader never crosses writing; if no place
-                fits, the tool says so: shorten the note or make it smaller.
+                give the point of what the mark is about, at its edge (such as
+                the end of an answer) rather than its middle. A leader never
+                crosses writing; if no place fits, the tool says so: shorten the
+                note or make it smaller.
                 Marks placed with `at` take an optional anchor: the point of the
                 mark placed at `at`: top-left, top, top-right, left, center,
                 right, bottom-left, bottom or bottom-right. Default center for
