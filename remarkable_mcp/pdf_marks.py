@@ -599,7 +599,7 @@ def _darken_rect(width: float, height: float, color: List[float], opacity: float
         content = doc.get_new_xref()
         doc.update_object(content, "<<>>")
         r, g, b = color
-        ops = f"q /Hl gs {r:.4f} {g:.4f} {b:.4f} rg 0 0 {width:.4f} {height:.4f} re f Q"
+        ops = f"q /Hl gs {r:.6f} {g:.6f} {b:.6f} rg 0 0 {width:.4f} {height:.4f} re f Q"
         doc.update_stream(content, ops.encode("ascii"))
         doc.xref_set_key(page.xref, "Contents", f"{content} 0 R")
         return doc.tobytes(garbage=3, deflate=True)

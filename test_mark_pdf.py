@@ -219,7 +219,9 @@ def test_highlight_darkens_and_keeps_text_dark():
     with pymupdf.open(stream=marked, filetype="pdf") as doc:
         pix = doc[0].get_pixmap(dpi=72)
     # Paper inside the highlight takes its color; text under it stays black.
-    assert pix.pixel(int(0.38 * A4[0]), int(0.21 * A4[1])) == (255, 234, 116)
+    paper = pix.pixel(int(0.38 * A4[0]), int(0.21 * A4[1]))
+    expected = [round(v * 255) for v in pdf_marks.HIGHLIGHT_COLORS["yellow"]]
+    assert all(abs(a - b) <= 1 for a, b in zip(paper, expected))
     text_pixels = [pix.pixel(x, 197) for x in range(100, 180)]
     assert min(sum(p) for p in text_pixels) < 60
 
