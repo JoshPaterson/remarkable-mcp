@@ -96,6 +96,35 @@ HIGHLIGHT_COLORS = {
         "gray": "#000000",
     }.items()
 }
+# The same named colors as the reMarkable desktop and browser apps (and the
+# tablet's PDF export) draw them. Exports re-draw named-color marks with
+# these, so exported files match those apps; on the tablet's own screen the
+# values above match instead.
+DESKTOP_COLORS = {
+    name: _rgb(value)
+    for name, value in {
+        "black": "#000000",
+        "gray": "#909090",
+        "white": "#FFFFFF",
+        "blue": "#304AE0",
+        "red": "#C23132",
+        "green": "#91DA71",
+        "yellow": "#FAE719",
+        "cyan": "#74D2E8",
+        "magenta": "#C07FD2",
+    }.items()
+}
+DESKTOP_HIGHLIGHT_COLORS = {
+    name: _rgb(value)
+    for name, value in {
+        "yellow": "#FEFD60",
+        "blue": "#BEEAFE",
+        "pink": "#FF55CF",
+        "orange": "#FFC38C",
+        "green": "#A9FA5C",
+        "gray": "#000000",
+    }.items()
+}
 # Highlighter colors drawn translucent, as the export draws them: gray is
 # black at 25% opacity, which is #BFBFBF on white paper and darkens colors
 # under it by a quarter.
@@ -143,6 +172,37 @@ def load_state(pdf_bytes: bytes) -> Tuple[bytes, List[Dict[str, Any]]]:
             "clear them (clear=True) and add them again."
         )
     return base, marks
+
+
+def for_export(pdf_bytes: bytes) -> bytes:
+    """A marked PDF as the desktop and browser apps would show it.
+
+    Marks drawn in a named color are re-drawn with that color from the
+    desktop palette; other marks are kept as they are. The embedded original
+    and mark list are left out. A PDF without marks is returned unchanged.
+    """
+    try:
+        base, marks = load_state(pdf_bytes)
+    except Exception:
+        return pdf_bytes
+    if not marks:
+        return pdf_bytes
+    sizes = page_sizes(base)
+    drawn = []
+    for mark in marks:
+        name, request = mark.get("color_name"), mark.get("request")
+        if name and isinstance(request, dict):
+            palette = (
+                DESKTOP_HIGHLIGHT_COLORS if mark.get("shape") == "highlight" else DESKTOP_COLORS
+            )
+            if name in palette:
+                again = dict(request, color=_hex(palette[name]))
+                try:
+                    mark = dict(mark, **render_mark(again, sizes[mark["pdf_page"]], None))
+                except (MarkError, IndexError):
+                    pass
+        drawn.append(mark)
+    return build(base, drawn, embed=False)
 
 
 def original_pdf(pdf_bytes: bytes) -> bytes:
@@ -198,9 +258,11 @@ def page_sizes(pdf_bytes: bytes) -> List[Tuple[float, float]]:
         return [(page.rect.width, page.rect.height) for page in doc]
 
 
-def build(base: bytes, marks: Sequence[Dict[str, Any]]) -> bytes:
+def build(base: bytes, marks: Sequence[Dict[str, Any]], embed: bool = True) -> bytes:
     """The PDF with ``marks`` placed on ``base``; ``base`` itself when none.
 
+    With ``embed`` (the default) the original PDF and the mark list are
+    embedded, so the marks can be changed later; exports pass False.
     Raises MarkError if placing would change the page count or a page size,
     which would move the tablet's ink relative to the page.
     """
@@ -218,9 +280,10 @@ def build(base: bytes, marks: Sequence[Dict[str, Any]]) -> bytes:
                 raise MarkError("Rotated PDF pages are not supported.")
             with pymupdf.open("pdf", base64.b64decode(mark["pdf"])) as snippet:
                 page.show_pdf_page(_points(page.rect, mark["box"]), snippet, 0)
-        doc.embfile_add(BASE_FILE, base, filename=BASE_FILE, desc="PDF before marks")
-        payload = json.dumps({"format": MARKS_FORMAT, "marks": list(marks)}, indent=1)
-        doc.embfile_add(MARKS_FILE, payload.encode("utf-8"), filename=MARKS_FILE, desc="Marks")
+        if embed:
+            doc.embfile_add(BASE_FILE, base, filename=BASE_FILE, desc="PDF before marks")
+            payload = json.dumps({"format": MARKS_FORMAT, "marks": list(marks)}, indent=1)
+            doc.embfile_add(MARKS_FILE, payload.encode("utf-8"), filename=MARKS_FILE, desc="Marks")
         result = doc.tobytes(garbage=3, deflate=True)
     finally:
         doc.close()
@@ -849,12 +912,12 @@ def render_mark(
             and name.strip().lower() in HIGHLIGHT_OPACITY
         ):
             request = dict(request, opacity=HIGHLIGHT_OPACITY[name.strip().lower()])
-        if "color" in request:
-            rgb = parse_color(request["color"], palette)
-        elif color:
-            rgb = parse_color(color, palette)
+        source = request["color"] if "color" in request else color
+        if source:
+            rgb = parse_color(source, palette)
         else:
             rgb = default_color(request.get("shape"))
+            source = "yellow" if request.get("shape") == "highlight" else "black"
         render = {
             "text": _render_text,
             "shape": _render_shape,
@@ -863,6 +926,10 @@ def render_mark(
         }[kind]
         stored = render(request, rgb, page)
         stored["color"] = rgb
+        if isinstance(source, str) and source.strip().lower() in palette:
+            # Named colors can be re-drawn in another palette (see for_export).
+            stored["color_name"] = source.strip().lower()
+            stored["request"] = {k: v for k, v in request.items() if k != "color"}
     if len(stored["pdf"]) > MAX_SNIPPET_BYTES:
         raise MarkError(f"The rendered mark is larger than {MAX_SNIPPET_BYTES} bytes.")
     stored["pdf"] = base64.b64encode(stored["pdf"]).decode("ascii")

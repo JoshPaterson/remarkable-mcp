@@ -572,6 +572,9 @@ available when the server runs with `--read-only`.
 
 ### PDF behavior
 
+- Marks added with `remarkable_mark_pdf` in a named color are re-drawn in the
+  desktop and browser apps' colors (the document itself keeps colors tuned for
+  the tablet's screen). The embedded original and mark list are left out.
 - Physical page order comes from reMarkable `.content` metadata.
 - `pages` exports only the selected physical pages, numbered as in
   `remarkable_image`, in document order. The response lists them in

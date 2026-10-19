@@ -31,8 +31,12 @@ another tablet. Probe PDFs come from `scripts/color_probes.py`.
 | magenta | `#FF00FF` | | |
 
 Mark colors live in `remarkable_mcp/pdf_marks.py` (`COLORS`,
-`HIGHLIGHT_COLORS`, `HIGHLIGHT_OPACITY`). The renderer
-(`remarkable_mcp/colors.py`, `RENDER_COLORS`) deliberately keeps the export
+`HIGHLIGHT_COLORS`, `HIGHLIGHT_OPACITY`). They are tuned for the tablet, which
+is where marks are meant to look right. The desktop and browser apps draw
+named colors with the export palette (`DESKTOP_COLORS`,
+`DESKTOP_HIGHLIGHT_COLORS`): marks record the color name they were drawn with,
+and `remarkable_export` PDFs re-draw named-color marks in that palette. The
+renderer (`remarkable_mcp/colors.py`, `RENDER_COLORS`) also keeps the export
 palette, so `remarkable_image` shows ink as the desktop app does.
 
 ## Procedure

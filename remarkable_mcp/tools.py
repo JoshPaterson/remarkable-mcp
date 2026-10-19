@@ -66,7 +66,7 @@ from remarkable_mcp.extract import (
     render_page_full_page_from_document_zip,
     render_tablet_pdf_page_to_png,
 )
-from remarkable_mcp.pdf_marks import original_pdf, stored_marks
+from remarkable_mcp.pdf_marks import for_export, original_pdf, stored_marks
 from remarkable_mcp.responses import make_error, make_response
 from remarkable_mcp.server import mcp
 from remarkable_mcp.tags import matches_tags, tag_names
@@ -2567,8 +2567,8 @@ def _select_pages(ranges: List[tuple], page_count: int) -> List[int]:
     return sorted({page for first, last in ranges for page in range(first, last + 1)})
 
 
-def _archive_without_marks(archive: bytes) -> bytes:
-    """A document archive with its PDF restored to the version before marks."""
+def _archive_with_pdf(archive: bytes, convert) -> bytes:
+    """A document archive with ``convert(pdf_bytes)`` applied to its PDF."""
     out = io.BytesIO()
     with (
         zipfile.ZipFile(io.BytesIO(archive)) as src,
@@ -2577,9 +2577,20 @@ def _archive_without_marks(archive: bytes) -> bytes:
         for info in src.infolist():
             data = src.read(info)
             if info.filename.endswith(".pdf"):
-                data = original_pdf(data)
+                data = convert(data)
             dst.writestr(info, data)
     return out.getvalue()
+
+
+def _archive_without_marks(archive: bytes) -> bytes:
+    """A document archive with its PDF restored to the version before marks."""
+    return _archive_with_pdf(archive, original_pdf)
+
+
+def _archive_for_export(archive: bytes) -> bytes:
+    """A document archive with marks in the desktop apps' colors (see
+    ``pdf_marks.for_export``)."""
+    return _archive_with_pdf(archive, for_export)
 
 
 def _mark_summaries(marks: list, archive: bytes) -> list:
@@ -2720,6 +2731,10 @@ def _publish_document_export(
                 representation="tablet_pdf",
             )
 
+        if output_format == "pdf":
+            # Marks match the tablet's screen in the document; exports match
+            # the desktop and browser apps instead.
+            raw_doc = _archive_for_export(raw_doc)
         with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as tmp:
             tmp.write(raw_doc)
             archive_path = Path(tmp.name)

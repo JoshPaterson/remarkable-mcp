@@ -2982,6 +2982,9 @@ def register_write_tools():
                 gray, white, blue, red, green, yellow, cyan, magenta.
                 Highlighter colors (highlights): yellow, blue, pink, orange,
                 green, gray. The default is black, and yellow for highlights.
+                Named colors are tuned to look right on the tablet's screen; PDF
+                exports (remarkable_export) re-draw them in the desktop and
+                browser apps' colors.
                 Highlights darken like the tablet's highlighter: the color shows
                 on the paper and text under it stays dark.
 

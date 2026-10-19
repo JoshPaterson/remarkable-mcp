@@ -767,3 +767,61 @@ def test_renderer_blends_translucent_highlighter_by_its_opacity():
     assert all(abs(a - b) <= 2 for a, b in zip(image.getpixel((25, 20)), (75, 150, 191)))
     assert all(abs(a - 191) <= 2 for a in image.getpixel((75, 20)))
     assert image.getpixel((25, 5)) == (100, 200, 255)
+
+
+def test_export_redraws_named_colors_in_the_desktop_palette():
+    original = _pdf()
+    result = _edit(
+        add=[
+            {"page": 1, "id": "red", "text": "Fix", "at": [0.1, 0.1], "color": "red"},
+            {"page": 1, "id": "hl", "shape": "highlight", "region": [0.1, 0.3, 0.4, 0.33]},
+            {
+                "page": 1,
+                "id": "hex",
+                "shape": "box",
+                "region": [0.5, 0.5, 0.6, 0.6],
+                "color": "#123456",
+            },
+            {"page": 1, "id": "svg", "graphic": SVG, "region": [0.5, 0.7, 0.7, 0.8]},
+        ],
+        color=None,
+    )
+    marked = pdf_marks.build(original, result["marks"])
+    exported = pdf_marks.for_export(marked)
+
+    with pymupdf.open(stream=exported, filetype="pdf") as doc:
+        assert doc.embfile_count() == 0
+        page = doc[0]
+        spans = [
+            span
+            for block in page.get_text("dict")["blocks"]
+            for line in block.get("lines", [])
+            for span in line["spans"]
+        ]
+        fills = {f"#{span['color']:06x}" for span in spans}
+        assert "#c23132" in fills  # desktop red, not the tablet's #ff0000
+        drawings = page.get_drawings()
+    colors = {pdf_marks._hex(d["fill"]) for d in drawings if d.get("fill")}
+    colors |= {pdf_marks._hex(d["color"]) for d in drawings if d.get("color")}
+    assert "#fefd60" in colors  # desktop yellow highlighter
+    assert "#ffed75" not in colors
+    assert "#123456" in colors  # hex colors are kept
+    # The document itself keeps the tablet's colors and its attachments.
+    assert pdf_marks.load_state(marked)[1][0]["color_name"] == "red"
+    assert pdf_marks.for_export(original) == original
+
+
+def test_export_archive_uses_desktop_colors(original):
+    from remarkable_mcp.tools import _archive_for_export
+
+    marks = _edit(add=[{"page": 1, "shape": "check", "at": [0.5, 0.5], "color": "blue"}])["marks"]
+    archive = io.BytesIO()
+    with zipfile.ZipFile(archive, "w") as zf:
+        zf.writestr(f"{DOC_ID}.pdf", pdf_marks.build(original, marks))
+        zf.writestr(f"{DOC_ID}.content", json.dumps(CONTENT))
+    with zipfile.ZipFile(io.BytesIO(_archive_for_export(archive.getvalue()))) as zf:
+        exported = zf.read(f"{DOC_ID}.pdf")
+    with pymupdf.open(stream=exported, filetype="pdf") as doc:
+        strokes = {pdf_marks._hex(d["color"]) for d in doc[0].get_drawings() if d.get("color")}
+        assert doc.embfile_count() == 0
+    assert strokes == {"#304ae0"}
