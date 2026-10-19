@@ -171,7 +171,7 @@ def test_default_colors():
 
 def test_named_colors_are_the_tablets():
     assert pdf_marks._hex(pdf_marks.COLORS["red"]) == "#ff0000"
-    assert pdf_marks._hex(pdf_marks.HIGHLIGHT_COLORS["pink"]) == "#f29bff"
+    assert pdf_marks._hex(pdf_marks.HIGHLIGHT_COLORS["pink"]) == "#ea9eff"
     pink = _edit(
         add=[{"page": 1, "shape": "highlight", "region": [0.1, 0.1, 0.2, 0.2], "color": "pink"}]
     )
@@ -219,7 +219,7 @@ def test_highlight_darkens_and_keeps_text_dark():
     with pymupdf.open(stream=marked, filetype="pdf") as doc:
         pix = doc[0].get_pixmap(dpi=72)
     # Paper inside the highlight takes its color; text under it stays black.
-    assert pix.pixel(int(0.38 * A4[0]), int(0.21 * A4[1])) == (254, 253, 96)
+    assert pix.pixel(int(0.38 * A4[0]), int(0.21 * A4[1])) == (255, 234, 116)
     text_pixels = [pix.pixel(x, 197) for x in range(100, 180)]
     assert min(sum(p) for p in text_pixels) < 60
 

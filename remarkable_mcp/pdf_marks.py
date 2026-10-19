@@ -86,11 +86,11 @@ COLORS = {
 HIGHLIGHT_COLORS = {
     name: _rgb(value)
     for name, value in {
-        "yellow": "#FEFD60",
+        "yellow": "#FFEA74",
         "blue": "#BEEAFE",
-        "pink": "#F29BFF",
+        "pink": "#EA9EFF",
         "orange": "#FFC38C",
-        "green": "#A9FF89",
+        "green": "#ACFF80",
         "gray": "#BFBFBF",
     }.items()
 }
