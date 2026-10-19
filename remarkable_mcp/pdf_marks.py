@@ -81,16 +81,18 @@ COLORS = {
 # Highlighter colors, drawn with the Darken blend: on white paper they show
 # their color, and text under them stays dark. Blue, orange and gray are the
 # tablet's PDF export values, which the tablet also shows as its own
-# highlighters; the others were matched by eye on a Paper Pro, since the
-# export values look different on its screen.
+# highlighters. Yellow, pink and green were measured on a Paper Pro, whose
+# own highlighter colors differ from its export: drawing its highlighter
+# across swatches that vary one channel (the others 00) shows, per channel,
+# the last swatch the stroke goes under, which is the highlighter's value.
 HIGHLIGHT_COLORS = {
     name: _rgb(value)
     for name, value in {
-        "yellow": "#FFEA74",
+        "yellow": "#FFED75",
         "blue": "#BEEAFE",
-        "pink": "#EA9EFF",
+        "pink": "#F29EFF",
         "orange": "#FFC38C",
-        "green": "#ACFF80",
+        "green": "#ACFF85",
         "gray": "#000000",
     }.items()
 }

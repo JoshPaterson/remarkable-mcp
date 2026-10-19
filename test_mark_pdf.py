@@ -171,7 +171,7 @@ def test_default_colors():
 
 def test_named_colors_are_the_tablets():
     assert pdf_marks._hex(pdf_marks.COLORS["red"]) == "#ff0000"
-    assert pdf_marks._hex(pdf_marks.HIGHLIGHT_COLORS["pink"]) == "#ea9eff"
+    assert pdf_marks._hex(pdf_marks.HIGHLIGHT_COLORS["pink"]) == "#f29eff"
     pink = _edit(
         add=[{"page": 1, "shape": "highlight", "region": [0.1, 0.1, 0.2, 0.2], "color": "pink"}]
     )
