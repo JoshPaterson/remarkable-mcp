@@ -1027,12 +1027,16 @@ def test_end_leader_starts_beside_the_text_heading_away_from_it():
     assert "border" not in mark["request"] or mark["request"]["border"] is False
     left, top, right, bottom = mark["box"]
     start = mark["leader"]["from"]
-    assert start[0] > right or start[0] < left  # beyond the text, not on it
-    # The point is above or below the note: the line starts at the text's
-    # visible top (cap height) or bottom (baseline), on the side of the point.
-    optical_top, optical_bottom = mark["optical"]
+    optical_top, optical_bottom, under = mark["optical"]
     assert top < optical_top < optical_bottom < bottom
-    assert start[1] == pytest.approx(optical_bottom if 0.45 > bottom else optical_top, abs=1e-3)
+    if left + (right - left) / 3 <= 0.9 <= right - (right - left) / 3:
+        # Directly above or below: from the middle of the top or bottom.
+        assert start[0] == pytest.approx((left + right) / 2, abs=1e-3)
+        assert start[1] > under if 0.45 > bottom else start[1] < optical_top
+    else:
+        # Beside: from the facing end, at the visible top or bottom.
+        assert start[0] > right or start[0] < left
+        assert start[1] == pytest.approx(optical_bottom if 0.45 > bottom else optical_top, abs=1e-3)
     # The six starts: top, middle or bottom of the left or right end.
     box = [0.2, 0.4, 0.4, 0.42]
     for near, start in [
@@ -1086,9 +1090,27 @@ def test_leader_crosses_printed_text_only_when_nothing_else_reaches():
 
 def test_optical_edges_of_text_and_latex():
     text = _edit(add=[{"page": 1, "text": "Hx", "at": [0.2, 0.2], "size": 20}])["marks"][0]
-    top, bottom = text["optical"]
+    top, bottom = text["optical"][:2]
     # Cap height 0.729 of the size below the box top's ascender (1.075).
     assert (top - text["box"][1]) * A4[1] == pytest.approx((1.075 - 0.729) * 20, abs=0.3)
     assert (text["box"][3] - bottom) * A4[1] == pytest.approx(0.299 * 20, abs=0.3)
     latex = _edit(add=[{"page": 1, "latex": r"\frac{a}{b}", "at": [0.2, 0.5]}])["marks"][0]
     assert latex["box"][1] <= latex["optical"][0] < latex["optical"][1] <= latex["box"][3]
+
+
+def test_leader_from_top_or_bottom_center_for_points_above_or_below():
+    box = [0.2, 0.4, 0.5, 0.42]
+    below = pdf_marks._leader_route(box, [0.38, 0.5])
+    above = pdf_marks._leader_route(box, [0.32, 0.3])
+    assert below[0][0] == above[0][0] == pytest.approx(0.35)
+    assert below[0][1] > 0.42 and above[0][1] < 0.40
+    # Over the outer thirds the leader leaves from the corner instead.
+    corner = pdf_marks._leader_route(box, [0.48, 0.3])
+    assert corner[0][0] > 0.5 and corner[0][1] == pytest.approx(0.40)
+
+
+def test_bottom_center_clears_descenders():
+    plain = _edit(add=[{"page": 1, "text": "note", "at": [0.2, 0.2]}])["marks"][0]
+    hanging = _edit(add=[{"page": 1, "text": "gap", "at": [0.2, 0.2]}])["marks"][0]
+    assert plain["optical"][2] == plain["optical"][1]  # no descenders: the baseline
+    assert hanging["optical"][2] > hanging["optical"][1]  # below the descenders

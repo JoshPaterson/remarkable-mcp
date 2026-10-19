@@ -923,12 +923,17 @@ def _render_graphic(request: dict, page: _Page) -> Dict[str, Any]:
     return {"format": fmt, "box": box, "pdf": pdf}
 
 
-def _optical(stored: Dict[str, Any], page: _Page) -> List[float]:
-    """The visible top and bottom of a note, as page fractions.
+# Characters that reach below the baseline.
+DESCENDERS = set("gjpqyQ,;()[]{}|/_@$")
 
-    Text: the cap height of its first line and the baseline of its last.
-    LaTeX (drawn as paths): the extent of what is drawn. The box around a
-    note also holds ascenders and descenders, so it reaches further.
+
+def _optical(stored: Dict[str, Any], page: _Page) -> List[float]:
+    """The visible top, bottom and lowest point of a note, as page fractions.
+
+    Text: the cap height of its first line, the baseline of its last, and
+    the bottom of its descenders if it has any (else the baseline). LaTeX
+    (drawn as paths): the extent of what is drawn. The box around a note also
+    holds the font's full ascent and descent, so it reaches further.
     """
     top_pt = page.pt(0, stored["box"][1])[1]
     with pymupdf.open("pdf", stored["pdf"]) as doc:
@@ -948,12 +953,18 @@ def _optical(stored: Dict[str, Any], page: _Page) -> List[float]:
                 for span in lines
             ]
             low, high = min(caps), max(span["origin"][1] for span in lines)
+            under = high
+            for span in lines:
+                if DESCENDERS & set(span["text"]):
+                    font = pymupdf.Font(_FONT_CODES.get(span["font"], "helv"))
+                    under = max(under, span["origin"][1] - font.descender * span["size"])
         else:
             drawn = [d["rect"] for d in snippet.get_drawings()]
             if not drawn:
-                return [stored["box"][1], stored["box"][3]]
+                return [stored["box"][1], stored["box"][3], stored["box"][3]]
             low, high = min(r.y0 for r in drawn), max(r.y1 for r in drawn)
-    return [_round((top_pt + low) / page.height), _round((top_pt + high) / page.height)]
+            under = high
+    return [_round((top_pt + v) / page.height) for v in (low, high, under)]
 
 
 def _bordered(stored: Dict[str, Any], color: List[float], page: _Page) -> Dict[str, Any]:
@@ -1189,27 +1200,37 @@ def _leader_route(
     box: Sequence[float],
     near: Sequence[float],
     size=(1.0, 1.0),
-    inset: Sequence[float] = (0.0, 0.0),
+    inset: Sequence[float] = (0.0, 0.0, 0.0),
 ):
     """Points of a leader from ``box`` to just short of ``near``, or None if
     the point is too close to need one.
 
-    The leader starts just past the left or right edge of the mark,
-    whichever faces the point: at its top for a point above the mark, its
-    bottom for one below, otherwise its middle, so the line heads away from
-    the mark. ``inset`` holds how far the visible top and bottom lie inside
-    the box (for text, its cap height and baseline; see ``_optical``).
+    A point above or below the middle third of the mark gets a leader from
+    the middle of its top or bottom. Otherwise the leader starts
+    just past the left or right edge, whichever faces the point: at the top
+    for a point above, the bottom for one below, else the middle. Either way
+    it heads away from the mark. ``inset`` holds how far the visible top,
+    bottom and lowest point lie inside the box (for text, its cap height,
+    baseline and descenders; see ``_optical``).
     """
-    facing_right = near[0] >= (box[0] + box[2]) / 2
-    gap = LEADER_START_GAP / size[0]
+    gap_x, gap_y = LEADER_START_GAP / size[0], LEADER_START_GAP / size[1]
     top, bottom = box[1] + inset[0], box[3] - inset[1]
-    if near[1] < top:
-        y = top
-    elif near[1] > bottom:
-        y = bottom
+    under = box[3] - inset[2] if len(inset) > 2 else bottom
+    center = (box[0] + box[2]) / 2
+    third = (box[2] - box[0]) / 3
+    middle = box[0] + third <= near[0] <= box[2] - third
+    if middle and near[1] < top:
+        start = [center, top - gap_y]
+    elif middle and near[1] > bottom:
+        start = [center, under + gap_y]
     else:
-        y = (top + bottom) / 2
-    start = [box[2] + gap, y] if facing_right else [box[0] - gap, y]
+        if near[1] < top:
+            y = top
+        elif near[1] > bottom:
+            y = bottom
+        else:
+            y = (top + bottom) / 2
+        start = [box[2] + gap_x, y] if near[0] > center else [box[0] - gap_x, y]
     dx, dy = near[0] - start[0], near[1] - start[1]
     length = math.hypot(dx, dy)
     if length < LEADER_GAP * 3:
@@ -1332,8 +1353,12 @@ def _render_near(
     trial = render_mark(dict(base, at=[0.5, 0.5], anchor="center"), size, color)
     width = trial["box"][2] - trial["box"][0]
     height = trial["box"][3] - trial["box"][1]
-    optical = trial.get("optical") or [trial["box"][1], trial["box"][3]]
-    inset = (optical[0] - trial["box"][1], trial["box"][3] - optical[1])
+    optical = trial.get("optical") or [trial["box"][1], trial["box"][3], trial["box"][3]]
+    inset = (
+        optical[0] - trial["box"][1],
+        trial["box"][3] - optical[1],
+        trial["box"][3] - optical[2],
+    )
     route = (lambda box: _leader_route(box, near, size, inset)) if leader else None
     x0, y0 = _place_near(near, width, height, obstacles, route, printed)
     # A border lies outside the content, whose top-left at gives.
