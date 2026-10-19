@@ -371,3 +371,125 @@ async def test_tag_tool_not_registered_over_usb(monkeypatch):
     finally:
         for name in WRITE_TOOLS:
             mcp._tool_manager._tools.pop(name, None)
+
+
+# --- several documents ------------------------------------------------------
+
+DOC2_ID = "5b1f3f0a-7c55-4a8e-9a43-2f6f2f2d9c11"
+
+
+class TwoDocCloud(FakeCloud):
+    """FakeCloud with a second, one-page document tagged "Graded"."""
+
+    def __init__(self):
+        super().__init__(_content(tags=[_tag("old")]), METADATA)
+        files = [
+            self._blob(
+                tablet_json.dumps(_content(tags=[_tag("Graded")], pages=["page-z"])).encode(),
+                f"{DOC2_ID}.content",
+            ),
+            self._blob(METADATA.replace("Tag test", "Second").encode(), f"{DOC2_ID}.metadata"),
+            self._blob(b"%PDF-1.4", f"{DOC2_ID}.pdf"),
+        ]
+        doc_hash = _hash_entries(files)
+        self.blobs[doc_hash] = _serialize_doc_index(files)
+        self.entries.append(
+            {"hash": doc_hash, "type": "0", "id": DOC2_ID, "subfiles": 3, "size": 100}
+        )
+
+    def get_meta_items(self, *args, **kwargs):
+        second = SimpleNamespace(
+            ID=DOC2_ID, VissibleName="Second", Parent="", is_folder=False, tags=["Graded"]
+        )
+        return super().get_meta_items() + [second]
+
+    def stored_for(self, doc_id: str, suffix: str) -> bytes:
+        entry = next(e for e in self.entries if e["id"] == doc_id)
+        index = self._parse_index(self.blobs[entry["hash"]])
+        return self.blobs[next(f for f in index if f["id"].endswith(suffix))["hash"]]
+
+
+@pytest.fixture
+def two_docs(cloud):
+    fake = TwoDocCloud()
+    with patch("remarkable_mcp.write_tools.get_rmapi", return_value=fake):
+        yield fake
+
+
+def _doc_tags(fake, doc_id):
+    return [t["name"] for t in json.loads(fake.stored_for(doc_id, ".content"))["tags"]]
+
+
+async def test_cloud_list_changes_every_document_in_one_commit(two_docs):
+    data = await _tag_tool(document=["Tag test", "Second"], add="graded", remove="old")
+
+    assert two_docs.commits == 1
+    assert data["changed"] == ["Tag test"]
+    by_name = {d["document"]: d for d in data["documents"]}
+    assert by_name["Tag test"]["tags"] == ["Graded"]
+    assert not by_name["Second"]["changed"] and by_name["Second"]["notes"]
+    assert _doc_tags(two_docs, DOC_ID) == ["Graded"]
+    assert _doc_tags(two_docs, DOC2_ID) == ["Graded"]
+
+
+async def test_cloud_list_with_duplicates_lists_each_document_once(two_docs):
+    data = await _tag_tool(document=["Tag test", "/Tag test", "Second"], add="x")
+
+    assert [d["document"] for d in data["documents"]] == ["Tag test", "Second"]
+    assert two_docs.commits == 1
+
+
+@pytest.mark.parametrize(
+    "arguments, message",
+    [
+        ({"document": ["Tag test", "Nope"], "add": "x"}, "Document not found: 'Nope'"),
+        ({"document": ["Tag test", "Course"], "add": "x"}, "is a folder"),
+        ({"document": ["Tag test", "Second"], "page": 2, "add": "x"}, "Page 2 does not exist"),
+        ({"document": [], "add": "x"}, "a name or a list of names"),
+    ],
+)
+async def test_cloud_list_changes_nothing_when_one_document_fails(two_docs, arguments, message):
+    data = await _tag_tool(**arguments)
+
+    assert message in data["_error"]["message"]
+    assert two_docs.commits == 0
+    assert _doc_tags(two_docs, DOC_ID) == ["old"]
+
+
+def test_ssh_list_reads_all_then_writes_changed_with_one_restart(monkeypatch):
+    from remarkable_mcp import write_tools
+
+    files = {
+        f"{write_tools.XOCHITL_PATH}/a.content": tablet_json.dumps(_content()).encode(),
+        f"{write_tools.XOCHITL_PATH}/a.metadata": METADATA.encode(),
+        f"{write_tools.XOCHITL_PATH}/b.content": tablet_json.dumps(
+            _content(tags=[_tag("x")])
+        ).encode(),
+        f"{write_tools.XOCHITL_PATH}/b.metadata": METADATA.encode(),
+    }
+    written, restarts = [], []
+    monkeypatch.setattr(write_tools, "_read_remote_bytes", lambda c, path: files.get(path))
+    monkeypatch.setattr(
+        write_tools, "_write_remote_bytes", lambda c, path, data: written.append(path)
+    )
+    monkeypatch.setattr(
+        write_tools, "_maybe_restart_xochitl", lambda c, defer: restarts.append(defer) or True
+    )
+    monkeypatch.setattr(write_tools, "_update_deferred_ssh_cache", lambda *a, **k: None)
+    client = SimpleNamespace(mark_operation_dirty=lambda: None)
+    targets = [SimpleNamespace(ID=i, VissibleName=i) for i in ("a", "b")]
+    apply = write_tools._tag_editor(["x"], [], {}, None, [])
+
+    results, pending = write_tools._ssh_tag(client, targets, apply, False)
+
+    assert results["a"]["changed"] and not results["b"]["changed"]
+    assert written == [
+        f"{write_tools.XOCHITL_PATH}/a.content",
+        f"{write_tools.XOCHITL_PATH}/a.metadata",
+    ]
+    assert restarts == [False] and not pending
+
+    missing = [SimpleNamespace(ID="a", VissibleName="a"), SimpleNamespace(ID="c", VissibleName="c")]
+    written.clear()
+    error = json.loads(write_tools._ssh_tag(client, missing, apply, False))
+    assert error["_error"]["type"] == "no_content" and written == []

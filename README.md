@@ -671,7 +671,7 @@ Or set the environment variable:
 | `remarkable_mkdir(folder_name, parent, defer_restart)` | Create a new folder (cloud and SSH) |
 | `remarkable_move(document, dest_folder, defer_restart)` | Move a document or folder (cloud and SSH) |
 | `remarkable_rename(document, new_name, defer_restart)` | Rename a document or folder (cloud and SSH) |
-| `remarkable_tag(document, add, remove, rename, page, defer_restart)` | Add, rename or remove document tags, or a page's tags with `page` (cloud and SSH) |
+| `remarkable_tag(document, add, remove, rename, page, defer_restart)` | Add, rename or remove document tags, or a page's tags with `page`; `document` may be a list, changed together in one write (cloud and SSH) |
 | `remarkable_delete(document, defer_restart, permanent)` | Move a document/folder to Trash; SSH can permanently remove it with `permanent=True` |
 | `remarkable_refresh()` | Safely restart `xochitl` once to apply pending writes made with `defer_restart=True`; no-op after this process has confirmed a clean state — **SSH only** |
 | `remarkable_author(method, ..., defer_restart)` | Author native ink and notebooks — `draw` (append strokes), `add_page` (append a blank notebook page), `create_document` (new notebook) — **SSH only** |
@@ -679,7 +679,7 @@ Or set the environment variable:
 ### Safety
 
 - **Upload registers in cloud, SSH, and USB web mode** — local-directory mode never exposes write tools.
-- **Tag changes are written the way the tablet writes them** — tags live only in a document's `.content` file, so `remarkable_tag` rewrites it in the tablet's own JSON layout and key order, changes nothing but the tag lists (checked before upload), and updates only `lastModified` in `.metadata`, as the desktop app does. A request that changes nothing writes nothing. Like the desktop app, a tag change replaces the tablet's tag list: tag edits made on the tablet while offline and not yet synced are lost.
+- **Tag changes are written the way the tablet writes them** — tags live only in a document's `.content` file, so `remarkable_tag` rewrites it in the tablet's own JSON layout and key order, changes nothing but the tag lists (checked before upload), and updates only `lastModified` in `.metadata`, as the desktop app does. A request that changes nothing writes nothing. A list of documents is checked in full before anything is written, so one unknown name changes nothing; the changes then go out in one cloud commit, or over SSH with one restart. Like the desktop app, a tag change replaces the tablet's tag list: tag edits made on the tablet while offline and not yet synced are lost.
 - **mkdir, move, rename, tag, delete register in cloud and SSH modes only** — they are not exposed on USB web (the tablet's USB web firmware has no folder/move/rename/delete endpoints), keeping the tool list scoped to what the active transport actually supports.
 - **Delete prompts for confirmation when possible** — if the client supports MCP elicitation, `remarkable_delete` asks the user to confirm before deleting. MCP SDK 2.x carries that prompt as a multi-round input request for `2026-07-28` clients and as push elicitation for legacy clients. If the client can't show a prompt, the delete is **refused** (not performed) unless `REMARKABLE_SKIP_CONFIRM=1` is set — so write-on-by-default can't silently delete from clients that lack elicitation. Cloud and SSH move items to Trash by default. SSH also supports `permanent=True` for an explicitly requested permanent removal; cloud permanent deletion remains a Trash-management operation in the app/tablet. Set `REMARKABLE_SKIP_CONFIRM=1` to allow deletes without a prompt in automated setups. All write tools carry `ToolAnnotations(read_only_hint=False)` (and `destructive_hint=True` for delete) so an agent harness can gate writes at the MCP layer.
 - **SSH work is fair and serialized per server** — one FIFO dispatcher owns every SSH subprocess, so startup scans, reads, uploads, mutations, and refresh probes cannot churn the tablet's USB CDC connection concurrently. Cached metadata reads bypass the queue.
@@ -715,6 +715,7 @@ remarkable_rename("Untitled", "Q4 Planning Notes")
 # Tag a document, then rename the tag once it is done
 remarkable_tag("Week 3 worksheet", add="to-grade")
 remarkable_tag("Week 3 worksheet", rename={"to-grade": "graded"})
+remarkable_tag(["Week 3 worksheet", "Week 4 worksheet"], add="graded")
 
 # Delete (destructive; confirms via elicitation when supported)
 remarkable_delete("Old Draft")
