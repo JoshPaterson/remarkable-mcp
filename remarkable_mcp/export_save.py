@@ -4,17 +4,19 @@
 ``:`` on macOS and Linux). A save path must resolve, symlinks included, to a
 file inside one of them. Files are written to a temporary name in the target
 folder and renamed into place, so a reader never sees a partial file, and an
-existing file is only replaced when asked. Nothing else is ever removed.
+existing file is only replaced when asked, and only when it is an earlier
+export of the same reMarkable document. Nothing else is ever removed.
 """
 
 from __future__ import annotations
 
 import errno
 import hashlib
+import json
 import os
 import tempfile
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 
 EXPORT_DIRS_ENV = "REMARKABLE_EXPORT_DIRS"
 SUFFIXES = {"pdf": ".pdf", "markdown": ".md"}
@@ -91,15 +93,68 @@ def check_path(save_to: str, output_format: str, overwrite: bool) -> Path:
     return resolved
 
 
+def exported_document_id(path: Path) -> Optional[str]:
+    """The reMarkable document id an earlier export at ``path`` records, if any.
+
+    PDF exports list it in their keywords (``remarkable-document-id:<id>``),
+    Markdown exports in their front matter (``remarkable_document_id``).
+    """
+    try:
+        if path.suffix.lower() == ".pdf":
+            import pymupdf
+
+            with pymupdf.open(path) as doc:
+                keywords = (doc.metadata or {}).get("keywords") or ""
+            ids = [
+                part.strip().split(":", 1)[1]
+                for part in keywords.split(",")
+                if part.strip().startswith("remarkable-document-id:")
+            ]
+            return ids[-1] if ids else None
+        with open(path, encoding="utf-8") as f:
+            lines = f.read(64 * 1024).splitlines()
+        if not lines or lines[0].strip() != "---":
+            return None
+        for line in lines[1:]:
+            if line.strip() == "---":
+                return None
+            if line.startswith("remarkable_document_id:"):
+                value = json.loads(line.split(":", 1)[1].strip())
+                return value if isinstance(value, str) else None
+    except Exception:
+        return None
+    return None
+
+
+def check_replace(path: Path, document_id: str) -> None:
+    """Refuse to replace ``path`` unless it is an export of ``document_id``."""
+    if not os.path.lexists(path):
+        return
+    found = exported_document_id(path)
+    if found != document_id:
+        source = (
+            f"an export of another reMarkable document ({found})"
+            if found
+            else "not an export of this document"
+        )
+        raise SaveError(
+            "not_same_document",
+            f"'{path}' is {source}, so it is not replaced.",
+            "overwrite only replaces an earlier export of the same document; "
+            "choose another file name.",
+        )
+
+
 def _allowed_hint(dirs: List[Path]) -> str:
     return "Save inside one of: " + ", ".join(str(d) for d in dirs)
 
 
-def save(data: bytes, path: Path, overwrite: bool) -> dict:
+def save(data: bytes, path: Path, overwrite: bool, document_id: str) -> dict:
     """Write ``data`` to ``path`` atomically; returns its path, size and SHA-256.
 
     Missing parent folders are created. Without ``overwrite`` an existing file
-    is never replaced, even one created while saving.
+    is never replaced, even one created while saving; with it, only an earlier
+    export of ``document_id`` is.
     """
     dirs = allowed_dirs()
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -122,6 +177,7 @@ def save(data: bytes, path: Path, overwrite: bool) -> dict:
         os.chmod(tmp, 0o666 & ~umask)
         target = parent / path.name
         if overwrite:
+            check_replace(target, document_id)
             os.replace(tmp, target)
         else:
             try:
