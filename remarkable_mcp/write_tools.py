@@ -3026,16 +3026,15 @@ def register_write_tools():
                 that point, clear of the user's ink, the printed text and other
                 marks, and "leader": true draws a thin line from the mark to the
                 point, ending in a dot; it is drawn only when the mark cannot sit
-                beside the point. A note's leader starts just past the end of its
-                text, on the edge facing the point, so it never crosses the text
-                ("leader_style": "end", the default), or runs
-                along an underline ("underline") or from a rounded border ("box").
-                Use near, with a leader, on pages full of writing; give the point
-                of what the mark is about, at its edge (such as the end of an
-                answer) rather than its middle. A leader never crosses the user's handwriting or
-                other marks, and crosses printed text only when nothing else
-                reaches the point; if no place fits, the tool says so: shorten
-                the note or make it smaller.
+                beside the point. It starts just past the end of the note that
+                faces the point, at the text's top, middle or baseline, so it
+                never crosses the note (a bordered note's leader starts at its
+                border). Use near, with a leader, on pages full of writing; give
+                the point of what the mark is about, at its edge (such as the
+                end of an answer) rather than its middle. A leader never crosses
+                the user's handwriting or other marks, and crosses printed text
+                only when nothing else reaches the point; if no place fits, the
+                tool says so: shorten the note or make it smaller.
                 Marks placed with `at` take an optional anchor: the point of the
                 mark placed at `at`: top-left, top, top-right, left, center,
                 right, bottom-left, bottom or bottom-right. Default center for

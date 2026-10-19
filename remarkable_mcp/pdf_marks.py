@@ -1059,7 +1059,6 @@ STYLE_KEYS = (
     "at",
     "near",
     "leader",
-    "leader_style",
     "border",
     "dot",
     "width",
@@ -1182,54 +1181,42 @@ def _segment_hits(p, q, box) -> bool:
     return False
 
 
-LEADER_STYLES = ("end", "underline", "box")
-# Gap (points) between the end of a note's text and its "end" style leader.
+# Gap (points) between a mark and the start of its leader.
 LEADER_START_GAP = 2.0
 
 
 def _leader_route(
     box: Sequence[float],
     near: Sequence[float],
-    style: str,
     size=(1.0, 1.0),
     inset: Sequence[float] = (0.0, 0.0),
 ):
     """Points of a leader from ``box`` to just short of ``near``, or None if
     the point is too close to need one.
 
-    ``end``: just past the left or right end of the note's text, whichever
-    faces the point, at its top for a point above the text, its bottom for
-    one below, otherwise its middle, so the line heads away from the text.
-    Top and bottom are the text's visible ones: ``inset`` holds how far
-    they lie inside the box (see ``_optical``).
-    ``underline``: along the bottom of the note from its far end, round the
-    corner nearest the point. ``box`` (and marks that are not notes): from the
-    nearest point of the note's box or border.
+    The leader starts just past the left or right edge of the mark,
+    whichever faces the point: at its top for a point above the mark, its
+    bottom for one below, otherwise its middle, so the line heads away from
+    the mark. ``inset`` holds how far the visible top and bottom lie inside
+    the box (for text, its cap height and baseline; see ``_optical``).
     """
     facing_right = near[0] >= (box[0] + box[2]) / 2
-    if style == "underline":
-        y = box[3]
-        far, start = ([box[0], y], [box[2], y]) if facing_right else ([box[2], y], [box[0], y])
-    elif style == "end":
-        gap = LEADER_START_GAP / size[0]
-        top, bottom = box[1] + inset[0], box[3] - inset[1]
-        if near[1] < top:
-            y = top
-        elif near[1] > bottom:
-            y = bottom
-        else:
-            y = (top + bottom) / 2
-        start = [box[2] + gap, y] if facing_right else [box[0] - gap, y]
+    gap = LEADER_START_GAP / size[0]
+    top, bottom = box[1] + inset[0], box[3] - inset[1]
+    if near[1] < top:
+        y = top
+    elif near[1] > bottom:
+        y = bottom
     else:
-        start = [min(max(near[0], box[0]), box[2]), min(max(near[1], box[1]), box[3])]
+        y = (top + bottom) / 2
+    start = [box[2] + gap, y] if facing_right else [box[0] - gap, y]
     dx, dy = near[0] - start[0], near[1] - start[1]
     length = math.hypot(dx, dy)
     if length < LEADER_GAP * 3:
         return None
     ux, uy = dx / length, dy / length
     end = [near[0] - ux * LEADER_GAP, near[1] - uy * LEADER_GAP]
-    route = [far, start, end] if style == "underline" else [start, end]
-    return [[_round(v) for v in p] for p in route]
+    return [[_round(v) for v in p] for p in (start, end)]
 
 
 def _route_clear(points, box, crossable, targets) -> bool:
@@ -1329,9 +1316,7 @@ def _render_near(
     """Render a mark placed with ``near`` (and optionally a ``leader``),
     clear of ``obstacles`` (ink, marks) and ``printed`` (printed text).
 
-    A text or latex note's leader starts at the end of its text
-    (``leader_style`` "end", the default), along an underline ("underline")
-    or from a rounded border ("box"); see ``_leader_route``.
+    See ``_leader_route`` for where a leader starts.
     """
     near = _point(options.get("near"), "near")
     leader = bool(options.get("leader", False))
@@ -1341,34 +1326,21 @@ def _render_near(
         "graphic" in options or "graphic_file" in options
     ):
         raise MarkError("near works for text, latex, check, cross and path marks.")
-    style = options.get("leader_style", "end")
-    if style not in LEADER_STYLES:
-        raise MarkError(f"leader_style must be one of: {', '.join(LEADER_STYLES)}.")
-    if "leader_style" in options and not leader:
-        raise MarkError("leader_style applies only with a leader.")
-    base = {
-        k: v for k, v in options.items() if k not in ("near", "leader", "leader_style", "anchor")
-    }
+    base = {k: v for k, v in options.items() if k not in ("near", "leader", "anchor")}
     note = "text" in base or "latex" in base
-    if not note:
-        style = "box"
-    elif style == "box":
-        base["border"] = True
     border = bool(base.get("border", False))
     trial = render_mark(dict(base, at=[0.5, 0.5], anchor="center"), size, color)
     width = trial["box"][2] - trial["box"][0]
     height = trial["box"][3] - trial["box"][1]
     optical = trial.get("optical") or [trial["box"][1], trial["box"][3]]
     inset = (optical[0] - trial["box"][1], trial["box"][3] - optical[1])
-    route = (lambda box: _leader_route(box, near, style, size, inset)) if leader else None
+    route = (lambda box: _leader_route(box, near, size, inset)) if leader else None
     x0, y0 = _place_near(near, width, height, obstacles, route, printed)
     # A border lies outside the content, whose top-left at gives.
     pad_x, pad_y = (BORDER_PAD / size[0], BORDER_PAD / size[1]) if border and note else (0, 0)
     stored = render_mark(dict(base, at=[x0 + pad_x, y0 + pad_y], anchor="top-left"), size, color)
     stored["request"] = dict(stored.get("request", {}), near=near, leader=leader)
-    if leader and note:
-        stored["request"]["leader_style"] = style
-    points = _leader_route(stored["box"], near, style, size, inset) if leader else None
+    points = _leader_route(stored["box"], near, size, inset) if leader else None
     if points:
         line = {
             "shape": "line",
