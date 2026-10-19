@@ -122,7 +122,7 @@ def stored_marks(pdf_bytes: bytes) -> List[Dict[str, Any]]:
 def text_lines(pdf_bytes: bytes, pdf_page: int) -> List[Dict[str, Any]]:
     """The text lines of one PDF page with their boxes as page fractions.
 
-    Each line is ``{"text", "box": [left, top, right, bottom]}``, top to
+    Each line is ``{"text", "region": [left, top, right, bottom]}``, top to
     bottom; whitespace-only lines are skipped.
     """
     with pymupdf.open(stream=pdf_bytes, filetype="pdf") as doc:
@@ -143,8 +143,9 @@ def text_lines(pdf_bytes: bytes, pdf_page: int) -> List[Dict[str, Any]]:
                     (x1 - rect.x0) / rect.width,
                     (y1 - rect.y0) / rect.height,
                 ]
-                lines.append({"text": text, "box": [_round(min(max(v, 0.0), 1.0)) for v in box]})
-    return sorted(lines, key=lambda line: (line["box"][1], line["box"][0]))
+                region = [_round(min(max(v, 0.0), 1.0)) for v in box]
+                lines.append({"text": text, "region": region})
+    return sorted(lines, key=lambda line: (line["region"][1], line["region"][0]))
 
 
 def page_sizes(pdf_bytes: bytes) -> List[Tuple[float, float]]:
@@ -204,12 +205,12 @@ def _point(value: Any, what: str) -> List[float]:
     return [_fraction(value[0], f"{what} x"), _fraction(value[1], f"{what} y")]
 
 
-def _rect(value: Any, what: str) -> List[float]:
+def _region(value: Any) -> List[float]:
     if not isinstance(value, (list, tuple)) or len(value) != 4:
-        raise MarkError(f"{what} must be [left, top, right, bottom] page fractions.")
-    x0, y0, x1, y1 = (_fraction(v, what) for v in value)
+        raise MarkError("region must be [left, top, right, bottom] page fractions.")
+    x0, y0, x1, y1 = (_fraction(v, "region") for v in value)
     if x0 >= x1 or y0 >= y1:
-        raise MarkError(f"{what} must have left < right and top < bottom.")
+        raise MarkError("region must have left < right and top < bottom.")
     return [x0, y0, x1, y1]
 
 
@@ -333,7 +334,7 @@ class _Page:
         if box[0] < -slack or box[1] < -slack or box[2] > 1 + slack or box[3] > 1 + slack:
             raise MarkError(
                 "The mark runs off the page; move it, or make it smaller "
-                "(a smaller size, or a rect to wrap text in)."
+                "(a smaller size, or a region to wrap text in)."
             )
         return [_round(min(max(v, 0.0), 1.0)) for v in box]
 
@@ -357,12 +358,34 @@ def _place(request: dict, width: float, height: float, page: _Page, default: str
     return page.box(x0, y0, x0 + width, y0 + height)
 
 
-def _fit(rect: Sequence[float], width: float, height: float, page: _Page) -> List[float]:
-    """The largest box of the given aspect in ``rect``, at its top-left."""
-    x0, y0 = page.pt(rect[0], rect[1])
-    x1, y1 = page.pt(rect[2], rect[3])
+def _fit(region: Sequence[float], width: float, height: float, page: _Page) -> List[float]:
+    """The largest box of the given aspect in ``region``, at its top-left."""
+    x0, y0 = page.pt(region[0], region[1])
+    x1, y1 = page.pt(region[2], region[3])
     scale = min((x1 - x0) / width, (y1 - y0) / height)
     return page.box(x0, y0, x0 + width * scale, y0 + height * scale)
+
+
+# Standard PDF Helvetica faces, by (bold, italic).
+_FONTS = {
+    (False, False): "helv",
+    (True, False): "hebo",
+    (False, True): "heit",
+    (True, True): "hebi",
+}
+
+
+def _underline(snippet, size: float, color: List[float]) -> None:
+    """Draw a line under each line of text on ``snippet``."""
+    for block in snippet.get_text("dict")["blocks"]:
+        for line in block.get("lines", []):
+            spans = [span for span in line["spans"] if span["text"].strip()]
+            if not spans:
+                continue
+            y = spans[0]["origin"][1] + size * 0.12
+            x0 = min(span["bbox"][0] for span in spans)
+            x1 = max(span["bbox"][2] for span in spans)
+            snippet.draw_line((x0, y), (x1, y), color=color, width=max(size * 0.06, 0.5))
 
 
 def _render_text(request: dict, color: List[float], page: _Page) -> Dict[str, Any]:
@@ -371,15 +394,20 @@ def _render_text(request: dict, color: List[float], page: _Page) -> Dict[str, An
         raise MarkError("text must be non-empty.")
     size = _positive(request.get("size"), "size", DEFAULT_TEXT_SIZE)
     bold = bool(request.get("bold", False))
-    fontname = "hebo" if bold else "helv"
-    if ("at" in request) == ("rect" in request):
-        raise MarkError("A text mark needs either at [x, y] or rect (to wrap within).")
-    out: Dict[str, Any] = {"text": text, "size": size, "bold": bold}
+    italic = bool(request.get("italic", False))
+    underline = bool(request.get("underline", False))
+    fontname = _FONTS[(bold, italic)]
+    if ("at" in request) == ("region" in request):
+        raise MarkError("A text mark needs either at [x, y] or region (to wrap within).")
+    out: Dict[str, Any] = {"text": text, "size": size}
+    out.update(
+        {k: True for k, v in (("bold", bold), ("italic", italic), ("underline", underline)) if v}
+    )
 
-    if "rect" in request:
-        rect = _rect(request["rect"], "rect")
-        x0, y0 = page.pt(rect[0], rect[1])
-        x1, y1 = page.pt(rect[2], rect[3])
+    if "region" in request:
+        region = _region(request["region"])
+        x0, y0 = page.pt(region[0], region[1])
+        x1, y1 = page.pt(region[2], region[3])
         fits = []
 
         def draw(snippet):
@@ -387,10 +415,14 @@ def _render_text(request: dict, color: List[float], page: _Page) -> Dict[str, An
                 snippet.rect, text, fontname=fontname, fontsize=size, color=color
             )
             fits.append(spare >= 0)
+            if underline:
+                _underline(snippet, size, color)
 
         pdf = _snippet(x1 - x0, y1 - y0, draw)
         if not fits[0]:
-            raise MarkError("The text does not fit its rect; make the rect larger or size smaller.")
+            raise MarkError(
+                "The text does not fit its region; make the region larger or size smaller."
+            )
         return dict(out, box=page.box(x0, y0, x1, y1), pdf=pdf)
 
     font = pymupdf.Font(fontname)
@@ -403,6 +435,8 @@ def _render_text(request: dict, color: List[float], page: _Page) -> Dict[str, An
         for i, line in enumerate(lines):
             baseline = ascent + i * size * LINE_SPACING
             snippet.insert_text((0, baseline), line, fontname=fontname, fontsize=size, color=color)
+        if underline:
+            _underline(snippet, size, color)
 
     box = _place(request, width, height, page, "top-left")
     return dict(out, box=box, pdf=_snippet(width, height, draw))
@@ -415,8 +449,20 @@ def _render_shape(request: dict, color: List[float], page: _Page) -> Dict[str, A
     out: Dict[str, Any] = {"shape": shape}
 
     if shape in ("check", "cross"):
-        size = _positive(request.get("size"), "size", DEFAULT_SYMBOL_SIZE)
         width = _positive(request.get("width"), "width", DEFAULT_LINE_WIDTH * 1.3)
+        if ("at" in request) == ("region" in request):
+            raise MarkError(f"A {shape} needs either at [x, y] or region.")
+        if "region" in request:
+            if "size" in request:
+                raise MarkError("size does not apply with region; the region sets the size.")
+            region = _region(request["region"])
+            x0, y0 = page.pt(region[0], region[1])
+            x1, y1 = page.pt(region[2], region[3])
+            size = min(x1 - x0, y1 - y0) - 2 * width
+            if size <= 0:
+                raise MarkError("The region is too small for the mark.")
+        else:
+            size = _positive(request.get("size"), "size", DEFAULT_SYMBOL_SIZE)
         half = size / 2 + width
         s = size / 2
 
@@ -429,14 +475,18 @@ def _render_shape(request: dict, color: List[float], page: _Page) -> Dict[str, A
                 snippet.draw_line(c + (-s, -s), c + (s, s), color=color, width=width)
                 snippet.draw_line(c + (-s, s), c + (s, -s), color=color, width=width)
 
-        box = _place(request, 2 * half, 2 * half, page, "center")
-        return dict(out, size=size, box=box, pdf=_snippet(2 * half, 2 * half, draw))
+        if "region" in request:
+            cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
+            box = page.box(cx - half, cy - half, cx + half, cy + half)
+        else:
+            box = _place(request, 2 * half, 2 * half, page, "center")
+        return dict(out, size=_round(size), box=box, pdf=_snippet(2 * half, 2 * half, draw))
 
     if shape == "highlight":
-        rect = _rect(request.get("rect"), "rect")
+        region = _region(request.get("region"))
         opacity = _opacity(request.get("opacity"), DEFAULT_HIGHLIGHT_OPACITY)
-        x0, y0 = page.pt(rect[0], rect[1])
-        x1, y1 = page.pt(rect[2], rect[3])
+        x0, y0 = page.pt(region[0], region[1])
+        x1, y1 = page.pt(region[2], region[3])
 
         def draw(snippet):
             snippet.draw_rect(snippet.rect, color=None, fill=color, fill_opacity=opacity)
@@ -446,9 +496,9 @@ def _render_shape(request: dict, color: List[float], page: _Page) -> Dict[str, A
 
     width = _positive(request.get("width"), "width", DEFAULT_LINE_WIDTH)
     if shape in ("circle", "box"):
-        rect = _rect(request.get("rect"), "rect")
-        x0, y0 = page.pt(rect[0], rect[1])
-        x1, y1 = page.pt(rect[2], rect[3])
+        region = _region(request.get("region"))
+        x0, y0 = page.pt(region[0], region[1])
+        x1, y1 = page.pt(region[2], region[3])
         w, h = x1 - x0 + width, y1 - y0 + width
 
         def draw(snippet):
@@ -461,8 +511,9 @@ def _render_shape(request: dict, color: List[float], page: _Page) -> Dict[str, A
         box = page.box(x0 - width / 2, y0 - width / 2, x1 + width / 2, y1 + width / 2)
         return dict(out, box=box, pdf=_snippet(w, h, draw))
 
-    ax, ay = page.pt(*_point(request.get("from"), "from"))
-    bx, by = page.pt(*_point(request.get("to"), "to"))
+    start, end = _point(request.get("from"), "from"), _point(request.get("to"), "to")
+    ax, ay = page.pt(*start)
+    bx, by = page.pt(*end)
     if (ax, ay) == (bx, by):
         raise MarkError("from and to must be different points.")
     head = max(6.0, width * 4) if shape == "arrow" else 0.0
@@ -481,18 +532,12 @@ def _render_shape(request: dict, color: List[float], page: _Page) -> Dict[str, A
                 tip = b + (head * math.cos(theta), head * math.sin(theta))
                 snippet.draw_line(b, tip, color=color, width=width)
 
-    box = _clamped_box(page, left, top, right, bottom)
-    return dict(out, box=box, pdf=_snippet(right - left, bottom - top, draw))
-
-
-def _clamped_box(page: _Page, x0: float, y0: float, x1: float, y1: float) -> List[float]:
-    """A box that may reach past the page edge only by its padding.
-
-    Lines and arrows are padded for their width and head; a line drawn along
-    the edge of the page keeps its full box so nothing is distorted.
-    """
-    box = [x0 / page.width, y0 / page.height, x1 / page.width, y1 / page.height]
-    return [_round(v) for v in box]
+    # The box is padded for the line width and arrowhead, so for a line along
+    # the page edge it reaches past the page; responses report the endpoints.
+    box = [_round(v) for v in (left / page.width, top / page.height)]
+    box += [_round(v) for v in (right / page.width, bottom / page.height)]
+    pdf = _snippet(right - left, bottom - top, draw)
+    return dict(out, **{"from": start, "to": end}, box=box, pdf=pdf)
 
 
 def _render_latex(request: dict, color: List[float], page: _Page) -> Dict[str, Any]:
@@ -502,8 +547,8 @@ def _render_latex(request: dict, color: List[float], page: _Page) -> Dict[str, A
     if not isinstance(source, str) or not source.strip():
         raise MarkError("latex must be non-empty.")
     size = _positive(request.get("size"), "size", DEFAULT_LATEX_SIZE)
-    if ("at" in request) == ("rect" in request):
-        raise MarkError("A latex mark needs either at [x, y] or rect (to scale into).")
+    if ("at" in request) == ("region" in request):
+        raise MarkError("A latex mark needs either at [x, y] or region (to scale into).")
     # SVG 1.1 output writes glyphs as plain paths; MuPDF misplaces the
     # <symbol>/<use> references of SVG 2 output.
     ziamath.config.svg2 = False
@@ -516,13 +561,32 @@ def _render_latex(request: dict, color: List[float], page: _Page) -> Dict[str, A
     with pymupdf.open("pdf", pdf) as doc:
         width, height = doc[0].rect.width, doc[0].rect.height
     out: Dict[str, Any] = {"latex": source, "size": size, "pdf": pdf}
-    if "rect" in request:
-        return dict(out, box=_fit(_rect(request["rect"], "rect"), width, height, page))
+    if "region" in request:
+        return dict(out, box=_fit(_region(request["region"]), width, height, page))
     return dict(out, box=_place(request, width, height, page, "top-left"))
 
 
+def _path_svg(data: str, view: Sequence[float], size: Sequence[float], style: str) -> str:
+    return (
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{size[0]}" height="{size[1]}" '
+        f'viewBox="{view[0]} {view[1]} {view[2]} {view[3]}">'
+        f'<path d="{data}" {style} stroke-linecap="round" stroke-linejoin="round"/></svg>'
+    )
+
+
+def _svg_to_pdf(svg: str) -> bytes:
+    try:
+        with pymupdf.open(stream=svg.encode("utf-8"), filetype="svg") as doc:
+            return doc.convert_to_pdf()
+    except Exception as e:
+        raise MarkError(f"The path could not be drawn: {e}") from None
+
+
 def _render_path(request: dict, color: List[float], page: _Page) -> Dict[str, Any]:
-    """SVG path data in points, with its origin at ``at``."""
+    """SVG path data in any units, scaled to fit ``region`` (aspect kept).
+
+    The line width stays in points however much the path is scaled.
+    """
     data = request["path"]
     if not isinstance(data, str) or not data.strip():
         raise MarkError('path must be SVG path data, e.g. "M 0 0 L 10 10".')
@@ -534,37 +598,39 @@ def _render_path(request: dict, color: List[float], page: _Page) -> Dict[str, An
     width = _positive(request.get("width"), "width", DEFAULT_LINE_WIDTH)
     fill = parse_color(request["fill"]) if request.get("fill") else None
     opacity = _opacity(request.get("opacity"), 1.0)
-    ax, ay = page.pt(*_point(request.get("at"), "at"))
-    # Draw on a canvas centered on the origin, large enough for any path that
-    # stays on the page, then crop to what was drawn.
-    reach = 2 * max(page.width, page.height)
-    svg = (
-        f'<svg xmlns="http://www.w3.org/2000/svg" width="{2 * reach}" height="{2 * reach}" '
-        f'viewBox="{-reach} {-reach} {2 * reach} {2 * reach}">'
-        f'<path d="{data}" stroke="{_hex(color)}" stroke-width="{width}" '
-        f'fill="{_hex(fill) if fill else "none"}" opacity="{opacity}" '
-        'stroke-linecap="round" stroke-linejoin="round"/></svg>'
+    region = _region(request.get("region"))
+
+    # Measure the path in its own units; MuPDF reports its bounds even
+    # where it lies outside the canvas.
+    measure = _path_svg(data, (0, 0, 100, 100), (100, 100), 'stroke="black" fill="none"')
+    with pymupdf.open("pdf", _svg_to_pdf(measure)) as doc:
+        drawings = doc[0].get_drawings()
+    if not drawings:
+        raise MarkError("The path draws nothing.")
+    bounds = pymupdf.Rect(drawings[0]["rect"])
+    for drawing in drawings[1:]:
+        bounds |= drawing["rect"]
+    if bounds.width <= 0 and bounds.height <= 0:
+        raise MarkError("The path draws nothing.")
+
+    x0, y0 = page.pt(region[0], region[1])
+    x1, y1 = page.pt(region[2], region[3])
+    room_w, room_h = x1 - x0 - width, y1 - y0 - width
+    if room_w <= 0 or room_h <= 0:
+        raise MarkError("The region is too small for the path's line width.")
+    scale = min(
+        room_w / bounds.width if bounds.width > 0 else math.inf,
+        room_h / bounds.height if bounds.height > 0 else math.inf,
     )
-    try:
-        with pymupdf.open(stream=svg.encode("utf-8"), filetype="svg") as doc:
-            canvas = pymupdf.open("pdf", doc.convert_to_pdf())
-    except Exception as e:
-        raise MarkError(f"The path could not be drawn: {e}") from None
-    with canvas:
-        drawings = canvas[0].get_drawings()
-        if not drawings:
-            raise MarkError("The path draws nothing.")
-        bounds = pymupdf.Rect(drawings[0]["rect"])
-        for drawing in drawings[1:]:
-            bounds |= drawing["rect"]
-        bounds += (-width, -width, width, width)
-
-        def draw(snippet):
-            snippet.show_pdf_page(snippet.rect, canvas, 0, clip=bounds)
-
-        pdf = _snippet(bounds.width, bounds.height, draw)
-    x0, y0 = ax + bounds.x0 - reach, ay + bounds.y0 - reach
-    box = page.box(x0, y0, x0 + bounds.width, y0 + bounds.height)
+    out_w, out_h = bounds.width * scale + width, bounds.height * scale + width
+    pad = width / 2 / scale
+    view = (bounds.x0 - pad, bounds.y0 - pad, bounds.width + 2 * pad, bounds.height + 2 * pad)
+    style = (
+        f'stroke="{_hex(color)}" stroke-width="{width / scale}" '
+        f'fill="{_hex(fill) if fill else "none"}" opacity="{opacity}"'
+    )
+    pdf = _svg_to_pdf(_path_svg(data, view, (out_w, out_h), style))
+    box = page.box(x0, y0, x0 + out_w, y0 + out_h)
     return {"path": data, "box": box, "pdf": pdf}
 
 
@@ -636,7 +702,7 @@ def _render_graphic(request: dict, page: _Page) -> Dict[str, Any]:
         raise MarkError(f"The graphic could not be read: {e}") from None
     with pymupdf.open("pdf", pdf) as doc:
         width, height = doc[0].rect.width, doc[0].rect.height
-    box = _fit(_rect(request.get("rect"), "rect"), width, height, page)
+    box = _fit(_region(request.get("region")), width, height, page)
     return {"format": fmt, "box": box, "pdf": pdf}
 
 
@@ -698,7 +764,10 @@ def summarize(mark: Dict[str, Any], page: Optional[int]) -> Dict[str, Any]:
             out[key] = mark[key]
     if mark.get("color"):
         out["color"] = color_name(mark["color"])
-    out["box"] = mark["box"]
+    if "from" in mark:
+        out["from"], out["to"] = mark["from"], mark["to"]
+    else:
+        out["region"] = mark["box"]
     return out
 
 

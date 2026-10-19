@@ -75,14 +75,14 @@ def test_marks_round_trip_and_clear_restores_original(tmp_path):
         add=[
             {"page": 1, "id": "score", "text": "3/4", "at": [0.8, 0.05], "size": 20},
             {"page": 1, "id": "q1", "shape": "check", "at": [0.4, 0.24]},
-            {"page": 2, "id": "note", "text": "See me", "rect": [0.1, 0.5, 0.6, 0.6]},
-            {"page": 2, "shape": "circle", "rect": [0.1, 0.1, 0.3, 0.2]},
+            {"page": 2, "id": "note", "text": "See me", "region": [0.1, 0.5, 0.6, 0.6]},
+            {"page": 2, "shape": "circle", "region": [0.1, 0.1, 0.3, 0.2]},
             {"page": 2, "shape": "arrow", "from": [0.5, 0.3], "to": [0.3, 0.3]},
             {"page": 2, "latex": r"\frac{a}{b}", "at": [0.6, 0.1]},
-            {"page": 2, "graphic": SVG, "rect": [0.5, 0.7, 0.7, 0.8]},
-            {"page": 2, "graphic": _b64(_png()), "rect": [0.1, 0.8, 0.2, 0.85]},
-            {"page": 2, "graphic": _b64(_one_page_pdf()), "rect": [0.3, 0.8, 0.5, 0.9]},
-            {"page": 2, "graphic_file": str(png_file), "rect": [0.6, 0.9, 0.7, 0.95]},
+            {"page": 2, "graphic": SVG, "region": [0.5, 0.7, 0.7, 0.8]},
+            {"page": 2, "graphic": _b64(_png()), "region": [0.1, 0.8, 0.2, 0.85]},
+            {"page": 2, "graphic": _b64(_one_page_pdf()), "region": [0.3, 0.8, 0.5, 0.9]},
+            {"page": 2, "graphic_file": str(png_file), "region": [0.6, 0.9, 0.7, 0.95]},
         ]
     )
     assert result["added"][:3] == ["score", "q1", "note"]
@@ -110,7 +110,7 @@ def test_rebuild_reuses_stored_snippets():
     first = _edit(add=[{"page": 1, "id": "a", "text": "keep", "at": [0.1, 0.1]}])
     base, marks = pdf_marks.load_state(pdf_marks.build(original, first["marks"]))
     second = _edit(
-        marks, add=[{"page": 1, "id": "b", "shape": "box", "rect": [0.2, 0.2, 0.3, 0.3]}]
+        marks, add=[{"page": 1, "id": "b", "shape": "box", "region": [0.2, 0.2, 0.3, 0.3]}]
     )
     assert second["marks"][0]["pdf"] == first["marks"][0]["pdf"]
 
@@ -156,8 +156,8 @@ def test_default_colors():
             {"page": 1, "shape": "cross", "at": [0.2, 0.1]},
             {"page": 1, "text": "x", "at": [0.3, 0.1]},
             {"page": 1, "latex": "x^2", "at": [0.5, 0.1]},
-            {"page": 1, "path": "M 0 0 L 5 5", "at": [0.6, 0.1]},
-            {"page": 1, "shape": "highlight", "rect": [0.1, 0.2, 0.3, 0.22]},
+            {"page": 1, "path": "M 0 0 L 5 5", "region": [0.6, 0.1, 0.65, 0.15]},
+            {"page": 1, "shape": "highlight", "region": [0.1, 0.2, 0.3, 0.22]},
             {"page": 1, "text": "4/4", "at": [0.4, 0.1], "color": "green"},
         ]
     )
@@ -188,7 +188,9 @@ def test_check_and_cross_are_centered_by_default():
 
 
 def test_highlight_is_a_translucent_fill():
-    mark = _edit(add=[{"page": 1, "shape": "highlight", "rect": [0.1, 0.2, 0.4, 0.25]}])["marks"][0]
+    mark = _edit(add=[{"page": 1, "shape": "highlight", "region": [0.1, 0.2, 0.4, 0.25]}])["marks"][
+        0
+    ]
     assert mark["box"] == [0.1, 0.2, 0.4, 0.25]
     with pymupdf.open("pdf", base64.b64decode(mark["pdf"])) as snippet:
         (drawing,) = snippet[0].get_drawings()
@@ -196,22 +198,55 @@ def test_highlight_is_a_translucent_fill():
     assert drawing["color"] is None
 
 
-def test_path_is_in_points_from_at():
-    mark = _edit(add=[{"page": 1, "path": "M 0 0 L 20 0 L 20 10", "at": [0.5, 0.5], "width": 1}])[
+def test_path_is_scaled_into_its_region_keeping_line_width():
+    region = [0.2, 0.2, 0.6, 0.3]
+    mark = _edit(add=[{"page": 1, "path": "M 0 0 L 2 0 L 2 1", "region": region, "width": 2}])[
         "marks"
     ][0]
     left, top, right, bottom = mark["box"]
-    # The box holds the path plus the line width on every side.
-    assert left * A4[0] == pytest.approx(0.5 * A4[0] - 1, abs=0.6)
-    assert right * A4[0] == pytest.approx(0.5 * A4[0] + 21, abs=0.6)
-    assert top * A4[1] == pytest.approx(0.5 * A4[1] - 1, abs=0.6)
-    assert bottom * A4[1] == pytest.approx(0.5 * A4[1] + 11, abs=0.6)
-    assert mark["path"] == "M 0 0 L 20 0 L 20 10"
+    assert (left, top) == (0.2, 0.2)
+    # The path is twice as wide as tall; the region's height limits it.
+    height_pt = (bottom - top) * A4[1]
+    width_pt = (right - left) * A4[0]
+    assert height_pt == pytest.approx(0.1 * A4[1], abs=0.1)
+    assert width_pt - 2 == pytest.approx(2 * (height_pt - 2), abs=0.5)
+    with pymupdf.open("pdf", base64.b64decode(mark["pdf"])) as snippet:
+        widths = {round(d["width"], 2) for d in snippet[0].get_drawings()}
+    assert widths == {2.0}
+
+
+def test_path_units_do_not_matter():
+    small = _edit(add=[{"page": 1, "path": "M 0 0 L 1 1", "region": [0.1, 0.1, 0.2, 0.2]}])
+    large = _edit(add=[{"page": 1, "path": "M 0 0 L 500 500", "region": [0.1, 0.1, 0.2, 0.2]}])
+    assert small["marks"][0]["box"] == large["marks"][0]["box"]
+
+
+def test_listing_uses_regions_and_line_endpoints():
+    result = _edit(
+        add=[
+            {"page": 1, "id": "hl", "shape": "highlight", "region": [0.1, 0.2, 0.3, 0.25]},
+            {"page": 1, "id": "ln", "shape": "line", "from": [0.0, 0.5], "to": [1.0, 0.5]},
+            {"page": 1, "id": "ck", "shape": "check", "region": [0.4, 0.4, 0.45, 0.43]},
+        ]
+    )
+    hl, ln, ck = (pdf_marks.summarize(m, 1) for m in result["marks"])
+    assert hl["region"] == [0.1, 0.2, 0.3, 0.25]
+    assert ln["from"] == [0.0, 0.5] and ln["to"] == [1.0, 0.5] and "region" not in ln
+    left, top, right, bottom = ck["region"]
+    assert (left + right) / 2 == pytest.approx(0.425, abs=1e-3)
+    assert (top + bottom) / 2 == pytest.approx(0.415, abs=1e-3)
 
 
 def test_path_with_fill():
     mark = _edit(
-        add=[{"page": 1, "path": "M 0 0 L 10 0 L 5 8 Z", "at": [0.5, 0.5], "fill": "yellow"}]
+        add=[
+            {
+                "page": 1,
+                "path": "M 0 0 L 10 0 L 5 8 Z",
+                "region": [0.5, 0.5, 0.6, 0.6],
+                "fill": "yellow",
+            }
+        ]
     )["marks"][0]
     with pymupdf.open("pdf", base64.b64decode(mark["pdf"])) as snippet:
         fills = [d["fill"] for d in snippet[0].get_drawings() if d.get("fill")]
@@ -231,7 +266,7 @@ def test_latex_renders_math_as_vectors():
 
 
 def test_graphic_fits_rect_keeping_aspect():
-    result = _edit(add=[{"page": 1, "graphic": SVG, "rect": [0.1, 0.1, 0.9, 0.9]}])
+    result = _edit(add=[{"page": 1, "graphic": SVG, "region": [0.1, 0.1, 0.9, 0.9]}])
     left, top, right, bottom = result["marks"][0]["box"]
     assert (left, top, right) == (0.1, 0.1, 0.9)
     assert (right - left) * A4[0] / ((bottom - top) * A4[1]) == pytest.approx(2.0, rel=0.01)
@@ -254,27 +289,31 @@ def test_marks_follow_pdf_pages_not_tablet_positions():
         ({"page": 1, "shape": "check", "at": [1.2, 0.5]}, "from 0 to 1"),
         ({"page": 1, "shape": "star", "at": [0.5, 0.5]}, "shape must be one of"),
         ({"page": 1, "shape": "line", "from": [0.1, 0.1], "to": [0.1, 0.1]}, "different"),
-        ({"page": 1, "shape": "circle", "rect": [0.5, 0.5, 0.4, 0.6]}, "left < right"),
+        ({"page": 1, "shape": "circle", "region": [0.5, 0.5, 0.4, 0.6]}, "left < right"),
         ({"page": 1, "text": "x"}, "either"),
-        ({"page": 1, "text": "x", "at": [0.1, 0.1], "rect": [0, 0, 1, 1]}, "either"),
+        ({"page": 1, "text": "x", "at": [0.1, 0.1], "region": [0, 0, 1, 1]}, "either"),
         ({"page": 1, "text": "far too long for the edge", "at": [0.95, 0.1]}, "runs off"),
-        ({"page": 1, "text": "long " * 200, "rect": [0.1, 0.1, 0.2, 0.12]}, "does not fit"),
+        ({"page": 1, "text": "long " * 200, "region": [0.1, 0.1, 0.2, 0.12]}, "does not fit"),
         ({"page": 1, "text": "x", "latex": "y", "at": [0.1, 0.1]}, "exactly one"),
         ({"page": 1, "text": "x", "at": [0.1, 0.1], "color": "chartreuse"}, "Unknown color"),
-        ({"page": 1, "graphic": SVG, "rect": [0, 0, 1, 1], "color": "red"}, "does not apply"),
-        ({"page": 1, "graphic": "not base64!", "rect": [0, 0, 1, 1]}, "base64"),
-        ({"page": 1, "graphic": _b64(b"GIF89a...."), "rect": [0, 0, 1, 1]}, "SVG, PDF, PNG"),
-        ({"page": 1, "graphic": _b64(_pdf(2)), "rect": [0, 0, 1, 1]}, "exactly one page"),
-        ({"page": 1, "graphic": SVG}, "rect"),
-        ({"page": 1, "graphic_file": "/nonexistent/plot.svg", "rect": [0, 0, 1, 1]}, "not found"),
+        ({"page": 1, "graphic": SVG, "region": [0, 0, 1, 1], "color": "red"}, "does not apply"),
+        ({"page": 1, "graphic": "not base64!", "region": [0, 0, 1, 1]}, "base64"),
+        ({"page": 1, "graphic": _b64(b"GIF89a...."), "region": [0, 0, 1, 1]}, "SVG, PDF, PNG"),
+        ({"page": 1, "graphic": _b64(_pdf(2)), "region": [0, 0, 1, 1]}, "exactly one page"),
+        ({"page": 1, "graphic": SVG}, "region"),
+        ({"page": 1, "graphic_file": "/nonexistent/plot.svg", "region": [0, 0, 1, 1]}, "not found"),
         ({"page": 3, "shape": "check", "at": [0.1, 0.1]}, "does not exist"),
-        ({"page": 1, "text": "x", "rect": [0, 0, 1, 1], "anchor": "center"}, "only to marks"),
+        ({"page": 1, "text": "x", "region": [0, 0, 1, 1], "anchor": "center"}, "only to marks"),
         ({"page": 1, "text": "x", "at": [0.5, 0.5], "anchor": "middle"}, "anchor must be"),
-        ({"page": 1, "shape": "highlight", "rect": [0, 0, 1, 1], "opacity": 2}, "opacity"),
-        ({"page": 1, "path": '"/><image href="x', "at": [0.5, 0.5]}, "SVG path data"),
-        ({"page": 1, "path": "M 0 0", "at": [0.5, 0.5]}, "draws nothing"),
-        ({"page": 1, "path": "M 0 0 L 900 0", "at": [0.5, 0.5]}, "runs off"),
-        ({"page": 1, "path": "M 0 0 L 5 5"}, "at"),
+        ({"page": 1, "shape": "highlight", "region": [0, 0, 1, 1], "opacity": 2}, "opacity"),
+        ({"page": 1, "path": '"/><image href="x', "region": [0, 0, 1, 1]}, "SVG path data"),
+        ({"page": 1, "path": "M 0 0", "region": [0, 0, 1, 1]}, "draws nothing"),
+        (
+            {"page": 1, "path": "M 0 0 L 9 0", "region": [0.5, 0.5, 0.501, 0.501], "width": 2},
+            "too small",
+        ),
+        ({"page": 1, "path": "M 0 0 L 5 5"}, "region"),
+        ({"page": 1, "shape": "check", "region": [0.1, 0.1, 0.2, 0.2], "size": 5}, "size does not"),
         ({"shape": "check", "at": [0.1, 0.1]}, "page number"),
         ({"page": 1, "id": "bad id!", "shape": "check", "at": [0.1, 0.1]}, "Mark ids"),
     ],
@@ -288,7 +327,7 @@ def test_graphic_file_must_be_a_graphic(tmp_path):
     secret = tmp_path / "notes.txt"
     secret.write_text("private")
     with pytest.raises(MarkError, match="SVG, PDF, PNG or JPEG"):
-        _edit(add=[{"page": 1, "graphic_file": str(secret), "rect": [0, 0, 1, 1]}])
+        _edit(add=[{"page": 1, "graphic_file": str(secret), "region": [0, 0, 1, 1]}])
 
 
 def test_duplicate_id_needs_removal_first():
@@ -343,7 +382,7 @@ def test_older_mark_format_must_be_cleared():
 def test_text_lines_are_page_fractions():
     lines = pdf_marks.text_lines(_pdf(), 0)
     assert lines[0]["text"] == "Answer: ____"
-    left, top, right, bottom = lines[0]["box"]
+    left, top, right, bottom = lines[0]["region"]
     assert left == pytest.approx(100 / 595, abs=0.005)
     assert top < 200 / 842 < bottom
 
@@ -551,3 +590,30 @@ def test_archive_without_marks_restores_original_pdf(original):
     with zipfile.ZipFile(io.BytesIO(_archive_without_marks(archive.getvalue()))) as zf:
         assert zf.read(f"{DOC_ID}.pdf") == original
         assert json.loads(zf.read(f"{DOC_ID}.content")) == CONTENT
+
+
+def test_text_styles():
+    mark = _edit(
+        add=[
+            {
+                "page": 1,
+                "text": "Styled note",
+                "at": [0.1, 0.1],
+                "bold": True,
+                "italic": True,
+                "underline": True,
+            }
+        ]
+    )["marks"][0]
+    assert (mark["bold"], mark["italic"], mark["underline"]) == (True, True, True)
+    with pymupdf.open("pdf", base64.b64decode(mark["pdf"])) as snippet:
+        fonts = {
+            span["font"]
+            for b in snippet[0].get_text("dict")["blocks"]
+            for line in b["lines"]
+            for span in line["spans"]
+        }
+        assert any("BoldOblique" in f for f in fonts)
+        assert len(snippet[0].get_drawings()) == 1
+    plain = _edit(add=[{"page": 1, "text": "Plain", "at": [0.1, 0.1]}])["marks"][0]
+    assert "bold" not in plain and "underline" not in plain

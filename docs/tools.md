@@ -191,8 +191,9 @@ text comes from that original, so `content_type="raw"` never includes marks.
 With `"text"` and `"annotations"` the marks are listed under
 `--- Marks (added with remarkable_mark_pdf) ---`, e.g.
 `q3-note (page 1, red, text): Orange is a secondary color.`, and returned as
-`marks: [{"id", "page", "kind", "color", "text", "at" | "rect" | "points"}]`
-with positions as page fractions.
+`marks: [{"id", "page", "kind", "shape" | "text" | "latex" | "path" | "format",
+"color", "region"}]`, with lines and arrows giving `from` and `to` instead of a
+region. Regions are page fractions, as for `remarkable_image`'s `region`.
 
 ### Smart Features
 

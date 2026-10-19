@@ -684,7 +684,7 @@ Or set the environment variable:
 
 - **Upload registers in cloud, SSH, and USB web mode** — local-directory mode never exposes write tools.
 - **Tag changes are written the way the tablet writes them** — tags live only in a document's `.content` file, so `remarkable_tag` rewrites it in the tablet's own JSON layout and key order, changes nothing but the tag lists (checked before upload), and updates only `lastModified` in `.metadata`, as the desktop app does. A request that changes nothing writes nothing. Like the desktop app, a tag change replaces the tablet's tag list: tag edits made on the tablet while offline and not yet synced are lost.
-- **Marks are drawn into the PDF, never into the ink.** The tablet never changes a document's PDF and keeps the user's ink in separate files, so `remarkable_mark_pdf` replaces only the PDF (and `lastModified` in `.metadata`) with a copy of the same page count and page sizes, refusing any change that would move the ink. Each mark is rendered once, when it is added, into a small PDF stored with it, so it looks the same however often the PDF is rebuilt. The marked PDF carries the original PDF and the mark list as embedded attachments; every change places the remaining marks on the original, so a removed mark leaves nothing behind and `clear=True` restores the original bytes. Marks cannot be erased on the tablet. LaTeX is rendered on the server with [ziamath](https://github.com/cdelker/ziamath) (math only, no TeX install needed). Graphics rendered elsewhere are passed inline (SVG markup, or base64 up to 2 MB) or as a `graphic_file` path (up to 10 MB), and must parse as SVG, a one-page PDF, PNG or JPEG; SVG may only reference its own elements or `data:` URIs, so no local file can be pulled into an uploaded PDF. Marks are black by default, and highlights yellow.
+- **Marks are drawn into the PDF, never into the ink.** The tablet never changes a document's PDF and keeps the user's ink in separate files, so `remarkable_mark_pdf` replaces only the PDF (and `lastModified` in `.metadata`) with a copy of the same page count and page sizes, refusing any change that would move the ink. Each mark is rendered once, when it is added, into a small PDF stored with it, so it looks the same however often the PDF is rebuilt. The marked PDF carries the original PDF and the mark list as embedded attachments; every change places the remaining marks on the original, so a removed mark leaves nothing behind and `clear=True` restores the original bytes. Marks cannot be erased on the tablet. LaTeX is rendered on the server with [ziamath](https://github.com/cdelker/ziamath) (math only, no TeX install needed). Positions are page fractions: points `[x, y]` and regions `[left, top, right, bottom]`, the same regions `remarkable_image` takes and `remarkable_read` returns. Graphics rendered elsewhere are passed inline (SVG markup, or base64 up to 2 MB) or as a `graphic_file` path (up to 10 MB), and must parse as SVG, a one-page PDF, PNG or JPEG; SVG may only reference its own elements or `data:` URIs, so no local file can be pulled into an uploaded PDF. Marks are black by default, and highlights yellow.
 - **mkdir, move, rename, tag, delete register in cloud and SSH modes only** — they are not exposed on USB web (the tablet's USB web firmware has no folder/move/rename/delete endpoints), keeping the tool list scoped to what the active transport actually supports.
 - **Delete prompts for confirmation when possible** — if the client supports MCP elicitation, `remarkable_delete` asks the user to confirm before deleting. MCP SDK 2.x carries that prompt as a multi-round input request for `2026-07-28` clients and as push elicitation for legacy clients. If the client can't show a prompt, the delete is **refused** (not performed) unless `REMARKABLE_SKIP_CONFIRM=1` is set — so write-on-by-default can't silently delete from clients that lack elicitation. Cloud and SSH move items to Trash by default. SSH also supports `permanent=True` for an explicitly requested permanent removal; cloud permanent deletion remains a Trash-management operation in the app/tablet. Set `REMARKABLE_SKIP_CONFIRM=1` to allow deletes without a prompt in automated setups. All write tools carry `ToolAnnotations(read_only_hint=False)` (and `destructive_hint=True` for delete) so an agent harness can gate writes at the MCP layer.
 - **SSH work is fair and serialized per server** — one FIFO dispatcher owns every SSH subprocess, so startup scans, reads, uploads, mutations, and refresh probes cannot churn the tablet's USB CDC connection concurrently. Cached metadata reads bypass the queue.
@@ -739,7 +739,7 @@ remarkable_mark_pdf("Week 3 worksheet", color="red", add=[
 
 # Highlight a line of a paper and add a note in the margin
 remarkable_mark_pdf("Paper", add=[
-    {"page": 3, "id": "claim", "shape": "highlight", "rect": [0.12, 0.41, 0.88, 0.43]},
+    {"page": 3, "id": "claim", "shape": "highlight", "region": [0.12, 0.41, 0.88, 0.43]},
     {"page": 3, "id": "claim-note", "text": "Compare with Fig. 2",
      "at": [0.9, 0.42], "anchor": "right", "size": 8},
 ])
@@ -748,9 +748,9 @@ remarkable_mark_pdf("Week 3 worksheet", add=[
     {"page": 2, "id": "q5-fix", "latex": r"x = \frac{-b \pm \sqrt{b^2-4ac}}{2a}",
      "at": [0.45, 0.52]},
     {"page": 2, "id": "q5-arrow", "shape": "arrow", "from": [0.44, 0.53], "to": [0.36, 0.53]},
-    # Any other shape as SVG path data in points, here a brace
+    # Any other shape as SVG path data, scaled to fit its region; here a brace
     {"page": 2, "id": "q5-brace", "path": "M 0 0 C 8 0 4 20 10 20 C 4 20 8 40 0 40",
-     "at": [0.8, 0.5]},
+     "region": [0.8, 0.5, 0.83, 0.58]},
 ])
 # After the answer is revised, replace the marks by id
 remarkable_mark_pdf("Week 3 worksheet", remove=["q3", "q3-note", "score"], add=[

@@ -2928,8 +2928,11 @@ def register_write_tools():
                 cleanly. With no changes requested it lists the current marks.
                 Marks cannot be erased on the tablet, only with this tool.
 
-                Coordinates are fractions of the page (0-1 from the top-left), the
-                same frame as remarkable_image and its region. Before marking a
+                Positions are fractions of the page (0-1 from the top-left): a
+                point is [x, y] and a region is [left, top, right, bottom], the
+                same regions remarkable_image takes and layout, remarkable_read
+                and this tool's listing return, so they can be passed straight
+                back. Sizes and widths are in points. Before marking a
                 page, call with layout=<page> for the positions of the PDF's text
                 lines and of the user's ink on it, and look at the page with
                 remarkable_image. Place marks beside the user's ink rather than
@@ -2941,24 +2944,25 @@ def register_write_tools():
 
                 Each mark in `add` has a `page` (1-based), an optional `id`, and
                 exactly one of:
-                - text: string ("\n" starts a new line); at [x, y], or rect
-                  [left, top, right, bottom] to wrap within; options size
-                  (points, default 11), bold
-                - shape: "check" or "cross" with at; "circle", "box" or
-                  "highlight" with rect; "line" or "arrow" with from [x, y] and
-                  to [x, y]. Options: size (check, cross), width (line width in
-                  points), opacity (highlight, default 0.35)
-                - path: SVG path data in points with its origin at `at`, for any
-                  other shape, e.g. "M -4 4 L 0 -4 L 4 4" (a caret). Options:
-                  width, fill (a color), opacity
-                - latex: LaTeX math, e.g. "\\frac{a}{b} = \\sqrt{2}"; at, or rect
-                  to scale into; option size (default 12)
+                - text: string ("\n" starts a new line); at, or region to wrap
+                  within; options size (default 11), bold, italic, underline
+                - shape: "check" or "cross" with at (option size) or region;
+                  "circle", "box" or "highlight" with region; "line" or "arrow"
+                  with from [x, y] and to [x, y]. Options: width (line width),
+                  opacity (highlight, default 0.35)
+                - path: SVG path data for any other shape, in any units, with
+                  region: the path is scaled to fit the region (aspect kept, at
+                  its top-left), e.g. "M 0 10 L 5 0 L 10 10" in a small region
+                  is a caret. Options: width (stays in points), fill (a color),
+                  opacity
+                - latex: LaTeX math, e.g. "\\frac{a}{b} = \\sqrt{2}"; at, or
+                  region to scale into; option size (default 12)
                 - graphic: content rendered elsewhere: SVG markup, or base64 PDF
-                  (one page), PNG or JPEG (up to 2 MB); with rect, scaled to fit
-                  and kept at the rect's top-left. SVG may only reference its own
-                  elements or data: URIs.
+                  (one page), PNG or JPEG (up to 2 MB); with region, scaled to
+                  fit at its top-left. SVG may only reference its own elements
+                  or data: URIs.
                 - graphic_file: path of such a file on the machine running this
-                  server (up to 10 MB), with rect
+                  server (up to 10 MB), with region
                 Marks placed with `at` take an optional anchor: the point of the
                 mark placed at `at`: top-left, top, top-right, left, center,
                 right, bottom-left, bottom or bottom-right. Default center for
@@ -2988,9 +2992,9 @@ def register_write_tools():
                 - dry_run: Return preview images of the changed pages without
                   writing
                 - layout: Tablet page number; the response adds that page's text
-                  lines (from the PDF before marks) and ink regions, each with a
-                  box [left, top, right, bottom] in page fractions. Not combined
-                  with a write; use it alone or with dry_run.
+                  lines (from the PDF before marks), each with its region, and
+                  the regions of the user's ink. Not combined with a write; use
+                  it alone or with dry_run.
                 </parameters>
                 <examples>
                 - remarkable_mark_pdf("Worksheet", color="red", add=[
@@ -3004,7 +3008,7 @@ def register_write_tools():
                   dry_run=True)
                 - remarkable_mark_pdf("Paper", add=[
                     {"page": 3, "id": "key-claim", "shape": "highlight",
-                     "rect": [0.12, 0.41, 0.88, 0.43]},
+                     "region": [0.12, 0.41, 0.88, 0.43]},
                     {"page": 3, "id": "key-claim-note", "text": "Compare with Fig. 2",
                      "at": [0.9, 0.42], "anchor": "right", "size": 8}])
                 - remarkable_mark_pdf("Notes", add=[
@@ -3014,7 +3018,8 @@ def register_write_tools():
                     {"page": 2, "id": "formula-arrow", "shape": "arrow",
                      "from": [0.44, 0.53], "to": [0.36, 0.53]},
                     {"page": 2, "id": "brace", "path":
-                     "M 0 0 C 8 0 4 20 10 20 C 4 20 8 40 0 40", "at": [0.8, 0.3]}])
+                     "M 0 0 C 8 0 4 20 10 20 C 4 20 8 40 0 40",
+                     "region": [0.8, 0.3, 0.83, 0.38]}])
                 - remarkable_mark_pdf("Worksheet", remove=["q3", "q3-note"], add=[
                     {"page": 1, "id": "q3", "shape": "check", "at": [0.38, 0.33],
                      "color": "green"}])  # the answer was revised
