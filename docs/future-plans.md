@@ -54,7 +54,13 @@ byte in ids, 1-255; 0 is structure) mapped to a UUID by the `AuthorIdsBlock`;
   page-info blocks; every other block stayed byte-identical. rmscene re-encodes
   the `AuthorIdsBlock` exactly.
 
-Plan: one random UUID per installation, stored in the config; reuse its
+- **Own author, tested:** strokes appended through the cloud under a separate
+  author (its UUID added to the `AuthorIdsBlock` as `2`, every other block
+  copied byte for byte) synced and appeared. With the tablet offline, it drew
+  `(1, 18)` while the cloud added `(2, 18)`; after syncing, both strokes were
+  on the tablet and in the cloud, and the tablet kept the new author entry.
+
+Plan (validated above): one random UUID per installation, stored in the config; reuse its
 author number in a file or take the lowest free one; counter = max over all ids
 + 1; replace only the `AuthorIdsBlock` (add the entry) and append strokes,
 copying every other block's bytes. The MCP's strokes are then those with its
