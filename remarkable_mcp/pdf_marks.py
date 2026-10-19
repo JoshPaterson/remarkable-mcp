@@ -145,6 +145,11 @@ NEAR_RADIUS = 0.4
 NEAR_STEP = 0.004
 LEADER_WIDTH = 0.75
 LEADER_GAP = 0.008
+# A mark this close to its point (page fraction), or this close to the
+# region holding the point (such as the answer it is about), sits beside it
+# and gets no leader.
+BESIDE_POINT = 0.024
+BESIDE_TARGET = 0.015
 # How far a leader may run inside the region holding its point.
 LEADER_ENTRY = 0.06
 # Bordered notes: padding, corner radius and line width (points). A border
@@ -1244,6 +1249,21 @@ def _leader_route(
     return [[_round(v) for v in p] for p in (start, end)]
 
 
+def _gap(a: Sequence[float], b: Sequence[float]) -> float:
+    """The distance between two boxes (0 if they touch or overlap)."""
+    dx = max(a[0] - b[2], b[0] - a[2], 0.0)
+    dy = max(a[1] - b[3], b[1] - a[3], 0.0)
+    return math.hypot(dx, dy)
+
+
+def _beside(box, near, targets) -> bool:
+    """True if ``box`` sits beside its point, or beside the region holding
+    it, so a leader would add nothing."""
+    if _gap(box, (near[0], near[1], near[0], near[1])) <= BESIDE_POINT:
+        return True
+    return any(_gap(box, t) <= BESIDE_TARGET for t in targets)
+
+
 def _near_axis(p, q, size) -> bool:
     """True if the segment p-q is within ``LEADER_AXIS_ANGLE`` of horizontal
     or vertical on a page of ``size`` points."""
@@ -1382,13 +1402,23 @@ def _render_near(
         trial["box"][3] - optical[1],
         trial["box"][3] - optical[2],
     )
-    route = (lambda box: _leader_route(box, near, size, inset)) if leader else None
-    x0, y0 = _place_near(near, width, height, obstacles, route, printed, size)
+    targets = [
+        o
+        for o in list(obstacles) + list(printed)
+        if o[0] <= near[0] <= o[2] and o[1] <= near[1] <= o[3]
+    ]
+
+    def route(box):
+        if _beside(box, near, targets):
+            return None
+        return _leader_route(box, near, size, inset)
+
+    x0, y0 = _place_near(near, width, height, obstacles, route if leader else None, printed, size)
     # A border lies outside the content, whose top-left at gives.
     pad_x, pad_y = (BORDER_PAD / size[0], BORDER_PAD / size[1]) if border and note else (0, 0)
     stored = render_mark(dict(base, at=[x0 + pad_x, y0 + pad_y], anchor="top-left"), size, color)
     stored["request"] = dict(stored.get("request", {}), near=near, leader=leader)
-    points = _leader_route(stored["box"], near, size, inset) if leader else None
+    points = route(stored["box"]) if leader else None
     if points:
         line = {
             "shape": "line",

@@ -871,6 +871,14 @@ def test_listing_shows_style():
     assert pdf_marks.summarize(old, 1)["style"] == {"size": 9, "bold": True}
 
 
+@pytest.fixture
+def always_lead(monkeypatch):
+    """Draw leaders even for notes beside their point, to test the leaders
+    themselves."""
+    monkeypatch.setattr(pdf_marks, "BESIDE_POINT", -1.0)
+    monkeypatch.setattr(pdf_marks, "BESIDE_TARGET", -1.0)
+
+
 def _near_edit(add, obstacles, marks=()):
     return pdf_marks.edit_marks(
         list(marks),
@@ -920,7 +928,7 @@ def test_near_avoids_marks_placed_earlier_in_the_call():
     assert not pdf_marks._overlaps(a["box"], b["box"])
 
 
-def test_leader_line_is_drawn_and_removed_with_its_mark():
+def test_leader_line_is_drawn_and_removed_with_its_mark(always_lead):
     ink = [[0.0, 0.4, 1.0, 0.5]]
     result = _near_edit(
         [{"page": 1, "id": "n", "text": "note", "near": [0.5, 0.45], "leader": True}], ink
@@ -965,7 +973,7 @@ def test_near_needs_obstacles():
         _edit(add=[{"page": 1, "text": "x", "near": [0.5, 0.5]}])
 
 
-def test_leader_does_not_run_across_its_target():
+def test_leader_does_not_run_across_its_target(always_lead):
     # The point is deep inside a wide line of writing: a leader may reach in a
     # little, but not along the whole line.
     ink = [[0.1, 0.4, 0.9, 0.45]]
@@ -993,7 +1001,7 @@ def test_border_wraps_content_with_padding():
         _edit(add=[{"page": 1, "shape": "check", "at": [0.5, 0.5], "border": True}])
 
 
-def test_leader_note_has_border_and_dot():
+def test_leader_note_has_border_and_dot(always_lead):
     ink = [[0.1, 0.4, 0.9, 0.45]]
     result = _near_edit(
         [
@@ -1018,7 +1026,7 @@ def test_leader_note_has_border_and_dot():
         _edit(add=[{"page": 1, "shape": "check", "at": [0.5, 0.5], "dot": True}])
 
 
-def test_end_leader_starts_beside_the_text_heading_away_from_it():
+def test_end_leader_starts_beside_the_text_heading_away_from_it(always_lead):
     ink = [[0.05, 0.3, 0.95, 0.5]]
     result = _near_edit(
         [{"page": 1, "id": "n", "text": "note", "near": [0.9, 0.45], "leader": True}], ink
@@ -1116,7 +1124,7 @@ def test_bottom_center_clears_descenders():
     assert hanging["optical"][2] > hanging["optical"][1]  # below the descenders
 
 
-def test_placement_prefers_diagonal_leaders():
+def test_placement_prefers_diagonal_leaders(always_lead):
     # A wide line of writing holds the point; there is room above and below.
     ink = [[0.1, 0.4, 0.9, 0.45]]
     result = _near_edit(
@@ -1124,3 +1132,24 @@ def test_placement_prefers_diagonal_leaders():
     )
     leader = result["marks"][0]["leader"]
     assert not pdf_marks._near_axis(leader["from"], leader["to"], A4)
+
+
+def test_no_leader_for_a_note_beside_what_it_is_about():
+    # The point is at the end of a short answer; free space right under it.
+    ink = [[0.25, 0.48, 0.32, 0.52]]
+    result = _near_edit(
+        [
+            {
+                "page": 1,
+                "id": "n",
+                "text": "add like fractions: write 1/2 as 2/4 first",
+                "near": [0.3, 0.5],
+                "leader": True,
+                "size": 9,
+            }
+        ],
+        ink,
+    )
+    mark = result["marks"][0]
+    assert pdf_marks._gap(mark["box"], ink[0]) <= pdf_marks.BESIDE_TARGET
+    assert "leader" not in mark
