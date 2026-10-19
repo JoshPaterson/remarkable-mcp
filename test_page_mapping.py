@@ -219,7 +219,7 @@ def test_glyph_range_rectangles_render_as_translucent_highlights():
 
     assert paths == [
         '<rect x="10.0" y="20.0" width="30.0" height="8.0" '
-        'fill="#FFD700" opacity="0.35" stroke="none"/>'
+        'fill="#FEFD60" opacity="0.35" stroke="none"/>'
     ]
     assert coords == [(10.0, 20.0), (40.0, 28.0)]
 

@@ -162,13 +162,35 @@ def test_default_colors():
             {"page": 1, "text": "4/4", "at": [0.4, 0.1], "color": "green"},
         ]
     )
-    colors = [pdf_marks.color_name(m["color"]) for m in result["marks"]]
+    colors = [pdf_marks.summarize(m, 1)["color"] for m in result["marks"]]
     assert colors == ["black", "black", "black", "black", "black", "yellow", "green"]
-    red = _edit(
-        add=[{"page": 1, "shape": "check", "at": [0.1, 0.1]}],
-        color=pdf_marks.parse_color("red"),
+    assert result["marks"][5]["color"] == pytest.approx(pdf_marks.HIGHLIGHT_COLORS["yellow"])
+    red = _edit(add=[{"page": 1, "shape": "check", "at": [0.1, 0.1]}], color="red")
+    assert pdf_marks.summarize(red["marks"][0], 1)["color"] == "red"
+
+
+def test_named_colors_are_the_tablets():
+    assert pdf_marks._hex(pdf_marks.COLORS["red"]) == "#c23132"
+    assert pdf_marks._hex(pdf_marks.HIGHLIGHT_COLORS["pink"]) == "#ff55cf"
+    pink = _edit(
+        add=[{"page": 1, "shape": "highlight", "region": [0.1, 0.1, 0.2, 0.2], "color": "pink"}]
     )
-    assert pdf_marks.color_name(red["marks"][0]["color"]) == "red"
+    assert pdf_marks.summarize(pink["marks"][0], 1)["color"] == "pink"
+    # Pink is a highlighter color only; pens have no pink.
+    with pytest.raises(MarkError, match="pen colors are"):
+        _edit(add=[{"page": 1, "shape": "check", "at": [0.1, 0.1], "color": "pink"}])
+    with pytest.raises(MarkError, match="highlighter colors are"):
+        _edit(add=[{"page": 1, "shape": "highlight", "region": [0, 0, 1, 1], "color": "magenta"}])
+    # A call-wide color names the matching shade for each mark.
+    both = _edit(
+        add=[
+            {"page": 1, "shape": "check", "at": [0.1, 0.1]},
+            {"page": 1, "shape": "highlight", "region": [0.1, 0.2, 0.3, 0.25]},
+        ],
+        color="green",
+    )
+    assert both["marks"][0]["color"] == pytest.approx(pdf_marks.COLORS["green"])
+    assert both["marks"][1]["color"] == pytest.approx(pdf_marks.HIGHLIGHT_COLORS["green"])
 
 
 @pytest.mark.parametrize("anchor", ["top-left", "center", "left", "bottom-right"])
@@ -188,15 +210,18 @@ def test_check_and_cross_are_centered_by_default():
     assert (top + bottom) / 2 == pytest.approx(0.5, abs=1e-3)
 
 
-def test_highlight_is_a_translucent_fill():
-    mark = _edit(add=[{"page": 1, "shape": "highlight", "region": [0.1, 0.2, 0.4, 0.25]}])["marks"][
-        0
-    ]
-    assert mark["box"] == [0.1, 0.2, 0.4, 0.25]
-    with pymupdf.open("pdf", base64.b64decode(mark["pdf"])) as snippet:
-        (drawing,) = snippet[0].get_drawings()
-    assert drawing["fill_opacity"] == pytest.approx(pdf_marks.DEFAULT_HIGHLIGHT_OPACITY)
-    assert drawing["color"] is None
+def test_highlight_darkens_and_keeps_text_dark():
+    original = _pdf()
+    region = [0.15, 0.2, 0.4, 0.25]
+    result = _edit(add=[{"page": 1, "shape": "highlight", "region": region}])
+    assert result["marks"][0]["box"] == region
+    marked = pdf_marks.build(original, result["marks"])
+    with pymupdf.open(stream=marked, filetype="pdf") as doc:
+        pix = doc[0].get_pixmap(dpi=72)
+    # Paper inside the highlight takes its color; text under it stays black.
+    assert pix.pixel(int(0.38 * A4[0]), int(0.21 * A4[1])) == (254, 253, 96)
+    text_pixels = [pix.pixel(x, 197) for x in range(100, 180)]
+    assert min(sum(p) for p in text_pixels) < 60
 
 
 def test_path_is_scaled_into_its_region_keeping_line_width():
@@ -298,6 +323,7 @@ def test_marks_follow_pdf_pages_not_tablet_positions():
         ({"page": 1, "text": "long " * 200, "region": [0.1, 0.1, 0.2, 0.12]}, "does not fit"),
         ({"page": 1, "text": "x", "latex": "y", "at": [0.1, 0.1]}, "exactly one"),
         ({"page": 1, "text": "x", "at": [0.1, 0.1], "color": "chartreuse"}, "Unknown color"),
+        ({"page": 1, "shape": "highlight", "at": [0.1, 0.1]}, "needs a region"),
         ({"page": 1, "graphic": SVG, "region": [0, 0, 1, 1], "color": "red"}, "does not apply"),
         ({"page": 1, "graphic": "not base64!", "region": [0, 0, 1, 1]}, "base64"),
         ({"page": 1, "graphic": _b64(b"GIF89a...."), "region": [0, 0, 1, 1]}, "SVG, PDF, PNG"),

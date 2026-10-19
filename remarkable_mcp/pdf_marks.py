@@ -42,9 +42,8 @@ SHAPE_PATHS: Dict[str, Dict[str, Any]] = {
     "cross": {"path": "M -1 -1 L 1 1 M -1 1 L 1 -1", "width": 1.95},
     "circle": {"path": "M 0 1 A 1 1 0 1 0 2 1 A 1 1 0 1 0 0 1", "stretch": True},
     "box": {"path": "M 0 0 H 1 V 1 H 0 Z", "stretch": True},
-    "highlight": {"path": "M 0 0 H 1 V 1 H 0 Z", "stretch": True, "filled": True},
 }
-SHAPES = (*SHAPE_PATHS, "line", "arrow")
+SHAPES = (*SHAPE_PATHS, "highlight", "line", "arrow")
 ANCHORS = {
     "top-left": (0.0, 0.0),
     "top": (0.5, 0.0),
@@ -56,21 +55,44 @@ ANCHORS = {
     "bottom": (0.5, 1.0),
     "bottom-right": (1.0, 1.0),
 }
+
+
+def _rgb(hex_color: str) -> Tuple[float, float, float]:
+    return tuple(int(hex_color[i : i + 2], 16) / 255 for i in (1, 3, 5))
+
+
+# The tablet's pen and highlighter colors, as its PDF export draws them.
+# Highlighters are drawn with the Darken blend: on white paper they show
+# their color, and text under them stays dark.
 COLORS = {
-    "black": (0.0, 0.0, 0.0),
-    "red": (0.85, 0.0, 0.0),
-    "yellow": (1.0, 0.85, 0.0),
-    "blue": (0.0, 0.25, 0.8),
-    "green": (0.0, 0.55, 0.0),
-    "orange": (0.95, 0.45, 0.0),
-    "purple": (0.5, 0.1, 0.6),
-    "gray": (0.45, 0.45, 0.45),
+    name: _rgb(value)
+    for name, value in {
+        "black": "#000000",
+        "gray": "#909090",
+        "white": "#FFFFFF",
+        "blue": "#304AE0",
+        "red": "#C23132",
+        "green": "#91DA71",
+        "yellow": "#FAE719",
+        "cyan": "#74D2E8",
+        "magenta": "#C07FD2",
+    }.items()
+}
+HIGHLIGHT_COLORS = {
+    name: _rgb(value)
+    for name, value in {
+        "yellow": "#FEFD60",
+        "blue": "#BEEAFE",
+        "pink": "#FF55CF",
+        "orange": "#FFC38C",
+        "green": "#A9FA5C",
+        "gray": "#BFBFBF",
+    }.items()
 }
 DEFAULT_TEXT_SIZE = 11.0
 DEFAULT_LATEX_SIZE = 12.0
 DEFAULT_SYMBOL_SIZE = 12.0
 DEFAULT_LINE_WIDTH = 1.5
-DEFAULT_HIGHLIGHT_OPACITY = 0.35
 MAX_PATH_CHARS = 20_000
 MAX_DESCRIPTION_CHARS = 200
 _PATH_PATTERN = re.compile(r"^[MmLlHhVvCcSsQqTtAaZz0-9eE+\-.,\s]+$")
@@ -234,20 +256,33 @@ def _positive(value: Any, what: str, default: float) -> float:
     return float(value)
 
 
-def parse_color(value: Any) -> List[float]:
-    """An RGB triple (0-1) from a color name or ``#RRGGBB``."""
+def parse_color(value: Any, palette: Dict[str, Tuple[float, ...]] = COLORS) -> List[float]:
+    """An RGB triple (0-1) from a name in ``palette`` or ``#RRGGBB``."""
     if isinstance(value, str):
         name = value.strip().lower()
-        if name in COLORS:
-            return list(COLORS[name])
+        if name in palette:
+            return list(palette[name])
         if re.fullmatch(r"#[0-9a-f]{6}", name):
             return [int(name[i : i + 2], 16) / 255 for i in (1, 3, 5)]
-    raise MarkError(f"Unknown color {value!r}; use {', '.join(COLORS)} or #RRGGBB.")
+    if palette is HIGHLIGHT_COLORS:
+        names = f"highlighter colors are {', '.join(HIGHLIGHT_COLORS)}"
+    else:
+        names = f"pen colors are {', '.join(COLORS)}"
+    raise MarkError(f"Unknown color {value!r}; {names}, or use #RRGGBB.")
 
 
-def color_name(rgb: Sequence[float]) -> str:
-    """The name of an RGB triple from ``COLORS``, or its ``#RRGGBB`` form."""
-    for name, value in COLORS.items():
+def check_color(value: Any) -> str:
+    """``value`` if it names a pen or highlighter color, or is ``#RRGGBB``."""
+    try:
+        parse_color(value)
+    except MarkError:
+        parse_color(value, HIGHLIGHT_COLORS)
+    return value
+
+
+def color_name(rgb: Sequence[float], palette: Dict[str, Tuple[float, ...]] = COLORS) -> str:
+    """The name of an RGB triple in ``palette``, or its ``#RRGGBB`` form."""
+    for name, value in palette.items():
         if all(abs(a - b) < 1e-6 for a, b in zip(rgb, value)):
             return name
     return _hex(rgb)
@@ -257,10 +292,14 @@ def _hex(rgb: Sequence[float]) -> str:
     return "#" + "".join(f"{round(v * 255):02x}" for v in rgb)
 
 
+def _palette(shape: Optional[str]) -> Dict[str, Tuple[float, ...]]:
+    return HIGHLIGHT_COLORS if shape == "highlight" else COLORS
+
+
 def default_color(shape: Optional[str] = None) -> List[float]:
-    """The color a mark gets when none is given: yellow for highlights,
-    black for everything else."""
-    return list(COLORS["yellow" if shape == "highlight" else "black"])
+    """The color a mark gets when none is given: highlighter yellow for
+    highlights, black for everything else."""
+    return list(HIGHLIGHT_COLORS["yellow"] if shape == "highlight" else COLORS["black"])
 
 
 def check_svg(svg: str) -> None:
@@ -541,28 +580,54 @@ def _draw_path(
     return box, _svg_to_pdf(_path_svg(placed, (out_w, out_h), style))
 
 
+def _darken_rect(width: float, height: float, color: List[float], opacity: float) -> bytes:
+    """A PDF of a filled box drawn with the Darken blend, as the tablet draws
+    highlighter strokes: the color shows on white, and dark text under it
+    stays dark. The box is placed as a form without a transparency group, so
+    it blends with the page under it."""
+    doc = pymupdf.open()
+    try:
+        page = doc.new_page(width=width, height=height)
+        state = doc.get_new_xref()
+        doc.update_object(state, f"<</Type/ExtGState/BM/Darken/ca {opacity}/CA {opacity}>>")
+        doc.xref_set_key(page.xref, "Resources", f"<</ExtGState<</Hl {state} 0 R>>>>")
+        content = doc.get_new_xref()
+        doc.update_object(content, "<<>>")
+        r, g, b = color
+        ops = f"q /Hl gs {r:.4f} {g:.4f} {b:.4f} rg 0 0 {width:.4f} {height:.4f} re f Q"
+        doc.update_stream(content, ops.encode("ascii"))
+        doc.xref_set_key(page.xref, "Contents", f"{content} 0 R")
+        return doc.tobytes(garbage=3, deflate=True)
+    finally:
+        doc.close()
+
+
 def _render_shape(request: dict, color: List[float], page: _Page) -> Dict[str, Any]:
     shape = request["shape"]
     if shape not in SHAPES:
         raise MarkError(f"shape must be one of: {', '.join(SHAPES)}.")
     out: Dict[str, Any] = {"shape": shape}
 
+    if shape == "highlight":
+        if "at" in request:
+            raise MarkError("A highlight needs a region.")
+        region = _region(request.get("region"))
+        opacity = _opacity(request.get("opacity"), 1.0)
+        x0, y0 = page.pt(region[0], region[1])
+        x1, y1 = page.pt(region[2], region[3])
+        pdf = _darken_rect(x1 - x0, y1 - y0, color, opacity)
+        return dict(out, box=page.box(x0, y0, x1, y1), pdf=pdf)
+
     if shape in SHAPE_PATHS:
         preset = SHAPE_PATHS[shape]
-        filled = preset.get("filled", False)
-        width = _positive(request.get("width"), "width", preset.get("width", DEFAULT_LINE_WIDTH))
-        if filled:
-            opacity = _opacity(request.get("opacity"), DEFAULT_HIGHLIGHT_OPACITY)
-        else:
-            opacity = _opacity(request.get("opacity"), 1.0)
         box, pdf = _draw_path(
             preset["path"],
             request,
             page,
-            stroke=None if filled else color,
-            width=width,
-            fill=color if filled else None,
-            opacity=opacity,
+            stroke=color,
+            width=_positive(request.get("width"), "width", preset.get("width", DEFAULT_LINE_WIDTH)),
+            fill=None,
+            opacity=_opacity(request.get("opacity"), 1.0),
             stretch=preset.get("stretch", False),
         )
         return dict(out, box=box, pdf=pdf)
@@ -735,14 +800,15 @@ def _render_graphic(request: dict, page: _Page) -> Dict[str, Any]:
 
 
 def render_mark(
-    request: Any, page_size: Tuple[float, float], color: Optional[List[float]]
+    request: Any, page_size: Tuple[float, float], color: Optional[str]
 ) -> Dict[str, Any]:
     """Render one requested mark (without ``id`` or ``page``) on a page of
     ``page_size`` points.
 
     Exactly one kind key (see ``KINDS``) gives the content; the rest are its
-    options. Without its own color a mark takes ``color``, or
-    ``default_color`` when that is None. Returns the stored form: the kind,
+    options. Without its own color a mark takes ``color`` (a name or
+    ``#RRGGBB``), or ``default_color`` when that is None. Highlights take
+    highlighter color names, other marks pen color names. Returns the stored form: the kind,
     the options needed to describe it, its ``box`` in page fractions and its
     PDF snippet (base64).
     """
@@ -763,10 +829,13 @@ def render_mark(
             raise MarkError("color does not apply to graphic marks.")
         stored = _render_graphic(request, page)
     else:
+        palette = _palette(request.get("shape"))
         if "color" in request:
-            rgb = parse_color(request["color"])
+            rgb = parse_color(request["color"], palette)
+        elif color:
+            rgb = parse_color(color, palette)
         else:
-            rgb = color or default_color(request.get("shape"))
+            rgb = default_color(request.get("shape"))
         render = {
             "text": _render_text,
             "shape": _render_shape,
@@ -791,7 +860,7 @@ def summarize(mark: Dict[str, Any], page: Optional[int]) -> Dict[str, Any]:
         if key in mark:
             out[key] = mark[key]
     if mark.get("color"):
-        out["color"] = color_name(mark["color"])
+        out["color"] = color_name(mark["color"], _palette(mark.get("shape")))
     if "from" in mark:
         out["from"], out["to"] = mark["from"], mark["to"]
     else:
@@ -809,7 +878,7 @@ def edit_marks(
     clear: bool,
     page_map: Sequence[Optional[int]],
     sizes: Sequence[Tuple[float, float]],
-    color: Optional[List[float]],
+    color: Optional[str],
 ) -> Dict[str, Any]:
     """Apply removals, then additions, to a copy of ``marks``.
 

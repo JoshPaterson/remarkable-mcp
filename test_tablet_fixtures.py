@@ -109,9 +109,9 @@ def test_render_omits_hidden_layer():
     visible = _render_rm_v6_to_svg(rm_file)
     everything = _render_rm_v6_to_svg(rm_file, layers="all")
 
-    assert 'stroke="#E00000"' in visible  # red, layer 2
-    assert 'stroke="#00C000"' not in visible  # green, hidden layer 3
-    assert 'stroke="#00C000"' in everything
+    assert 'stroke="#C23132"' in visible  # red, layer 2
+    assert 'stroke="#91DA71"' not in visible  # green, hidden layer 3
+    assert 'stroke="#91DA71"' in everything
 
 
 def test_moved_and_deleted_layers(layers_and_tags):

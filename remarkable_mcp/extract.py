@@ -1050,7 +1050,7 @@ def _v6_paths_from_blocks(
         # Emit a translucent filled rect per rectangle in the highlight colour.
         if getattr(line, "rectangles", None):
             hl_fill = render_color(
-                getattr(line, "color", 9), getattr(line, "color_rgba", None), "#FFD700"
+                getattr(line, "color", 9), getattr(line, "color_rgba", None), "#FEFD60"
             )
             for r in line.rectangles:
                 paths.append(

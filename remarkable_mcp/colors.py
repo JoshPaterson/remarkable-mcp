@@ -29,22 +29,25 @@ COLOR_NAMES: Dict[int, str] = {
     13: "yellow",
 }
 
-# Render colors for v6 color ids when no ARGB value applies.
+# Render colors for v6 color ids when no ARGB value applies: the colors the
+# tablet's PDF export draws. Ids 3, 4, 5 and 8 are highlighter colors; the
+# export draws the gray highlighter as black at 25% with the Darken blend,
+# which is this gray on white paper.
 RENDER_COLORS: Dict[int, str] = {
-    0: "black",
-    1: "#808080",
-    2: "white",
-    3: "#FFD700",
-    4: "#00A000",
-    5: "#FF69B4",
-    6: "#4169E1",
-    7: "#E00000",
-    8: "#A0A0A0",
-    9: "#FFD700",
-    10: "#00C000",
-    11: "#00CED1",
-    12: "#FF00FF",
-    13: "#FFD700",
+    0: "#000000",
+    1: "#909090",
+    2: "#FFFFFF",
+    3: "#FEFD60",
+    4: "#A9FA5C",
+    5: "#FF55CF",
+    6: "#304AE0",
+    7: "#C23132",
+    8: "#BFBFBF",
+    9: "#FEFD60",
+    10: "#91DA71",
+    11: "#74D2E8",
+    12: "#C07FD2",
+    13: "#FAE719",
 }
 
 # Highlighter colors written as color id 9 plus an ARGB value.

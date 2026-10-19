@@ -1296,7 +1296,8 @@ def _mark_editor(add: list, remove: list, clear: bool, color: Optional[str], bui
     from remarkable_mcp import pdf_marks
     from remarkable_mcp.pages import pdf_page_map
 
-    rgb = pdf_marks.parse_color(color) if color else None
+    if color:
+        pdf_marks.check_color(color)
 
     def edit(pdf: bytes, content: dict) -> dict:
         base, marks = pdf_marks.load_state(pdf)
@@ -1308,7 +1309,7 @@ def _mark_editor(add: list, remove: list, clear: bool, color: Optional[str], bui
             clear=clear,
             page_map=page_map,
             sizes=pdf_marks.page_sizes(base),
-            color=rgb,
+            color=color,
         )
         touched = {m["pdf_page"] for m in marks if m["id"] in result["removed"]}
         touched |= {m["pdf_page"] for m in result["marks"] if m["id"] in result["added"]}
@@ -2953,8 +2954,7 @@ def register_write_tools():
                 - shape: "check" or "cross" with at (option size) or region;
                   "circle", "box" or "highlight" with region, stretched to fill
                   it; "line" or "arrow" with from [x, y] and to [x, y].
-                  Options: width (line width), opacity (highlight, default
-                  0.35)
+                  Options: width (line width), opacity
                 - path: SVG path data for any other shape, in any units. With
                   region it is scaled to fit, centered, keeping its aspect
                   (stretch: true fills the region instead); with at it is
@@ -2977,8 +2977,13 @@ def register_write_tools():
                 right, bottom-left, bottom or bottom-right. Default center for
                 check and cross, top-left otherwise. Use anchor "left" with at
                 at the right end of a text line's middle to put a note beside it.
-                Every mark but graphics takes a color (name or #RRGGBB); the
-                default is black, and yellow for highlights.
+                Every mark but graphics takes a color: #RRGGBB or one of the
+                tablet's colors. Pen colors (all marks but highlights): black,
+                gray, white, blue, red, green, yellow, cyan, magenta.
+                Highlighter colors (highlights): yellow, blue, pink, orange,
+                green, gray. The default is black, and yellow for highlights.
+                Highlights darken like the tablet's highlighter: the color shows
+                on the paper and text under it stays dark.
 
                 Pick colors for the task. When grading, for example, use green
                 for check marks and full scores, and red for X marks, notes about
@@ -2996,8 +3001,9 @@ def register_write_tools():
                 - add: List of marks to add (see above)
                 - remove: Mark id or list of ids to remove
                 - clear: Remove every mark, restoring the original PDF
-                - color: Color for marks in this call that set none (black, red,
-                  yellow, blue, green, orange, purple, gray, or #RRGGBB)
+                - color: Color for marks in this call that set none: a pen or
+                  highlighter color name (each mark takes the matching shade),
+                  or #RRGGBB
                 - dry_run: Return preview images of the changed pages without
                   writing
                 - layout: Tablet page number; the response adds that page's text

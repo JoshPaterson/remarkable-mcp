@@ -189,8 +189,8 @@ def test_color_info_names_custom_highlighter_colors_from_argb():
 
 def test_render_color_uses_argb_only_for_custom_color():
     assert render_color(9, rgba(0xFFBEEAFE)) == "#beeafe"
-    assert render_color(3, rgba(0xFF000000)) == "#FFD700"
-    assert render_color(9) == "#FFD700"
+    assert render_color(3, rgba(0xFF000000)) == "#FEFD60"
+    assert render_color(9) == "#FEFD60"
 
 
 # --- extraction -------------------------------------------------------------
@@ -235,7 +235,7 @@ def test_svg_render_uses_argb_for_custom_highlights(tmp_path):
 
     assert 'fill="#beeafe"' in svg
     assert 'fill="#ffc38c"' in svg
-    assert 'fill="#FF69B4"' in svg
+    assert 'fill="#FF55CF"' in svg
 
 
 def test_markdown_export_labels_highlight_colors(tmp_path):
@@ -585,14 +585,14 @@ def test_render_draws_visible_layers_by_default(tmp_path):
     everything = _render_rm_v6_to_svg(rm_file, layers="all")
     only_two = _render_rm_v6_to_svg(rm_file, layers="layer 2")
 
-    green = 'stroke="#00A000"'
-    red = 'stroke="#E00000"'
-    assert red in visible and 'stroke="black"' in visible
+    green = 'stroke="#A9FA5C"'
+    red = 'stroke="#C23132"'
+    assert red in visible and 'stroke="#000000"' in visible
     assert green not in visible
-    assert 'stroke="#FF69B4"' not in visible  # highlighter on hidden layer
+    assert 'stroke="#FF55CF"' not in visible  # highlighter on hidden layer
     assert green in everything
     assert red in only_two
-    assert 'stroke="black"' not in only_two and green not in only_two
+    assert 'stroke="#000000"' not in only_two and green not in only_two
 
 
 def test_get_page_layers_from_document_zip(tmp_path):
@@ -731,8 +731,8 @@ async def test_image_layers_parameter(tmp_path):
     everything = await _image(zip_bytes, layers="all")
     missing = await _image(zip_bytes, layers="Layer 9")
 
-    assert 'stroke="#00A000"' not in default["svg"]
-    assert 'stroke="#00A000"' in everything["svg"]
+    assert 'stroke="#A9FA5C"' not in default["svg"]
+    assert 'stroke="#A9FA5C"' in everything["svg"]
     assert missing["_error"]["type"] == "layer_not_found"
     assert "Layer 3" in missing["_error"]["suggestion"]
 
