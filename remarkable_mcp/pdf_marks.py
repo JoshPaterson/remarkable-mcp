@@ -532,12 +532,19 @@ def _fit(region: Sequence[float], width: float, height: float, page: _Page) -> L
     return page.box(x0, y0, x0 + width * scale, y0 + height * scale)
 
 
-# Standard PDF Helvetica faces, by (bold, italic).
+# Standard PDF Helvetica faces, by (bold, italic), and the PDF font names
+# they appear under in rendered text.
 _FONTS = {
     (False, False): "helv",
     (True, False): "hebo",
     (False, True): "heit",
     (True, True): "hebi",
+}
+_FONT_CODES = {
+    "Helvetica": "helv",
+    "Helvetica-Bold": "hebo",
+    "Helvetica-Oblique": "heit",
+    "Helvetica-BoldOblique": "hebi",
 }
 
 
@@ -916,6 +923,39 @@ def _render_graphic(request: dict, page: _Page) -> Dict[str, Any]:
     return {"format": fmt, "box": box, "pdf": pdf}
 
 
+def _optical(stored: Dict[str, Any], page: _Page) -> List[float]:
+    """The visible top and bottom of a note, as page fractions.
+
+    Text: the cap height of its first line and the baseline of its last.
+    LaTeX (drawn as paths): the extent of what is drawn. The box around a
+    note also holds ascenders and descenders, so it reaches further.
+    """
+    top_pt = page.pt(0, stored["box"][1])[1]
+    with pymupdf.open("pdf", stored["pdf"]) as doc:
+        snippet = doc[0]
+        lines = [
+            span
+            for block in snippet.get_text("dict")["blocks"]
+            for line in block.get("lines", [])
+            for span in line["spans"]
+            if span["text"].strip()
+        ]
+        if lines:
+            caps = [
+                span["origin"][1]
+                - pymupdf.Font(_FONT_CODES.get(span["font"], "helv")).glyph_bbox(ord("H")).y1
+                * span["size"]
+                for span in lines
+            ]
+            low, high = min(caps), max(span["origin"][1] for span in lines)
+        else:
+            drawn = [d["rect"] for d in snippet.get_drawings()]
+            if not drawn:
+                return [stored["box"][1], stored["box"][3]]
+            low, high = min(r.y0 for r in drawn), max(r.y1 for r in drawn)
+    return [_round((top_pt + low) / page.height), _round((top_pt + high) / page.height)]
+
+
 def _bordered(stored: Dict[str, Any], color: List[float], page: _Page) -> Dict[str, Any]:
     """``stored`` (raw PDF snippet) inside a rounded box with a white
     background, ``BORDER_PAD`` points larger on every side."""
@@ -992,6 +1032,8 @@ def render_mark(
         stored = render(request, rgb, page)
         if request.get("border"):
             stored = _bordered(stored, rgb, page)
+        elif kind in ("text", "latex"):
+            stored["optical"] = _optical(stored, page)
         stored["color"] = rgb
         # The request is kept for listing a mark's style and re-drawing it;
         # named colors can be re-drawn in another palette (see for_export).
@@ -1145,13 +1187,21 @@ LEADER_STYLES = ("end", "underline", "box")
 LEADER_START_GAP = 2.0
 
 
-def _leader_route(box: Sequence[float], near: Sequence[float], style: str, size=(1.0, 1.0)):
+def _leader_route(
+    box: Sequence[float],
+    near: Sequence[float],
+    style: str,
+    size=(1.0, 1.0),
+    inset: Sequence[float] = (0.0, 0.0),
+):
     """Points of a leader from ``box`` to just short of ``near``, or None if
     the point is too close to need one.
 
     ``end``: just past the left or right end of the note's text, whichever
     faces the point, at its top for a point above the text, its bottom for
     one below, otherwise its middle, so the line heads away from the text.
+    Top and bottom are the text's visible ones: ``inset`` holds how far
+    they lie inside the box (see ``_optical``).
     ``underline``: along the bottom of the note from its far end, round the
     corner nearest the point. ``box`` (and marks that are not notes): from the
     nearest point of the note's box or border.
@@ -1162,12 +1212,13 @@ def _leader_route(box: Sequence[float], near: Sequence[float], style: str, size=
         far, start = ([box[0], y], [box[2], y]) if facing_right else ([box[2], y], [box[0], y])
     elif style == "end":
         gap = LEADER_START_GAP / size[0]
-        if near[1] < box[1]:
-            y = box[1]
-        elif near[1] > box[3]:
-            y = box[3]
+        top, bottom = box[1] + inset[0], box[3] - inset[1]
+        if near[1] < top:
+            y = top
+        elif near[1] > bottom:
+            y = bottom
         else:
-            y = (box[1] + box[3]) / 2
+            y = (top + bottom) / 2
         start = [box[2] + gap, y] if facing_right else [box[0] - gap, y]
     else:
         start = [min(max(near[0], box[0]), box[2]), min(max(near[1], box[1]), box[3])]
@@ -1307,7 +1358,9 @@ def _render_near(
     trial = render_mark(dict(base, at=[0.5, 0.5], anchor="center"), size, color)
     width = trial["box"][2] - trial["box"][0]
     height = trial["box"][3] - trial["box"][1]
-    route = (lambda box: _leader_route(box, near, style, size)) if leader else None
+    optical = trial.get("optical") or [trial["box"][1], trial["box"][3]]
+    inset = (optical[0] - trial["box"][1], trial["box"][3] - optical[1])
+    route = (lambda box: _leader_route(box, near, style, size, inset)) if leader else None
     x0, y0 = _place_near(near, width, height, obstacles, route, printed)
     # A border lies outside the content, whose top-left at gives.
     pad_x, pad_y = (BORDER_PAD / size[0], BORDER_PAD / size[1]) if border and note else (0, 0)
@@ -1315,7 +1368,7 @@ def _render_near(
     stored["request"] = dict(stored.get("request", {}), near=near, leader=leader)
     if leader and note:
         stored["request"]["leader_style"] = style
-    points = _leader_route(stored["box"], near, style, size) if leader else None
+    points = _leader_route(stored["box"], near, style, size, inset) if leader else None
     if points:
         line = {
             "shape": "line",
