@@ -395,3 +395,114 @@ class TestExportTransportFixtures:
         assert data["representation"] == "document_archive"
         resource = await mcp.read_resource(link.uri)
         assert "Cloud typed text" in resource[0].content
+
+
+class TestExportSaveTo:
+    """remarkable_export(save_to=...) writes inside REMARKABLE_EXPORT_DIRS only."""
+
+    @pytest.fixture
+    def allowed(self, tmp_path, monkeypatch):
+        root = tmp_path / "Projects"
+        root.mkdir()
+        monkeypatch.setenv("REMARKABLE_EXPORT_DIRS", f"/nonexistent-elsewhere:{root}")
+        return root
+
+    async def _export(self, **arguments):
+        import remarkable_mcp.tools as tool_module
+
+        document = _document("Worksheet done", "sheet-id")
+        client = Mock()
+        client.get_meta_items.return_value = [document]
+        client.download.return_value = _pdf_bytes(3)
+        with (
+            patch.object(tool_module, "get_rmapi", return_value=client),
+            patch.object(tool_module, "get_file_type", return_value="pdf"),
+        ):
+            result = await mcp.call_tool(
+                "remarkable_export", {"document": document.VissibleName, **arguments}
+            )
+        return _json_result(result), result
+
+    @pytest.mark.asyncio
+    async def test_saves_atomically_with_hash_and_creates_folders(self, allowed):
+        import hashlib
+
+        target = allowed / "Course" / "Worksheets" / "S1 data" / "Sheet - done.pdf"
+        data, result = await self._export(save_to=str(target))
+
+        assert "_error" not in data, data
+        assert data["saved_path"] == str(target.resolve())
+        on_disk = target.read_bytes()
+        assert data["sha256"] == hashlib.sha256(on_disk).hexdigest()
+        assert data["size"] == len(on_disk) and data["pages"] == 3
+        assert data["warnings"] == [] and data["status"] == "complete"
+        assert not any(isinstance(c, types.ResourceLink) for c in result.content)
+        assert sorted(p.name for p in target.parent.iterdir()) == ["Sheet - done.pdf"]
+        with fitz.open(stream=on_disk, filetype="pdf") as exported:
+            assert len(exported) == 3
+
+    @pytest.mark.asyncio
+    async def test_pages_option_applies_to_saved_file(self, allowed):
+        target = allowed / "two.pdf"
+        data, _ = await self._export(save_to=str(target), pages="2-3")
+
+        assert data["pages"] == 2 and data["selected_pages"] == [2, 3]
+        with fitz.open(target) as exported:
+            assert len(exported) == 2
+
+    @pytest.mark.asyncio
+    async def test_existing_file_needs_overwrite(self, allowed):
+        target = allowed / "sheet.pdf"
+        target.write_bytes(b"keep me")
+
+        data, _ = await self._export(save_to=str(target))
+        assert data["_error"]["type"] == "file_exists"
+        assert target.read_bytes() == b"keep me"
+
+        data, _ = await self._export(save_to=str(target), overwrite=True)
+        assert "_error" not in data, data
+        assert target.read_bytes().startswith(b"%PDF")
+        assert [p.name for p in allowed.iterdir()] == ["sheet.pdf"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "path, error",
+        [
+            ("{outside}/sheet.pdf", "save_path_not_allowed"),
+            ("{allowed}/../escape.pdf", "save_path_not_allowed"),
+            ("{allowed}/link/sheet.pdf", "save_path_not_allowed"),
+            ("{allowed}/sheet.md", "invalid_save_path"),
+            ("relative/sheet.pdf", "invalid_save_path"),
+        ],
+    )
+    async def test_refuses_paths_outside_allowed_folders(self, allowed, tmp_path, path, error):
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (allowed / "link").symlink_to(outside)
+        data, _ = await self._export(save_to=path.format(allowed=allowed, outside=outside))
+
+        assert data["_error"]["type"] == error
+        assert list(outside.iterdir()) == []
+        assert not (tmp_path / "escape.pdf").exists()
+
+    @pytest.mark.asyncio
+    async def test_refused_when_not_configured(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("REMARKABLE_EXPORT_DIRS", raising=False)
+        data, _ = await self._export(save_to=str(tmp_path / "sheet.pdf"))
+
+        assert data["_error"]["type"] == "save_not_configured"
+        assert not (tmp_path / "sheet.pdf").exists()
+
+    @pytest.mark.asyncio
+    async def test_overwrite_needs_save_to(self, allowed):
+        data, _ = await self._export(overwrite=True)
+
+        assert data["_error"]["type"] == "invalid_export_options"
+
+    @pytest.mark.asyncio
+    async def test_without_save_to_returns_a_temporary_resource(self, allowed):
+        data, result = await self._export()
+
+        assert data["temporary_local_file"] is True and "saved_path" not in data
+        assert _resource_link(result).uri == data["resource_uri"]
+        assert list(allowed.iterdir()) == []

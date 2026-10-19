@@ -449,6 +449,8 @@ used when configured; otherwise OCR runs locally with Tesseract.
 | `pdf_mode` | `"merged"` \| `"annotations"` | `"merged"` | PDF-only rendering mode |
 | `include_ocr` | bool | `False` | Run the existing OCR path for Markdown |
 | `pages` | int \| string | all pages | PDF only: one page (`5`) or ranges (`"5-9,12"`) |
+| `save_to` | string | none | Absolute path of a `.pdf` or `.md` file to save the export at, inside a folder listed in `REMARKABLE_EXPORT_DIRS` |
+| `overwrite` | bool | `False` | With `save_to`: replace an existing file |
 
 ### Delivery and lifecycle
 
@@ -462,7 +464,26 @@ directory:
 - expired and evicted links stop resolving;
 - all managed exports are removed at server shutdown.
 
-This local temporary write is why the tool declares `readOnlyHint=false`.
+### Saving to a folder
+
+With `save_to`, the export is saved at that path on the machine running the
+server instead of being returned as a resource. Only paths inside the folders
+listed in `REMARKABLE_EXPORT_DIRS` (separated by `:`) are accepted, checked
+after resolving symlinks; any other path, or a save without that setting, is
+refused. Missing folders are created, and the file is written under a
+temporary name in the same folder and renamed into place. An existing file is
+replaced only with `overwrite=True`; nothing is ever deleted. The response gives
+`saved_path`, `size`, `pages`, `sha256`, `status`, `failed_pages` and
+`warnings`, so the copy can be checked. `pdf_mode` and `pages` work the same as
+without `save_to`.
+
+```json
+"env": {
+    "REMARKABLE_EXPORT_DIRS": "/Users/me/Library/Mobile Documents/com~apple~CloudDocs/Projects"
+}
+```
+
+These local writes are why the tool declares `readOnlyHint=false`.
 The reMarkable tablet and library are never modified, and the tool remains
 available when the server runs with `--read-only`.
 
@@ -514,6 +535,10 @@ remarkable_export("Journal", output_format="markdown", include_ocr=True)
 
 # Export pages 3-5 and 9 only
 remarkable_export("Lecture Notes", pages="3-5,9")
+
+# Save into an allowed folder (REMARKABLE_EXPORT_DIRS)
+remarkable_export("Week 3 worksheet",
+                  save_to="/Users/me/Projects/Course/Worksheets/Week 3 - done.pdf")
 ```
 
 ### Response

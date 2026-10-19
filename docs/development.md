@@ -215,6 +215,7 @@ The workflow automatically:
 | `REMARKABLE_SSH_KEY` | Explicit private key path |
 | `REMARKABLE_READ_ONLY` | Disable write tools |
 | `REMARKABLE_ROOT_PATH` | Scope document access to one folder |
+| `REMARKABLE_EXPORT_DIRS` | Folders `remarkable_export(save_to=...)` may save in, separated by `:` |
 | `REMARKABLE_MCP_HOST` | Streamable HTTP bind address |
 | `REMARKABLE_MCP_PORT` | Streamable HTTP port |
 | `GOOGLE_VISION_API_KEY` | Google Vision API key for OCR |
