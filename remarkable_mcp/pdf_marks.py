@@ -38,7 +38,10 @@ KINDS = ("text", "shape", "path", "latex", "graphic", "graphic_file")
 # Built-in shapes drawn as paths. A shape that stretches fills its region on
 # both axes; the others keep their aspect. A filled shape has no outline.
 SHAPE_PATHS: Dict[str, Dict[str, Any]] = {
-    "check": {"path": "M -1 0 L -0.3 0.7 L 1 -0.9", "width": 1.95},
+    "check": {
+        "path": "M -0.854 -0.121 Q -0.511 0.245 -0.3 0.7 Q 0.105 -0.27 0.853 -1.009",
+        "width": 1.95,
+    },
     "cross": {"path": "M -1 -1 L 1 1 M -1 1 L 1 -1", "width": 1.95},
     "circle": {"path": "M 0 1 A 1 1 0 1 0 2 1 A 1 1 0 1 0 0 1", "stretch": True},
     "box": {"path": "M 0 0 H 1 V 1 H 0 Z", "stretch": True},
