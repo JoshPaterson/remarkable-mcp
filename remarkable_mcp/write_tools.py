@@ -3025,13 +3025,13 @@ def register_write_tools():
                 can take near [x, y]: the mark is put in the closest free space to
                 that point, clear of the user's ink, the printed text and other
                 marks, and "leader": true draws a thin line from the mark to the
-                point, ending in a dot. Text and latex with a leader get a
-                rounded border where it fits, otherwise an underline that the
-                leader continues from ("border": true or false picks one). Use
-                near (with a leader when the free space is not right beside it)
-                on pages full of writing; give the point of what the mark is
-                about, at its edge (such as the end of an answer) rather than
-                its middle. A leader never crosses the user's handwriting or
+                point, ending in a dot; it is drawn only when the mark cannot sit
+                beside the point. A note's leader starts just past the end of its
+                text at mid-height ("leader_style": "end", the default), or runs
+                along an underline ("underline") or from a rounded border ("box").
+                Use near, with a leader, on pages full of writing; give the point
+                of what the mark is about, at its edge (such as the end of an
+                answer) rather than its middle. A leader never crosses the user's handwriting or
                 other marks, and crosses printed text only when nothing else
                 reaches the point; if no place fits, the tool says so: shorten
                 the note or make it smaller.

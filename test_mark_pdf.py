@@ -996,7 +996,17 @@ def test_border_wraps_content_with_padding():
 def test_leader_note_has_border_and_dot():
     ink = [[0.1, 0.4, 0.9, 0.45]]
     result = _near_edit(
-        [{"page": 1, "id": "n", "text": "note", "near": [0.85, 0.425], "leader": True}], ink
+        [
+            {
+                "page": 1,
+                "id": "n",
+                "text": "note",
+                "near": [0.85, 0.425],
+                "leader": True,
+                "leader_style": "box",
+            }
+        ],
+        ink,
     )
     mark = result["marks"][0]
     assert mark["request"]["border"] is True
@@ -1008,23 +1018,46 @@ def test_leader_note_has_border_and_dot():
         _edit(add=[{"page": 1, "shape": "check", "at": [0.5, 0.5], "dot": True}])
 
 
-def test_leader_falls_back_to_underline_where_a_border_does_not_fit():
-    # A gap just tall enough for the note's text, not for a bordered note.
-    trial = _edit(add=[{"page": 1, "text": "a fairly long note", "at": [0.5, 0.5]}])
-    left, top, right, bottom = trial["marks"][0]["box"]
-    height = bottom - top
-    gap = height + 2 * pdf_marks.CLEARANCE + 0.002
-    ink = [[0.05, 0.3, 0.95, 0.5], [0.05, 0.5 + gap, 0.95, 0.8]]
+def test_underline_leader_runs_along_the_note():
+    ink = [[0.05, 0.3, 0.95, 0.5]]
     result = _near_edit(
-        [{"page": 1, "id": "n", "text": "a fairly long note", "near": [0.9, 0.45], "leader": True}],
+        [
+            {
+                "page": 1,
+                "id": "n",
+                "text": "a fairly long note",
+                "near": [0.9, 0.45],
+                "leader": True,
+                "leader_style": "underline",
+            }
+        ],
         ink,
     )
     mark = result["marks"][0]
-    assert mark["request"]["border"] is False
     leader = mark["leader"]
     # Along the bottom of the note, round the corner, to the point.
     assert len(leader["via"]) == 1
     assert leader["from"][1] == leader["via"][0][1] == pytest.approx(mark["box"][3])
+
+
+def test_end_leader_starts_beside_the_text_at_mid_height():
+    ink = [[0.05, 0.3, 0.95, 0.5]]
+    result = _near_edit(
+        [{"page": 1, "id": "n", "text": "note", "near": [0.9, 0.45], "leader": True}], ink
+    )
+    mark = result["marks"][0]
+    assert "border" not in mark["request"] or mark["request"]["border"] is False
+    assert mark["request"]["leader_style"] == "end"
+    leader = mark["leader"]
+    left, top, right, bottom = mark["box"]
+    start = leader["from"]
+    assert start[1] == pytest.approx((top + bottom) / 2, abs=1e-3)
+    assert start[0] > right or start[0] < left  # beyond the text, not on it
+    with pytest.raises(MarkError, match="leader_style must be"):
+        _near_edit(
+            [{"page": 1, "text": "x", "near": [0.5, 0.2], "leader": True, "leader_style": "x"}],
+            ink,
+        )
 
 
 def test_line_via_points():
