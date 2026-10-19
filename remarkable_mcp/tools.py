@@ -2434,7 +2434,9 @@ async def _saved_export_response(published, output_format, save_path, overwrite,
     build = result.build
     try:
         data = export_store.read_bytes(resource.export_id, output_format)
-        saved = await run_blocking(export_save.save, data, save_path, overwrite)
+        saved = await run_blocking(
+            export_save.save, data, save_path, overwrite, result.metadata.document_id
+        )
     except export_save.SaveError as exc:
         return make_error(error_type=exc.error_type, message=exc.message, suggestion=exc.suggestion)
     except OSError as exc:
@@ -2498,7 +2500,8 @@ async def remarkable_export(
     the copy. Only paths inside the folders listed in REMARKABLE_EXPORT_DIRS
     are accepted. Missing folders are created; the file is written under a
     temporary name and renamed into place. An existing file is replaced only
-    with `overwrite=True`. Nothing is ever deleted.
+    with `overwrite=True`, and only when it is an earlier export of the same
+    document. Nothing is ever deleted.
 
     PDF behavior:
     - `pdf_mode="merged"` (default) preserves complete physical pages, combining
@@ -2525,7 +2528,8 @@ async def remarkable_export(
     - pages: PDF only. One page (5) or ranges ("5-9,12"); default: every page.
     - save_to: Absolute path of a .pdf or .md file to save the export at,
       inside a folder listed in REMARKABLE_EXPORT_DIRS.
-    - overwrite: Replace an existing file at save_to (default: False).
+    - overwrite: Replace an existing file at save_to that is an earlier export
+      of the same document (default: False).
     </parameters>
     <examples>
     - remarkable_export("Meeting Notes")
@@ -2602,6 +2606,8 @@ async def remarkable_export(
                 did_you_mean=similar if similar else None,
             )
 
+        if save_path is not None and overwrite:
+            await run_blocking(export_save.check_replace, save_path, target_doc.ID)
         full_path = get_item_path(target_doc, items_by_id)
         display_path = _apply_root_filter(full_path)
         source_type = await run_blocking(get_file_type, client, target_doc)
@@ -2626,7 +2632,7 @@ async def remarkable_export(
             background_color=background,
             page_ranges=page_ranges,
         )
-    except _ExportRequestError as exc:
+    except (_ExportRequestError, export_save.SaveError) as exc:
         return make_error(
             error_type=exc.error_type,
             message=exc.message,

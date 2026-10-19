@@ -451,18 +451,37 @@ class TestExportSaveTo:
             assert len(exported) == 2
 
     @pytest.mark.asyncio
-    async def test_existing_file_needs_overwrite(self, allowed):
+    async def test_overwrite_replaces_only_an_export_of_the_same_document(self, allowed):
+        import hashlib
+
         target = allowed / "sheet.pdf"
-        target.write_bytes(b"keep me")
+        data, _ = await self._export(save_to=str(target))
 
         data, _ = await self._export(save_to=str(target))
         assert data["_error"]["type"] == "file_exists"
-        assert target.read_bytes() == b"keep me"
 
         data, _ = await self._export(save_to=str(target), overwrite=True)
         assert "_error" not in data, data
-        assert target.read_bytes().startswith(b"%PDF")
         assert [p.name for p in allowed.iterdir()] == ["sheet.pdf"]
+        assert data["sha256"] == hashlib.sha256(target.read_bytes()).hexdigest()
+
+    @pytest.mark.asyncio
+    async def test_overwrite_refuses_other_files(self, allowed):
+        other = allowed / "notes.pdf"
+        other.write_bytes(b"%PDF-1.4 not an export")
+        data, _ = await self._export(save_to=str(other), overwrite=True)
+        assert data["_error"]["type"] == "not_same_document"
+        assert other.read_bytes() == b"%PDF-1.4 not an export"
+
+        exported = allowed / "other.pdf"
+        with fitz.open(stream=_pdf_bytes(1), filetype="pdf") as doc:
+            doc.set_metadata({"keywords": "remarkable-document-id:another-id"})
+            doc.save(exported)
+        before = exported.read_bytes()
+        data, _ = await self._export(save_to=str(exported), overwrite=True)
+        assert data["_error"]["type"] == "not_same_document"
+        assert "another-id" in data["_error"]["message"]
+        assert exported.read_bytes() == before
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(

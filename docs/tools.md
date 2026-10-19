@@ -450,7 +450,7 @@ used when configured; otherwise OCR runs locally with Tesseract.
 | `include_ocr` | bool | `False` | Run the existing OCR path for Markdown |
 | `pages` | int \| string | all pages | PDF only: one page (`5`) or ranges (`"5-9,12"`) |
 | `save_to` | string | none | Absolute path of a `.pdf` or `.md` file to save the export at, inside a folder listed in `REMARKABLE_EXPORT_DIRS` |
-| `overwrite` | bool | `False` | With `save_to`: replace an existing file |
+| `overwrite` | bool | `False` | With `save_to`: replace an existing file that is an earlier export of the same document |
 
 ### Delivery and lifecycle
 
@@ -472,7 +472,9 @@ listed in `REMARKABLE_EXPORT_DIRS` (separated by `:`) are accepted, checked
 after resolving symlinks; any other path, or a save without that setting, is
 refused. Missing folders are created, and the file is written under a
 temporary name in the same folder and renamed into place. An existing file is
-replaced only with `overwrite=True`; nothing is ever deleted. The response gives
+replaced only with `overwrite=True`, and only when it is an earlier export of the
+same reMarkable document (its id is in a PDF export's keywords and a Markdown
+export's front matter); nothing is ever deleted. The response gives
 `saved_path`, `size`, `pages`, `sha256`, `status`, `failed_pages` and
 `warnings`, so the copy can be checked. `pdf_mode` and `pages` work the same as
 without `save_to`.
