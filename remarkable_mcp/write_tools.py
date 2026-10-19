@@ -1291,8 +1291,40 @@ MARK_PREVIEW_MAX_PAGES = 4
 MARK_PREVIEW_DPI = 100
 
 
-def _mark_editor(add: list, remove: list, clear: bool, color: Optional[str], build: bool):
-    """``edit(pdf, content)`` for ``replace_document_pdf``, or a dry run."""
+def _page_obstacles(client, files: list, pdf: bytes):
+    """``obstacles(pdf_page, page_map)``: regions of the user's ink and the
+    PDF's printed text on a page, for placing marks with ``near``."""
+    from remarkable_mcp.extract import page_ink_regions
+    from remarkable_mcp.pdf_marks import original_pdf, tablet_page, text_lines
+
+    base = original_pdf(pdf)
+    cache: dict = {}
+
+    def obstacles(pdf_page: int, page_map: list) -> list:
+        if pdf_page not in cache:
+            page = tablet_page(pdf_page, page_map)
+            ink = []
+            if page:
+                with _document_dir(client, files, base) as root:
+                    ink = page_ink_regions(root, page)
+            cache[pdf_page] = ink + [line["region"] for line in text_lines(base, pdf_page)]
+        return cache[pdf_page]
+
+    return obstacles
+
+
+def _mark_editor(
+    add: list,
+    remove: list,
+    clear: bool,
+    color: Optional[str],
+    build: bool,
+    obstacles=None,
+):
+    """``edit(pdf, content)`` for ``replace_document_pdf``, or a dry run.
+
+    ``obstacles`` (see ``_page_obstacles``) is needed for marks placed with
+    ``near``."""
     from remarkable_mcp import pdf_marks
     from remarkable_mcp.pages import pdf_page_map
 
@@ -1310,6 +1342,7 @@ def _mark_editor(add: list, remove: list, clear: bool, color: Optional[str], bui
             page_map=page_map,
             sizes=pdf_marks.page_sizes(base),
             color=color,
+            obstacles=(lambda i: obstacles(i, page_map)) if obstacles else None,
         )
         touched = {m["pdf_page"] for m in marks if m["id"] in result["removed"]}
         touched |= {m["pdf_page"] for m in result["marks"] if m["id"] in result["added"]}
@@ -1372,9 +1405,16 @@ def _mark_preview_images(client, files: list, pdf: bytes, pages: list) -> list:
 
 
 def _mark_layout(client, files: list, pdf: bytes, page: int, page_map: list) -> dict:
-    """The original PDF's text lines and the user's ink on a tablet page."""
+    """The original PDF's text lines, the user's ink and the free space on a
+    tablet page."""
     from remarkable_mcp.extract import page_ink_regions
-    from remarkable_mcp.pdf_marks import MarkError, original_pdf, text_lines
+    from remarkable_mcp.pdf_marks import (
+        MarkError,
+        free_regions,
+        original_pdf,
+        stored_marks,
+        text_lines,
+    )
 
     if not 1 <= page <= len(page_map):
         raise MarkError(f"Page {page} does not exist; the document has {len(page_map)}.")
@@ -1382,10 +1422,13 @@ def _mark_layout(client, files: list, pdf: bytes, page: int, page_map: list) -> 
     base = original_pdf(pdf)
     with _document_dir(client, files, base) as root:
         ink = page_ink_regions(root, page)
+    lines = text_lines(base, pdf_page) if pdf_page is not None else []
+    marks = [m["box"] for m in stored_marks(pdf) if m.get("pdf_page") == pdf_page]
     return {
         "page": page,
-        "text_lines": text_lines(base, pdf_page) if pdf_page is not None else [],
+        "text_lines": lines,
         "ink": ink,
+        "free": free_regions(ink + [line["region"] for line in lines] + marks),
     }
 
 
@@ -2974,6 +3017,13 @@ def register_write_tools():
                   or data: URIs.
                 - graphic_file: path of such a file on the machine running this
                   server (up to 10 MB), with region
+                Instead of at or region, text, latex, check, cross and path marks
+                can take near [x, y]: the mark is put in the closest free space to
+                that point, clear of the user's ink, the printed text and other
+                marks, and "leader": true draws a thin line from the mark to the
+                point. Use near (with a leader when the free space is not right
+                beside it) on pages full of writing; give the point of what the
+                mark is about, such as the end of an answer.
                 Marks placed with `at` take an optional anchor: the point of the
                 mark placed at `at`: top-left, top, top-right, left, center,
                 right, bottom-left, bottom or bottom-right. Default center for
@@ -3012,9 +3062,10 @@ def register_write_tools():
                 - dry_run: Return preview images of the changed pages without
                   writing
                 - layout: Tablet page number; the response adds that page's text
-                  lines (from the PDF before marks), each with its region, and
-                  the regions of the user's ink. Not combined with a write; use
-                  it alone or with dry_run.
+                  lines (from the PDF before marks), each with its region, the
+                  regions of the user's ink, and free: the largest empty regions
+                  (clear of ink, text and marks), largest first. Not combined
+                  with a write; use it alone or with dry_run.
                 </parameters>
                 <examples>
                 - remarkable_mark_pdf("Worksheet", color="red", add=[
@@ -3043,6 +3094,9 @@ def register_write_tools():
                 - remarkable_mark_pdf("Worksheet", remove=["q3", "q3-note"], add=[
                     {"page": 1, "id": "q3", "shape": "check", "at": [0.38, 0.33],
                      "color": "green"}])  # the answer was revised
+                - remarkable_mark_pdf("Worksheet", color="red", add=[
+                    {"page": 2, "id": "q4-note", "text": "check the sign",
+                     "near": [0.62, 0.41], "leader": true, "size": 9}])
                 - remarkable_mark_pdf("Worksheet", layout=1)  # where to place marks
                 - remarkable_mark_pdf("Worksheet")  # list marks
                 - remarkable_mark_pdf("Worksheet", clear=True)
@@ -3087,7 +3141,13 @@ def register_write_tools():
                                 f"'{target.VissibleName}' is a folder.",
                                 "Mark a PDF document instead.",
                             )
-                        edit = _mark_editor(adds, removes, clear, color, build=writing)
+                        obstacles = None
+                        if any(isinstance(m, dict) and "near" in m for m in adds):
+                            near_pdf, _, near_files = client.read_document_pdf(target.ID)
+                            obstacles = _page_obstacles(client, near_files, near_pdf)
+                        edit = _mark_editor(
+                            adds, removes, clear, color, build=writing, obstacles=obstacles
+                        )
                         if writing:
                             result = client.replace_document_pdf(target.ID, edit)
                             if result["changed"]:

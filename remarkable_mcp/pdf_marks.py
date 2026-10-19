@@ -135,6 +135,17 @@ DEFAULT_SYMBOL_SIZE = 12.0
 DEFAULT_LINE_WIDTH = 1.5
 MAX_PATH_CHARS = 20_000
 MAX_DESCRIPTION_CHARS = 200
+# Placement with "near": marks keep this clearance (page fraction) from ink,
+# printed text and other marks, stay inside PAGE_BOUNDS, and are looked for
+# within NEAR_RADIUS of the point. Leader lines are LEADER_WIDTH points wide
+# and stop LEADER_GAP short of the point.
+PAGE_BOUNDS = (0.02, 0.02, 0.98, 0.98)
+CLEARANCE = 0.006
+NEAR_RADIUS = 0.4
+NEAR_STEP = 0.004
+LEADER_WIDTH = 0.75
+LEADER_GAP = 0.008
+FREE_GRID = (120, 170)
 _PATH_PATTERN = re.compile(r"^[MmLlHhVvCcSsQqTtAaZz0-9eE+\-.,\s]+$")
 LINE_SPACING = 1.2
 MAX_SVG_CHARS = 1_000_000
@@ -188,19 +199,26 @@ def for_export(pdf_bytes: bytes) -> bytes:
     if not marks:
         return pdf_bytes
     sizes = page_sizes(base)
+
+    def redraw(part: Dict[str, Any], size) -> Dict[str, Any]:
+        name, request = part.get("color_name"), part.get("request")
+        if not name or not isinstance(request, dict):
+            return part
+        palette = DESKTOP_HIGHLIGHT_COLORS if part.get("shape") == "highlight" else DESKTOP_COLORS
+        if name not in palette:
+            return part
+        request = {k: v for k, v in request.items() if k not in ("near", "leader")}
+        try:
+            return dict(part, **render_mark(dict(request, color=_hex(palette[name])), size, None))
+        except MarkError:
+            return part
+
     drawn = []
     for mark in marks:
-        name, request = mark.get("color_name"), mark.get("request")
-        if name and isinstance(request, dict):
-            palette = (
-                DESKTOP_HIGHLIGHT_COLORS if mark.get("shape") == "highlight" else DESKTOP_COLORS
-            )
-            if name in palette:
-                again = dict(request, color=_hex(palette[name]))
-                try:
-                    mark = dict(mark, **render_mark(again, sizes[mark["pdf_page"]], None))
-                except (MarkError, IndexError):
-                    pass
+        size = sizes[mark["pdf_page"]]
+        mark = redraw(mark, size)
+        if mark.get("leader"):
+            mark = dict(mark, leader=redraw(mark["leader"], size))
         drawn.append(mark)
     return build(base, drawn, embed=False)
 
@@ -278,8 +296,10 @@ def build(base: bytes, marks: Sequence[Dict[str, Any]], embed: bool = True) -> b
             page = doc[index]
             if page.rotation:
                 raise MarkError("Rotated PDF pages are not supported.")
-            with pymupdf.open("pdf", base64.b64decode(mark["pdf"])) as snippet:
-                page.show_pdf_page(_points(page.rect, mark["box"]), snippet, 0)
+            for part in (mark, mark.get("leader")):
+                if part:
+                    with pymupdf.open("pdf", base64.b64decode(part["pdf"])) as snippet:
+                        page.show_pdf_page(_points(page.rect, part["box"]), snippet, 0)
         if embed:
             doc.embfile_add(BASE_FILE, base, filename=BASE_FILE, desc="PDF before marks")
             payload = json.dumps({"format": MARKS_FORMAT, "marks": list(marks)}, indent=1)
@@ -948,6 +968,8 @@ STYLE_KEYS = (
     "underline",
     "anchor",
     "at",
+    "near",
+    "leader",
     "width",
     "opacity",
     "fill",
@@ -991,6 +1013,169 @@ def summarize(mark: Dict[str, Any], page: Optional[int]) -> Dict[str, Any]:
     return out
 
 
+# --- Placing marks in free space -----------------------------------------
+
+
+def _overlaps(a: Sequence[float], b: Sequence[float], margin: float = 0.0) -> bool:
+    return (
+        a[0] < b[2] + margin
+        and b[0] < a[2] + margin
+        and a[1] < b[3] + margin
+        and b[1] < a[3] + margin
+    )
+
+
+def free_regions(obstacles: Sequence[Sequence[float]], count: int = 12) -> List[List[float]]:
+    """The largest empty rectangles on a page, largest first.
+
+    ``obstacles`` are regions (page fractions) to keep clear of, such as ink,
+    printed text and marks; the result keeps ``CLEARANCE`` from them and
+    stays inside ``PAGE_BOUNDS``. Rectangles smaller than about 6% of the
+    page width or 2% of its height are left out.
+    """
+    cols, rows = FREE_GRID
+    left, top, right, bottom = PAGE_BOUNDS
+    cw, ch = (right - left) / cols, (bottom - top) / rows
+    used = [[False] * cols for _ in range(rows)]
+    for o in obstacles:
+        c0 = max(0, int((o[0] - CLEARANCE - left) / cw))
+        c1 = min(cols, int((o[2] + CLEARANCE - left) / cw) + 1)
+        r0 = max(0, int((o[1] - CLEARANCE - top) / ch))
+        r1 = min(rows, int((o[3] + CLEARANCE - top) / ch) + 1)
+        for r in range(r0, r1):
+            for c in range(c0, c1):
+                used[r][c] = True
+
+    def largest():
+        best, heights = (0, None), [0] * cols
+        for r in range(rows):
+            for c in range(cols):
+                heights[c] = 0 if used[r][c] else heights[c] + 1
+            stack: List[int] = []
+            for c in range(cols + 1):
+                h = heights[c] if c < cols else 0
+                while stack and heights[stack[-1]] >= h:
+                    height = heights[stack.pop()]
+                    start = stack[-1] + 1 if stack else 0
+                    area = height * (c - start)
+                    if area > best[0]:
+                        best = (area, (start, r - height + 1, c, r + 1))
+                stack.append(c)
+        return best[1]
+
+    found = []
+    for _ in range(count):
+        cells = largest()
+        if cells is None:
+            break
+        c0, r0, c1, r1 = cells
+        for r in range(r0, r1):
+            for c in range(c0, c1):
+                used[r][c] = True
+        region = [left + c0 * cw, top + r0 * ch, left + c1 * cw, top + r1 * ch]
+        if region[2] - region[0] < 0.06 or region[3] - region[1] < 0.02:
+            continue
+        found.append([_round(v) for v in region])
+    return found
+
+
+def _segment_hits(p, q, box) -> bool:
+    """True if the segment p-q passes through ``box``."""
+    steps = 24
+    for i in range(steps + 1):
+        t = i / steps
+        x, y = p[0] + (q[0] - p[0]) * t, p[1] + (q[1] - p[1]) * t
+        if box[0] < x < box[2] and box[1] < y < box[3]:
+            return True
+    return False
+
+
+def _leader_ends(box: Sequence[float], near: Sequence[float]):
+    """Ends of a leader line from ``box`` toward ``near``, or None if too short."""
+    start = [min(max(near[0], box[0]), box[2]), min(max(near[1], box[1]), box[3])]
+    dx, dy = near[0] - start[0], near[1] - start[1]
+    length = math.hypot(dx, dy)
+    if length < LEADER_GAP * 3:
+        return None
+    ux, uy = dx / length, dy / length
+    begin = [start[0] + ux * 0.003, start[1] + uy * 0.003]
+    end = [near[0] - ux * LEADER_GAP, near[1] - uy * LEADER_GAP]
+    return [_round(v) for v in begin], [_round(v) for v in end]
+
+
+def _place_near(
+    near: Sequence[float],
+    width: float,
+    height: float,
+    obstacles: Sequence[Sequence[float]],
+    leader: bool,
+) -> List[float]:
+    """Top-left of the closest ``width`` x ``height`` box to ``near`` that is
+    clear of ``obstacles``; with ``leader``, positions whose leader would
+    cross an obstacle count as much farther away."""
+    left, top, right, bottom = PAGE_BOUNDS
+    best, best_cost = None, math.inf
+    span = int(NEAR_RADIUS / NEAR_STEP)
+    for i in range(-span, span + 1):
+        x0 = near[0] + i * NEAR_STEP - width / 2
+        if x0 < left or x0 + width > right:
+            continue
+        for j in range(-span, span + 1):
+            y0 = near[1] + j * NEAR_STEP - height / 2
+            if y0 < top or y0 + height > bottom:
+                continue
+            box = (x0, y0, x0 + width, y0 + height)
+            dx = max(box[0] - near[0], 0, near[0] - box[2])
+            dy = max(box[1] - near[1], 0, near[1] - box[3])
+            cost = math.hypot(dx, dy)
+            if cost >= best_cost or any(_overlaps(box, o, CLEARANCE) for o in obstacles):
+                continue
+            if leader:
+                ends = _leader_ends(box, near)
+                if ends and any(_segment_hits(ends[0], ends[1], o) for o in obstacles):
+                    cost += 0.5
+                    if cost >= best_cost:
+                        continue
+            best, best_cost = [x0, y0], cost
+    if best is None:
+        raise MarkError(
+            "No free space near that point fits the mark; make it smaller or shorter, "
+            "or place it with at."
+        )
+    return best
+
+
+def _render_near(
+    options: Dict[str, Any],
+    size: Tuple[float, float],
+    color: Optional[str],
+    obstacles: Sequence[Sequence[float]],
+) -> Dict[str, Any]:
+    """Render a mark placed with ``near`` (and optionally a ``leader``)."""
+    near = _point(options.get("near"), "near")
+    leader = bool(options.get("leader", False))
+    if "at" in options or "region" in options:
+        raise MarkError("Place a mark with near, at or region, not more than one.")
+    if options.get("shape") in ("circle", "box", "highlight", "line", "arrow") or (
+        "graphic" in options or "graphic_file" in options
+    ):
+        raise MarkError("near works for text, latex, check, cross and path marks.")
+    base = {k: v for k, v in options.items() if k not in ("near", "leader", "anchor")}
+    trial = render_mark(dict(base, at=[0.5, 0.5], anchor="center"), size, color)
+    width = trial["box"][2] - trial["box"][0]
+    height = trial["box"][3] - trial["box"][1]
+    x0, y0 = _place_near(near, width, height, obstacles, leader)
+    stored = render_mark(dict(base, at=[x0, y0], anchor="top-left"), size, color)
+    stored["request"] = dict(stored.get("request", {}), near=near, leader=leader)
+    ends = _leader_ends(stored["box"], near) if leader else None
+    if ends:
+        line = {"shape": "line", "from": ends[0], "to": ends[1], "width": LEADER_WIDTH}
+        if "color" in options:
+            line["color"] = options["color"]
+        stored["leader"] = render_mark(line, size, color)
+    return stored
+
+
 def edit_marks(
     marks: List[Dict[str, Any]],
     *,
@@ -1000,13 +1185,16 @@ def edit_marks(
     page_map: Sequence[Optional[int]],
     sizes: Sequence[Tuple[float, float]],
     color: Optional[str],
+    obstacles: Optional[Callable[[int], List[List[float]]]] = None,
 ) -> Dict[str, Any]:
     """Apply removals, then additions, to a copy of ``marks``.
 
     ``page_map`` maps each tablet page (1-based position) to its PDF page
     index (``None`` for pages added on the tablet); ``sizes`` are the PDF's
     page sizes in points. Each added mark needs a ``page`` and may give an
-    ``id``; generated ids are ``mark-N``.
+    ``id``; generated ids are ``mark-N``. A mark placed with ``near`` is put
+    in the closest free space, clear of ``obstacles(pdf_page)`` (ink and
+    printed text) and of the other marks on its page.
 
     Returns ``{"marks", "added", "removed", "notes", "changed"}``.
     """
@@ -1052,7 +1240,16 @@ def edit_marks(
         options = {k: v for k, v in request.items() if k not in ("id", "page", "description")}
         try:
             description = _description(request.get("description"))
-            stored = render_mark(options, sizes[pdf_page], color)
+            if "leader" in options and "near" not in options:
+                raise MarkError("leader applies only to marks placed with near.")
+            if "near" in options:
+                if obstacles is None:
+                    raise MarkError("near is not available here.")
+                blocked = list(obstacles(pdf_page))
+                blocked += [other["box"] for other in result if other["pdf_page"] == pdf_page]
+                stored = _render_near(options, sizes[pdf_page], color, blocked)
+            else:
+                stored = render_mark(options, sizes[pdf_page], color)
         except MarkError as e:
             raise MarkError(f"Mark '{mark_id}': {e}") from None
         mark = {"id": mark_id, "pdf_page": pdf_page, **stored}

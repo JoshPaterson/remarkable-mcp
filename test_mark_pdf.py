@@ -868,3 +868,97 @@ def test_listing_shows_style():
     old = dict(result["marks"][0])
     del old["request"]
     assert pdf_marks.summarize(old, 1)["style"] == {"size": 9, "bold": True}
+
+
+def _near_edit(add, obstacles, marks=()):
+    return pdf_marks.edit_marks(
+        list(marks),
+        add=add,
+        remove=[],
+        clear=False,
+        page_map=[0, 1],
+        sizes=[A4, A4],
+        color=None,
+        obstacles=lambda pdf_page: obstacles,
+    )
+
+
+def test_free_regions_avoid_obstacles():
+    ink = [[0.0, 0.0, 1.0, 0.5]]
+    free = pdf_marks.free_regions(ink)
+    assert free
+    biggest = free[0]
+    assert biggest[1] >= 0.5 + pdf_marks.CLEARANCE - 0.01
+    assert all(not pdf_marks._overlaps(region, ink[0]) for region in free)
+    assert pdf_marks.free_regions([[0, 0, 1, 1]]) == []
+
+
+def test_near_places_mark_in_closest_free_space():
+    ink = [[0.1, 0.4, 0.9, 0.5]]  # a full line of writing around the point
+    result = _near_edit(
+        [{"page": 1, "id": "n", "text": "note", "near": [0.5, 0.45], "size": 10}], ink
+    )
+    mark = result["marks"][0]
+    assert not pdf_marks._overlaps(mark["box"], ink[0], pdf_marks.CLEARANCE - 1e-6)
+    # Just above or below the line, not far away.
+    assert 0.4 - 0.06 < mark["box"][1] < 0.5 + 0.03
+    assert mark["request"]["near"] == [0.5, 0.45]
+    assert "leader" not in mark
+
+
+def test_near_avoids_marks_placed_earlier_in_the_call():
+    ink = [[0.1, 0.4, 0.9, 0.5]]
+    result = _near_edit(
+        [
+            {"page": 1, "id": "a", "text": "first note", "near": [0.5, 0.45]},
+            {"page": 1, "id": "b", "text": "second note", "near": [0.5, 0.45]},
+        ],
+        ink,
+    )
+    a, b = result["marks"]
+    assert not pdf_marks._overlaps(a["box"], b["box"])
+
+
+def test_leader_line_is_drawn_and_removed_with_its_mark():
+    ink = [[0.0, 0.3, 1.0, 0.6]]
+    result = _near_edit(
+        [{"page": 1, "id": "n", "text": "note", "near": [0.5, 0.45], "leader": True}], ink
+    )
+    mark = result["marks"][0]
+    leader = mark["leader"]
+    assert leader["shape"] == "line"
+    # The line ends short of the point, on the side of the mark.
+    assert abs(leader["to"][1] - 0.45) < abs(leader["from"][1] - 0.45)
+    original = _pdf()
+    marked = pdf_marks.build(original, result["marks"])
+    with pymupdf.open(stream=marked, filetype="pdf") as doc:
+        assert any(abs(d["width"] - pdf_marks.LEADER_WIDTH) < 0.01 for d in doc[0].get_drawings())
+    base, marks = pdf_marks.load_state(marked)
+    after = pdf_marks.edit_marks(
+        marks, add=[], remove=["n"], clear=False, page_map=[0, 1], sizes=[A4, A4], color=None
+    )
+    assert pdf_marks.build(base, after["marks"]) == original
+    assert pdf_marks.summarize(mark, 1)["style"]["leader"] is True
+
+
+@pytest.mark.parametrize(
+    "mark, message",
+    [
+        ({"page": 1, "text": "x", "near": [0.5, 0.5], "at": [0.1, 0.1]}, "not more than one"),
+        ({"page": 1, "text": "x", "at": [0.1, 0.1], "leader": True}, "only to marks placed"),
+        ({"page": 1, "shape": "circle", "near": [0.5, 0.5]}, "near works for"),
+    ],
+)
+def test_invalid_near_marks(mark, message):
+    with pytest.raises(MarkError, match=message):
+        _near_edit([mark], [])
+
+
+def test_near_reports_when_nothing_fits():
+    with pytest.raises(MarkError, match="No free space"):
+        _near_edit([{"page": 1, "text": "x", "near": [0.5, 0.5]}], [[0, 0, 1, 1]])
+
+
+def test_near_needs_obstacles():
+    with pytest.raises(MarkError, match="not available"):
+        _edit(add=[{"page": 1, "text": "x", "near": [0.5, 0.5]}])
