@@ -61,23 +61,26 @@ def _rgb(hex_color: str) -> Tuple[float, float, float]:
     return tuple(int(hex_color[i : i + 2], 16) / 255 for i in (1, 3, 5))
 
 
-# The tablet's pen and highlighter colors, as its PDF export draws them.
-# Highlighters are drawn with the Darken blend: on white paper they show
-# their color, and text under them stays dark.
+# Pen colors as the Paper Pro shows them. Its screen draws the pure colors
+# below without dithering, matching its own pen strokes; the softer values
+# its PDF export uses for pens are dithered on the screen and look different.
 COLORS = {
     name: _rgb(value)
     for name, value in {
         "black": "#000000",
         "gray": "#909090",
         "white": "#FFFFFF",
-        "blue": "#304AE0",
-        "red": "#C23132",
-        "green": "#91DA71",
-        "yellow": "#FAE719",
-        "cyan": "#74D2E8",
-        "magenta": "#C07FD2",
+        "blue": "#0000FF",
+        "red": "#FF0000",
+        "green": "#00FF00",
+        "yellow": "#FFFF00",
+        "cyan": "#00FFFF",
+        "magenta": "#FF00FF",
     }.items()
 }
+# Highlighter colors from the tablet's PDF export, drawn with the Darken
+# blend: on white paper they show their color, and text under them stays
+# dark.
 HIGHLIGHT_COLORS = {
     name: _rgb(value)
     for name, value in {
