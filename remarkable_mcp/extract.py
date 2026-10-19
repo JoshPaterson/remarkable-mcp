@@ -2817,9 +2817,11 @@ def page_ink_regions(tmpdir_path: Path, page: int) -> List[List[float]]:
 
     Each box is ``[left, top, right, bottom]`` in the frame of
     ``remarkable_image``'s ``region``, around strokes on visible layers that
-    lie close together (roughly a word or a line of writing). Empty when the
-    page has no ink.
+    lie close together (roughly a word or a line of writing). Strokes the MCP
+    wrote (covers over marks) are left out. Empty when the page has no ink.
     """
+    from remarkable_mcp.cover_layers import known_author_uuid
+
     rm_file = _select_rm_file_for_page(tmpdir_path, _get_ordered_rm_files(tmpdir_path), page)
     if rm_file is None:
         return []
@@ -2829,11 +2831,27 @@ def page_ink_regions(tmpdir_path: Path, page: int) -> List[List[float]]:
     blocks, tree = scene
     offsets = _v6_anchor_offsets(rm_file)
     frame = _page_frame(tmpdir_path, page, rm_file, _pdf_page_sizes(tmpdir_path))
+    author = known_author_uuid()
+    own = next(
+        (
+            number
+            for block in blocks
+            for number, value in (getattr(block, "author_uuids", None) or {}).items()
+            if author is not None and value == author
+        ),
+        None,
+    )
     boxes = []
     for layer in _scene_layers(tree, blocks):
         if not layer["visible"]:
             continue
+        ours = set()
+        if own is not None and getattr(layer["group"].node_id, "part1", None) == own:
+            children = layer["group"].children
+            ours = {id(v) for k, v in children.items() if getattr(k, "part1", None) == own}
         for item, node_id in _scene_items(layer["group"]):
+            if id(item) in ours:
+                continue
             if type(item).__name__ != "Line":
                 continue
             tool = getattr(item, "tool", None)

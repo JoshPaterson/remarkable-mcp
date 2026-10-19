@@ -193,7 +193,10 @@ With `"text"` and `"annotations"` the marks are listed under
 `q3-note (page 1, red, text): Orange is a secondary color.`, and returned as
 `marks: [{"id", "page", "kind", "shape" | "text" | "latex" | "path" | "format",
 "color", "region"}]`, with lines and arrows giving `from` and `to` instead of a
-region. Regions are page fractions, as for `remarkable_image`'s `region`.
+region. Regions are page fractions, as for `remarkable_image`'s `region`. A
+mark with a cover layer adds `[cover 'Mark cover': hidden on tablet]` to its
+line and `"cover": {"layer", "state"}` to its entry; the state is `hidden on
+tablet`, `shown on tablet` or `cover erased on tablet`.
 
 ### Smart Features
 

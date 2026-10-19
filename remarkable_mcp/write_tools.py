@@ -1333,9 +1333,15 @@ def _mark_editor(
     if color:
         pdf_marks.check_color(color)
 
-    def edit(pdf: bytes, content: dict) -> dict:
+    def edit(pdf: bytes, content: dict, read_ink=None) -> dict:
+        """``read_ink(page_id)`` returns a page's ink file (or None); it is
+        needed to write marks' covers and report their state."""
+        from remarkable_mcp import cover_layers
+        from remarkable_mcp.pages import content_page_ids
+
         base, marks = pdf_marks.load_state(pdf)
         page_map = pdf_page_map(content)
+        page_ids = content_page_ids(content)
         result = pdf_marks.edit_marks(
             marks,
             add=add,
@@ -1352,12 +1358,52 @@ def _mark_editor(
         result["touched_pages"] = sorted(
             p for p in (pdf_marks.tablet_page(i, page_map) for i in touched) if p
         )
+        result["ink"] = {}
+        covers = [m.get("cover") for m in marks + result["marks"]]
+        if build and result["changed"] and any(isinstance(c, dict) for c in covers):
+            if read_ink is None:
+                raise pdf_marks.MarkError("Covers cannot be written here.")
+            try:
+                result["ink"] = cover_layers.write_mark_covers(
+                    marks,
+                    result["marks"],
+                    result["removed"],
+                    page_ids=page_ids,
+                    page_map=page_map,
+                    sizes=pdf_marks.page_sizes(base),
+                    read_ink=read_ink,
+                    author=cover_layers.author_uuid(),
+                )
+            except cover_layers.CoverError as e:
+                raise pdf_marks.MarkError(str(e)) from None
+        result["cover_states"], cover_notes = {}, []
+        if read_ink is not None:
+            written = result["ink"]
+            result["cover_states"], cover_notes = cover_layers.mark_cover_states(
+                result["marks"],
+                page_ids=page_ids,
+                page_map=page_map,
+                read_ink=lambda page_id: written.get(page_id) or read_ink(page_id),
+            )
+        result["notes"] = result["notes"] + cover_notes
         result["pdf"] = pdf_marks.build(base, result["marks"]) if result["changed"] else None
         if not build:
             result["preview_pdf"], result["pdf"] = result["pdf"], None
         return result
 
     return edit
+
+
+def _ink_reader(client, doc_id: str, files: list):
+    """``read_ink(page_id)``: a page's ``.rm`` file from a document's index
+    ``files``, or None when the page has no ink."""
+    by_id = {entry["id"]: entry for entry in files}
+
+    def read_ink(page_id: str) -> Optional[bytes]:
+        entry = by_id.get(f"{doc_id}/{page_id}.rm")
+        return None if entry is None else client._get_file(entry["hash"], entry["id"])
+
+    return read_ink
 
 
 @contextmanager
@@ -1440,7 +1486,14 @@ def _mark_response(target, result: dict, dry_run: bool) -> str:
     page_map = result["page_map"]
     data = {
         "document": target.VissibleName,
-        "marks": [summarize(m, tablet_page(m["pdf_page"], page_map)) for m in result["marks"]],
+        "marks": [
+            summarize(
+                m,
+                tablet_page(m["pdf_page"], page_map),
+                result.get("cover_states", {}).get(m["id"]),
+            )
+            for m in result["marks"]
+        ],
         "added": result["added"],
         "removed": result["removed"],
         "changed": result["changed"],
@@ -2972,7 +3025,8 @@ def register_write_tools():
                 which is not changed. Each mark has an id; removing a mark
                 rebuilds the PDF without it, so outdated marks can be replaced
                 cleanly. With no changes requested it lists the current marks.
-                Marks cannot be erased on the tablet, only with this tool.
+                Marks cannot be erased on the tablet, only with this tool (or
+                hidden there, with a cover; see below).
 
                 Positions are fractions of the page (0-1 from the top-left): a
                 point is [x, y] and a region is [left, top, right, bottom], the
@@ -2993,6 +3047,17 @@ def register_write_tools():
                 for later sessions; it is shown when marks are listed and by
                 remarkable_read. Describe path marks, which are otherwise only
                 path data, e.g. "gold star: neat, complete working".
+
+                Any mark can take "cover": true so the user can hide it on the
+                tablet: white ink goes over it on a "Mark cover" layer at the
+                bottom of the page, made hidden, and showing that layer hides
+                the mark. A layer name instead of true (e.g. "Answer key")
+                makes a group the user hides separately; "covered": true makes
+                a new layer shown, so its marks start hidden (e.g. answers to
+                reveal later). Listings give each covered mark's layer and
+                state: hidden on tablet, shown on tablet, or cover erased on
+                tablet. Treat marks the user has hidden as dismissed. Removing
+                a mark removes its cover.
 
                 Each mark in `add` has a `page` (1-based), an optional `id`, and
                 exactly one of:
@@ -3163,12 +3228,12 @@ def register_write_tools():
                             adds, removes, clear, color, build=writing, obstacles=obstacles
                         )
                         if writing:
-                            result = client.replace_document_pdf(target.ID, edit)
+                            result = client.replace_document_pdf(target.ID, edit, with_ink=True)
                             if result["changed"]:
                                 _invalidate_client_cache(client)
                             return _mark_response(target, result, dry_run=False)
                         pdf, content, files = client.read_document_pdf(target.ID)
-                        result = edit(pdf, content)
+                        result = edit(pdf, content, _ink_reader(client, target.ID, files))
                         if layout is not None:
                             result["layout"] = _mark_layout(
                                 client, files, pdf, layout, result["page_map"]

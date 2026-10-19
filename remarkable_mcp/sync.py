@@ -1040,14 +1040,19 @@ class RemarkableClient:
             raise CloudWriteError(f"Document {doc_id} is not a PDF document.")
         return files, pdf_file, content
 
-    def replace_document_pdf(self, doc_id: str, edit: "Any") -> Any:
+    def replace_document_pdf(self, doc_id: str, edit: "Any", with_ink: bool = False) -> Any:
         """Replace one PDF document's ``.pdf`` and return ``edit``'s result.
 
         ``edit(pdf_bytes, content)`` returns a result whose ``"pdf"`` key is
         the new PDF, or None to leave the document unchanged. Only the PDF and
-        the metadata's ``lastModified`` change; ``.content`` and the ink
-        (``.rm``) files are left as they are, so the new PDF must keep the
-        page count and page sizes for the ink to stay in place.
+        the metadata's ``lastModified`` change; ``.content`` is left as it is,
+        so the new PDF must keep the page count and page sizes for the ink to
+        stay in place.
+
+        With ``with_ink``, ``edit`` is called as ``edit(pdf, content,
+        read_ink)``, where ``read_ink(page_id)`` returns a page's ``.rm`` file
+        or None, and its result's ``"ink"`` (``{page_id: bytes}``) replaces or
+        adds those files in the same commit.
         """
         from remarkable_mcp import tablet_json
 
@@ -1057,7 +1062,13 @@ class RemarkableClient:
             entry = self._require_entry(entries, doc_id)
             files, pdf_file, content = self._pdf_document_files(entry)
             pdf = self._get_file(pdf_file["hash"], pdf_file["id"])
-            result = edit(pdf, content)
+            by_id = {f["id"]: f for f in files}
+
+            def read_ink(page_id: str) -> Optional[bytes]:
+                entry = by_id.get(f"{doc_id}/{page_id}.rm")
+                return None if entry is None else self._get_file(entry["hash"], entry["id"])
+
+            result = edit(pdf, content, read_ink) if with_ink else edit(pdf, content)
             outcome["result"] = result
             new_pdf = result.get("pdf")
             if new_pdf is None or new_pdf == pdf:
@@ -1073,7 +1084,11 @@ class RemarkableClient:
                     tablet_json.dumps(metadata).encode("utf-8"), meta_file["id"]
                 ),
             }
-            new_files = [replaced.get(f["id"], f) for f in files]
+            for page_id, data in (result.get("ink") or {}).items() if with_ink else ():
+                name = f"{doc_id}/{page_id}.rm"
+                replaced[name] = self._upload_file_blob(data, name)
+            new_files = [replaced.pop(f["id"], f) for f in files]
+            new_files += [replaced[name] for name in replaced if name not in by_id]
             return self._replace_root_entry(entries, self._upload_doc_index(doc_id, new_files))
 
         self._sync_root(mutate)

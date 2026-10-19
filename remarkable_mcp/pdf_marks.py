@@ -1103,8 +1103,13 @@ def mark_style(mark: Dict[str, Any]) -> Dict[str, Any]:
     return {k: v for k, v in style.items() if v is not False}
 
 
-def summarize(mark: Dict[str, Any], page: Optional[int]) -> Dict[str, Any]:
-    """A short description of a stored mark for tool responses."""
+def summarize(
+    mark: Dict[str, Any], page: Optional[int], cover_state: Optional[str] = None
+) -> Dict[str, Any]:
+    """A short description of a stored mark for tool responses.
+
+    ``cover_state`` is the state of the mark's cover on the tablet, if known
+    (see ``cover_layers.cover_status``)."""
     out: Dict[str, Any] = {"id": mark["id"], "page": page, "kind": mark["kind"]}
     for key in ("shape", "text", "latex", "path", "format"):
         if key in mark:
@@ -1118,6 +1123,10 @@ def summarize(mark: Dict[str, Any], page: Optional[int]) -> Dict[str, Any]:
     style = mark_style(mark)
     if style:
         out["style"] = style
+    if isinstance(mark.get("cover"), dict):
+        out["cover"] = {"layer": mark["cover"]["layer"]}
+        if cover_state:
+            out["cover"]["state"] = cover_state
     if mark.get("description"):
         out["description"] = mark["description"]
     return out
@@ -1500,9 +1509,14 @@ def edit_marks(
             while f"mark-{counter}" in taken:
                 counter += 1
             mark_id = f"mark-{counter}"
-        options = {k: v for k, v in request.items() if k not in ("id", "page", "description")}
+        options = {
+            k: v
+            for k, v in request.items()
+            if k not in ("id", "page", "description", "cover", "covered")
+        }
         try:
             description = _description(request.get("description"))
+            cover = _cover(request)
             if "leader" in options and "near" not in options:
                 raise MarkError("leader applies only to marks placed with near.")
             if "near" in options:
@@ -1522,6 +1536,8 @@ def edit_marks(
         mark = {"id": mark_id, "pdf_page": pdf_page, **stored}
         if description:
             mark["description"] = description
+        if cover:
+            mark["cover"] = cover
         result.append(mark)
         taken.add(mark_id)
         added.append(mark_id)
@@ -1533,6 +1549,27 @@ def edit_marks(
         "notes": notes,
         "changed": bool(added or removed),
     }
+
+
+def _cover(request: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """The cover a mark asks for: ``{"layer", "shown", "pending"}`` until its
+    strokes are written (see ``cover_layers``), or None."""
+    from remarkable_mcp.cover_layers import CoverError, layer_name
+
+    try:
+        name = layer_name(request.get("cover"))
+    except CoverError as e:
+        raise MarkError(str(e)) from None
+    covered = request.get("covered", False)
+    if not isinstance(covered, bool):
+        raise MarkError("covered must be true or false.")
+    if covered and name is None:
+        raise MarkError("covered applies only to marks with a cover.")
+    if name is None:
+        return None
+    if request.get("shape") == "highlight":
+        raise MarkError("Highlights cannot have a cover: it would hide the text under them.")
+    return {"layer": name, "shown": covered, "pending": True}
 
 
 def tablet_page(pdf_page: int, page_map: Sequence[Optional[int]]) -> Optional[int]:
