@@ -2995,11 +2995,13 @@ def register_write_tools():
                 Each mark in `add` has a `page` (1-based), an optional `id`, and
                 exactly one of:
                 - text: string ("\n" starts a new line); at, or region to wrap
-                  within; options size (default 11), bold, italic, underline
+                  within; options size (default 11), bold, italic, underline,
+                  border (a rounded box with a white background)
                 - shape: "check" or "cross" with at (option size) or region;
                   "circle", "box" or "highlight" with region, stretched to fill
                   it; "line" or "arrow" with from [x, y] and to [x, y].
-                  Options: width (line width), opacity
+                  Options: width (line width), opacity, dot (a dot at the to
+                  end of a line or arrow)
                 - path: SVG path data for any other shape, in any units. With
                   region it is scaled to fit, centered, keeping its aspect
                   (stretch: true fills the region instead); with at it is
@@ -3010,7 +3012,7 @@ def register_write_tools():
                   several colors or text, or output from other tools, use
                   graphic.
                 - latex: LaTeX math, e.g. "\\frac{a}{b} = \\sqrt{2}"; at, or
-                  region to scale into; option size (default 12)
+                  region to scale into; options size (default 12), border
                 - graphic: content rendered elsewhere: SVG markup, or base64 PDF
                   (one page), PNG or JPEG (up to 2 MB); with region, scaled to
                   fit at its top-left. SVG may only reference its own elements
@@ -3021,8 +3023,11 @@ def register_write_tools():
                 can take near [x, y]: the mark is put in the closest free space to
                 that point, clear of the user's ink, the printed text and other
                 marks, and "leader": true draws a thin line from the mark to the
-                point. Use near (with a leader when the free space is not right
-                beside it) on pages full of writing; give the point of what the
+                point, ending in a dot; text and latex with a leader get a
+                rounded border (as with "border": true), which needs a little
+                more room, so keep such notes short. Use near (with a leader when
+                the free space is not right beside it) on pages full of writing;
+                give the point of what the
                 mark is about, at its edge (such as the end of an answer) rather
                 than its middle. A leader never crosses writing; if no place
                 fits, the tool says so: shorten the note or make it smaller.

@@ -976,3 +976,33 @@ def test_leader_does_not_run_across_its_target():
     (x0, y0), (x1, y1) = leader["from"], leader["to"]
     length = math.hypot(x1 - x0, y1 - y0)
     assert length < 0.2
+
+
+def test_border_wraps_content_with_padding():
+    plain = _edit(add=[{"page": 1, "text": "note", "at": [0.4, 0.4]}])["marks"][0]
+    boxed = _edit(add=[{"page": 1, "text": "note", "at": [0.4, 0.4], "border": True}])["marks"][0]
+    pad_x, pad_y = pdf_marks.BORDER_PAD / A4[0], pdf_marks.BORDER_PAD / A4[1]
+    assert boxed["box"][0] == pytest.approx(plain["box"][0] - pad_x, abs=1e-3)
+    assert boxed["box"][3] == pytest.approx(plain["box"][3] + pad_y, abs=1e-3)
+    with pymupdf.open("pdf", base64.b64decode(boxed["pdf"])) as snippet:
+        frame = [d for d in snippet[0].get_drawings() if d.get("fill") == (1.0, 1.0, 1.0)]
+        assert frame and frame[0]["width"] == pytest.approx(pdf_marks.BORDER_WIDTH)
+        assert "note" in snippet[0].get_text()
+    assert pdf_marks.summarize(boxed, 1)["style"]["border"] is True
+    with pytest.raises(MarkError, match="border applies only"):
+        _edit(add=[{"page": 1, "shape": "check", "at": [0.5, 0.5], "border": True}])
+
+
+def test_leader_note_has_border_and_dot():
+    ink = [[0.1, 0.4, 0.9, 0.45]]
+    result = _near_edit(
+        [{"page": 1, "id": "n", "text": "note", "near": [0.85, 0.425], "leader": True}], ink
+    )
+    mark = result["marks"][0]
+    assert mark["request"]["border"] is True
+    leader = mark["leader"]
+    assert leader["request"]["dot"] is True
+    with pymupdf.open("pdf", base64.b64decode(leader["pdf"])) as snippet:
+        assert any(d.get("fill") for d in snippet[0].get_drawings())
+    with pytest.raises(MarkError, match="dot applies only"):
+        _edit(add=[{"page": 1, "shape": "check", "at": [0.5, 0.5], "dot": True}])

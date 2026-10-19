@@ -147,6 +147,13 @@ LEADER_WIDTH = 0.75
 LEADER_GAP = 0.008
 # How far a leader may run inside the region holding its point.
 LEADER_ENTRY = 0.06
+# Bordered notes: padding, corner radius and line width (points). A border
+# has a white background so the page's grid does not show through.
+BORDER_PAD = 3.0
+BORDER_RADIUS = 3.5
+BORDER_WIDTH = 0.6
+# The dot at the end of a line with "dot" (radius in points).
+DOT_RADIUS = 1.6
 FREE_GRID = (120, 170)
 _PATH_PATTERN = re.compile(r"^[MmLlHhVvCcSsQqTtAaZz0-9eE+\-.,\s]+$")
 LINE_SPACING = 1.2
@@ -703,6 +710,8 @@ def _render_shape(request: dict, color: List[float], page: _Page) -> Dict[str, A
     if shape not in SHAPES:
         raise MarkError(f"shape must be one of: {', '.join(SHAPES)}.")
     out: Dict[str, Any] = {"shape": shape}
+    if "dot" in request and shape not in ("line", "arrow"):
+        raise MarkError("dot applies only to line and arrow shapes.")
 
     if shape == "highlight":
         if "at" in request:
@@ -735,7 +744,8 @@ def _render_shape(request: dict, color: List[float], page: _Page) -> Dict[str, A
     if (ax, ay) == (bx, by):
         raise MarkError("from and to must be different points.")
     head = max(6.0, width * 4) if shape == "arrow" else 0.0
-    pad = width + head
+    dot = bool(request.get("dot", False))
+    pad = width + max(head, DOT_RADIUS if dot else 0.0)
     left, top = min(ax, bx) - pad, min(ay, by) - pad
     right, bottom = max(ax, bx) + pad, max(ay, by) + pad
 
@@ -749,6 +759,8 @@ def _render_shape(request: dict, color: List[float], page: _Page) -> Dict[str, A
                 theta = angle + math.pi - side * math.radians(25)
                 tip = b + (head * math.cos(theta), head * math.sin(theta))
                 snippet.draw_line(b, tip, color=color, width=width)
+        if dot:
+            snippet.draw_circle(b, DOT_RADIUS, color=None, fill=color)
 
     # The box is padded for the line width and arrowhead, so for a line along
     # the page edge it reaches past the page; responses report the endpoints.
@@ -895,6 +907,26 @@ def _render_graphic(request: dict, page: _Page) -> Dict[str, Any]:
     return {"format": fmt, "box": box, "pdf": pdf}
 
 
+def _bordered(stored: Dict[str, Any], color: List[float], page: _Page) -> Dict[str, Any]:
+    """``stored`` (raw PDF snippet) inside a rounded box with a white
+    background, ``BORDER_PAD`` points larger on every side."""
+    x0, y0 = page.pt(stored["box"][0], stored["box"][1])
+    x1, y1 = page.pt(stored["box"][2], stored["box"][3])
+    w, h = x1 - x0 + 2 * BORDER_PAD, y1 - y0 + 2 * BORDER_PAD
+    radius = min(0.5, BORDER_RADIUS / min(w, h))
+
+    def draw(snippet):
+        inset = BORDER_WIDTH / 2
+        frame = pymupdf.Rect(inset, inset, w - inset, h - inset)
+        snippet.draw_rect(frame, color=color, fill=(1, 1, 1), width=BORDER_WIDTH, radius=radius)
+        with pymupdf.open("pdf", stored["pdf"]) as content:
+            inner = pymupdf.Rect(BORDER_PAD, BORDER_PAD, w - BORDER_PAD, h - BORDER_PAD)
+            snippet.show_pdf_page(inner, content, 0)
+
+    box = page.box(x0 - BORDER_PAD, y0 - BORDER_PAD, x1 + BORDER_PAD, y1 + BORDER_PAD)
+    return dict(stored, box=box, pdf=_snippet(w, h, draw))
+
+
 def render_mark(
     request: Any, page_size: Tuple[float, float], color: Optional[str]
 ) -> Dict[str, Any]:
@@ -946,7 +978,11 @@ def render_mark(
             "path": _render_path,
             "latex": _render_latex,
         }[kind]
+        if request.get("border") and kind not in ("text", "latex"):
+            raise MarkError("border applies only to text and latex marks.")
         stored = render(request, rgb, page)
+        if request.get("border"):
+            stored = _bordered(stored, rgb, page)
         stored["color"] = rgb
         # The request is kept for listing a mark's style and re-drawing it;
         # named colors can be re-drawn in another palette (see for_export).
@@ -972,6 +1008,8 @@ STYLE_KEYS = (
     "at",
     "near",
     "leader",
+    "border",
+    "dot",
     "width",
     "opacity",
     "fill",
@@ -1100,7 +1138,7 @@ def _leader_ends(box: Sequence[float], near: Sequence[float]):
     if length < LEADER_GAP * 3:
         return None
     ux, uy = dx / length, dy / length
-    begin = [start[0] + ux * 0.003, start[1] + uy * 0.003]
+    begin = start
     end = [near[0] - ux * LEADER_GAP, near[1] - uy * LEADER_GAP]
     return [_round(v) for v in begin], [_round(v) for v in end]
 
@@ -1187,15 +1225,25 @@ def _render_near(
     ):
         raise MarkError("near works for text, latex, check, cross and path marks.")
     base = {k: v for k, v in options.items() if k not in ("near", "leader", "anchor")}
+    if leader and ("text" in base or "latex" in base):
+        base.setdefault("border", True)
     trial = render_mark(dict(base, at=[0.5, 0.5], anchor="center"), size, color)
     width = trial["box"][2] - trial["box"][0]
     height = trial["box"][3] - trial["box"][1]
     x0, y0 = _place_near(near, width, height, obstacles, leader)
-    stored = render_mark(dict(base, at=[x0, y0], anchor="top-left"), size, color)
+    # A border lies outside the content, whose top-left at gives.
+    pad_x, pad_y = (BORDER_PAD / size[0], BORDER_PAD / size[1]) if base.get("border") else (0, 0)
+    stored = render_mark(dict(base, at=[x0 + pad_x, y0 + pad_y], anchor="top-left"), size, color)
     stored["request"] = dict(stored.get("request", {}), near=near, leader=leader)
     ends = _leader_ends(stored["box"], near) if leader else None
     if ends:
-        line = {"shape": "line", "from": ends[0], "to": ends[1], "width": LEADER_WIDTH}
+        line = {
+            "shape": "line",
+            "from": ends[0],
+            "to": ends[1],
+            "width": LEADER_WIDTH,
+            "dot": True,
+        }
         if "color" in options:
             line["color"] = options["color"]
         stored["leader"] = render_mark(line, size, color)
