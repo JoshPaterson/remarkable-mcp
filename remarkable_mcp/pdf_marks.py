@@ -90,7 +90,7 @@ HIGHLIGHT_COLORS = {
         "blue": "#BEEAFE",
         "pink": "#F29BFF",
         "orange": "#FFC38C",
-        "green": "#A9FA5C",
+        "green": "#A0FF89",
         "gray": "#BFBFBF",
     }.items()
 }
