@@ -1006,3 +1006,33 @@ def test_leader_note_has_border_and_dot():
         assert any(d.get("fill") for d in snippet[0].get_drawings())
     with pytest.raises(MarkError, match="dot applies only"):
         _edit(add=[{"page": 1, "shape": "check", "at": [0.5, 0.5], "dot": True}])
+
+
+def test_leader_falls_back_to_underline_where_a_border_does_not_fit():
+    # A gap just tall enough for the note's text, not for a bordered note.
+    trial = _edit(add=[{"page": 1, "text": "a fairly long note", "at": [0.5, 0.5]}])
+    left, top, right, bottom = trial["marks"][0]["box"]
+    height = bottom - top
+    gap = height + 2 * pdf_marks.CLEARANCE + 0.002
+    ink = [[0.05, 0.3, 0.95, 0.5], [0.05, 0.5 + gap, 0.95, 0.8]]
+    result = _near_edit(
+        [{"page": 1, "id": "n", "text": "a fairly long note", "near": [0.9, 0.45], "leader": True}],
+        ink,
+    )
+    mark = result["marks"][0]
+    assert mark["request"]["border"] is False
+    leader = mark["leader"]
+    # Along the bottom of the note, round the corner, to the point.
+    assert len(leader["via"]) == 1
+    assert leader["from"][1] == leader["via"][0][1] == pytest.approx(mark["box"][3])
+
+
+def test_line_via_points():
+    mark = _edit(
+        add=[
+            {"page": 1, "shape": "line", "from": [0.1, 0.1], "via": [[0.3, 0.1]], "to": [0.3, 0.3]}
+        ]
+    )["marks"][0]
+    assert mark["via"] == [[0.3, 0.1]]
+    with pymupdf.open("pdf", base64.b64decode(mark["pdf"])) as snippet:
+        assert len(snippet[0].get_drawings()[0]["items"]) == 2

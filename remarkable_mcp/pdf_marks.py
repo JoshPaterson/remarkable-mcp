@@ -739,20 +739,26 @@ def _render_shape(request: dict, color: List[float], page: _Page) -> Dict[str, A
 
     width = _positive(request.get("width"), "width", DEFAULT_LINE_WIDTH)
     start, end = _point(request.get("from"), "from"), _point(request.get("to"), "to")
-    ax, ay = page.pt(*start)
-    bx, by = page.pt(*end)
-    if (ax, ay) == (bx, by):
+    via = request.get("via", [])
+    if not isinstance(via, list):
+        raise MarkError("via must be a list of [x, y] points.")
+    route = [start] + [_point(v, "via") for v in via] + [end]
+    pts = [page.pt(*p) for p in route]
+    if pts[-2] == pts[-1]:
         raise MarkError("from and to must be different points.")
     head = max(6.0, width * 4) if shape == "arrow" else 0.0
     dot = bool(request.get("dot", False))
     pad = width + max(head, DOT_RADIUS if dot else 0.0)
-    left, top = min(ax, bx) - pad, min(ay, by) - pad
-    right, bottom = max(ax, bx) + pad, max(ay, by) + pad
+    left, top = min(x for x, _ in pts) - pad, min(y for _, y in pts) - pad
+    right, bottom = max(x for x, _ in pts) + pad, max(y for _, y in pts) + pad
 
     def draw(snippet):
-        a = pymupdf.Point(ax - left, ay - top)
-        b = pymupdf.Point(bx - left, by - top)
-        snippet.draw_line(a, b, color=color, width=width)
+        points = [pymupdf.Point(x - left, y - top) for x, y in pts]
+        a, b = points[-2], points[-1]
+        if len(points) == 2:
+            snippet.draw_line(a, b, color=color, width=width)
+        else:
+            snippet.draw_polyline(points, color=color, width=width)
         if shape == "arrow":
             angle = math.atan2(b.y - a.y, b.x - a.x)
             for side in (-1, 1):
@@ -767,7 +773,10 @@ def _render_shape(request: dict, color: List[float], page: _Page) -> Dict[str, A
     box = [_round(v) for v in (left / page.width, top / page.height)]
     box += [_round(v) for v in (right / page.width, bottom / page.height)]
     pdf = _snippet(right - left, bottom - top, draw)
-    return dict(out, **{"from": start, "to": end}, box=box, pdf=pdf)
+    out.update({"from": start, "to": end})
+    if via:
+        out["via"] = route[1:-1]
+    return dict(out, box=box, pdf=pdf)
 
 
 def _render_latex(request: dict, color: List[float], page: _Page) -> Dict[str, Any]:
@@ -1130,17 +1139,50 @@ def _segment_hits(p, q, box) -> bool:
     return False
 
 
-def _leader_ends(box: Sequence[float], near: Sequence[float]):
-    """Ends of a leader line from ``box`` toward ``near``, or None if too short."""
-    start = [min(max(near[0], box[0]), box[2]), min(max(near[1], box[1]), box[3])]
+def _leader_route(box: Sequence[float], near: Sequence[float], underline: bool):
+    """Points of a leader from ``box`` to just short of ``near``, or None if
+    the point is too close to need one.
+
+    A bordered note's leader starts on its border. An underlined note's leader
+    runs along the bottom of the note from its far end, round the corner
+    nearest the point, then to the point.
+    """
+    if underline:
+        y = box[3]
+        if near[0] >= (box[0] + box[2]) / 2:
+            far, corner = [box[0], y], [box[2], y]
+        else:
+            far, corner = [box[2], y], [box[0], y]
+        start = corner
+    else:
+        start = [min(max(near[0], box[0]), box[2]), min(max(near[1], box[1]), box[3])]
     dx, dy = near[0] - start[0], near[1] - start[1]
     length = math.hypot(dx, dy)
     if length < LEADER_GAP * 3:
         return None
     ux, uy = dx / length, dy / length
-    begin = start
     end = [near[0] - ux * LEADER_GAP, near[1] - uy * LEADER_GAP]
-    return [_round(v) for v in begin], [_round(v) for v in end]
+    route = [far, corner, end] if underline else [start, end]
+    return [[_round(v) for v in p] for p in route]
+
+
+def _route_clear(points, box, crossable, targets) -> bool:
+    """True if a leader's ``points`` cross no ``crossable`` obstacle, cut
+    through no more than ``LEADER_ENTRY`` of its ``targets``, and do not pass
+    back through the note's own ``box``."""
+    inner = (box[0] + 0.004, box[1] + 0.004, box[2] - 0.004, box[3] - 0.004)
+    segments = list(zip(points, points[1:]))
+    for p, q in segments:
+        if any(_segment_hits(p, q, o) for o in crossable) or _segment_hits(p, q, inner):
+            return False
+    (bx, by), (ex, ey) = segments[-1]
+    length = math.hypot(ex - bx, ey - by)
+    if length > LEADER_ENTRY:
+        t = (length - LEADER_ENTRY) / length
+        outside = (bx + (ex - bx) * t, by + (ey - by) * t)
+        if any(_segment_hits((bx, by), outside, o) for o in targets):
+            return False
+    return True
 
 
 def _place_near(
@@ -1148,11 +1190,11 @@ def _place_near(
     width: float,
     height: float,
     obstacles: Sequence[Sequence[float]],
-    leader: bool,
+    route=None,
 ) -> List[float]:
     """Top-left of the closest ``width`` x ``height`` box to ``near`` that is
-    clear of ``obstacles``; with ``leader``, also one whose leader line
-    crosses none of them.
+    clear of ``obstacles``; with ``route(box)`` (a leader's points), also one
+    whose leader crosses none of them, nor the note itself.
 
     Positions are tried on a grid around the point and flush against the
     edges of nearby obstacles, so narrow gaps between lines are found.
@@ -1189,20 +1231,12 @@ def _place_near(
         box = (x0, y0, x0 + width, y0 + height)
         if any(_overlaps(box, o, CLEARANCE) for o in obstacles):
             continue
-        if leader:
-            ends = _leader_ends(box, near)
-            if ends:
-                if any(_segment_hits(ends[0], ends[1], o) for o in crossable):
-                    continue
-                (bx, by), (ex, ey) = ends
-                length = math.hypot(ex - bx, ey - by)
-                if length > LEADER_ENTRY:
-                    t = (length - LEADER_ENTRY) / length
-                    outside = (bx + (ex - bx) * t, by + (ey - by) * t)
-                    if any(_segment_hits((bx, by), outside, o) for o in targets):
-                        continue
+        if route:
+            points = route(box)
+            if points and not _route_clear(points, box, crossable, targets):
+                continue
         return [x0, y0]
-    why = " with a leader that crosses no writing" if leader else ""
+    why = " with a leader that crosses no writing" if route else ""
     raise MarkError(
         f"No free space near that point fits the mark{why}; make it smaller or "
         "shorter, or place it with at."
@@ -1215,7 +1249,12 @@ def _render_near(
     color: Optional[str],
     obstacles: Sequence[Sequence[float]],
 ) -> Dict[str, Any]:
-    """Render a mark placed with ``near`` (and optionally a ``leader``)."""
+    """Render a mark placed with ``near`` (and optionally a ``leader``).
+
+    A text or latex note with a leader is drawn in a rounded border, or
+    underlined when ``border`` is false; without ``border``, the border is
+    tried first and the underline where a bordered note does not fit.
+    """
     near = _point(options.get("near"), "near")
     leader = bool(options.get("leader", False))
     if "at" in options or "region" in options:
@@ -1225,22 +1264,35 @@ def _render_near(
     ):
         raise MarkError("near works for text, latex, check, cross and path marks.")
     base = {k: v for k, v in options.items() if k not in ("near", "leader", "anchor")}
-    if leader and ("text" in base or "latex" in base):
-        base.setdefault("border", True)
-    trial = render_mark(dict(base, at=[0.5, 0.5], anchor="center"), size, color)
-    width = trial["box"][2] - trial["box"][0]
-    height = trial["box"][3] - trial["box"][1]
-    x0, y0 = _place_near(near, width, height, obstacles, leader)
+    note = "text" in base or "latex" in base
+    if leader and note and "border" not in base:
+        styles = [True, False]
+    else:
+        styles = [bool(base.get("border", False))]
+    for i, border in enumerate(styles):
+        attempt = dict(base, border=border) if note else base
+        underline = leader and note and not border
+        trial = render_mark(dict(attempt, at=[0.5, 0.5], anchor="center"), size, color)
+        width = trial["box"][2] - trial["box"][0]
+        height = trial["box"][3] - trial["box"][1]
+        route = (lambda box: _leader_route(box, near, underline)) if leader else None
+        try:
+            x0, y0 = _place_near(near, width, height, obstacles, route)
+            break
+        except MarkError:
+            if i == len(styles) - 1:
+                raise
     # A border lies outside the content, whose top-left at gives.
-    pad_x, pad_y = (BORDER_PAD / size[0], BORDER_PAD / size[1]) if base.get("border") else (0, 0)
-    stored = render_mark(dict(base, at=[x0 + pad_x, y0 + pad_y], anchor="top-left"), size, color)
+    pad_x, pad_y = (BORDER_PAD / size[0], BORDER_PAD / size[1]) if border and note else (0, 0)
+    stored = render_mark(dict(attempt, at=[x0 + pad_x, y0 + pad_y], anchor="top-left"), size, color)
     stored["request"] = dict(stored.get("request", {}), near=near, leader=leader)
-    ends = _leader_ends(stored["box"], near) if leader else None
-    if ends:
+    points = _leader_route(stored["box"], near, underline) if leader else None
+    if points:
         line = {
             "shape": "line",
-            "from": ends[0],
-            "to": ends[1],
+            "from": points[0],
+            "via": points[1:-1],
+            "to": points[-1],
             "width": LEADER_WIDTH,
             "dot": True,
         }
