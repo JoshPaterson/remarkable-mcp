@@ -28,6 +28,7 @@ from mcp.types import (
     ToolAnnotations,
 )
 
+from remarkable_mcp import export_save
 from remarkable_mcp.api import (
     REMARKABLE_TOKEN,
     document_version,
@@ -2915,6 +2916,50 @@ def _publish_document_export(
     )
 
 
+async def _saved_export_response(published, output_format, save_path, overwrite, page_ranges):
+    """Save a published export at ``save_path`` and describe the saved copy."""
+    resource, result = published.resource, published.result
+    build = result.build
+    try:
+        data = export_store.read_bytes(resource.export_id, output_format)
+        saved = await run_blocking(export_save.save, data, save_path, overwrite)
+    except export_save.SaveError as exc:
+        return make_error(error_type=exc.error_type, message=exc.message, suggestion=exc.suggestion)
+    except OSError as exc:
+        return make_error(
+            error_type="save_failed",
+            message=f"Could not save the export: {exc}",
+            suggestion="Check the folder exists and is writable, then try again.",
+        )
+    response = {
+        "document": result.metadata.title,
+        "document_id": result.metadata.document_id,
+        "path": result.metadata.path,
+        "source_type": result.metadata.source_type,
+        "format": output_format,
+        **saved,
+        "pages": build.pages,
+        "status": build.status,
+        "failed_pages": list(build.failed_pages),
+        "warnings": list(build.warnings),
+        "representation": result.representation,
+    }
+    if result.pdf_mode is not None:
+        response["pdf_mode"] = result.pdf_mode
+    if page_ranges is not None:
+        response["selected_pages"] = _select_pages(page_ranges, result.metadata.page_count)
+        response["document_pages"] = result.metadata.page_count
+    if build.ocr_backend:
+        response["ocr_backend"] = build.ocr_backend
+    hint = (
+        f"Saved the {output_format.upper()} export to {saved['saved_path']} "
+        f"({saved['size']} bytes, SHA-256 {saved['sha256']}). The tablet was not modified."
+    )
+    if build.status == "partial":
+        hint = f"Partial export: {'; '.join(build.warnings) or 'some pages failed'}. {hint}"
+    return make_response(response, hint)
+
+
 @mcp.tool(annotations=EXPORT_ANNOTATIONS)
 async def remarkable_export(
     document: str,
@@ -2922,6 +2967,8 @@ async def remarkable_export(
     pdf_mode: Literal["merged", "annotations"] = "merged",
     include_ocr: bool = False,
     pages: Optional[int | str] = None,
+    save_to: Optional[str] = None,
+    overwrite: bool = False,
 ):
     """
     <usecase>Export one reMarkable document as a reusable PDF or Markdown file.</usecase>
@@ -2933,6 +2980,13 @@ async def remarkable_export(
     the PDF/Markdown as base64 and never writes to an arbitrary host path. The
     resource expires after 15 minutes and may be evicted earlier when more than
     eight exports are retained. Fetch and save the linked resource for durable use.
+
+    With `save_to`, the file is instead saved at that path on this machine and
+    the response gives its path, size, page count and SHA-256 hash to check
+    the copy. Only paths inside the folders listed in REMARKABLE_EXPORT_DIRS
+    are accepted. Missing folders are created; the file is written under a
+    temporary name and renamed into place. An existing file is replaced only
+    with `overwrite=True`. Nothing is ever deleted.
 
     PDF behavior:
     - `pdf_mode="merged"` (default) preserves complete physical pages, combining
@@ -2957,12 +3011,17 @@ async def remarkable_export(
     - pdf_mode: PDF-only mode, "merged" (default) or "annotations".
     - include_ocr: Enable existing handwriting OCR for Markdown (default: False).
     - pages: PDF only. One page (5) or ranges ("5-9,12"); default: every page.
+    - save_to: Absolute path of a .pdf or .md file to save the export at,
+      inside a folder listed in REMARKABLE_EXPORT_DIRS.
+    - overwrite: Replace an existing file at save_to (default: False).
     </parameters>
     <examples>
     - remarkable_export("Meeting Notes")
     - remarkable_export("Research Paper", output_format="pdf", pdf_mode="annotations")
     - remarkable_export("Journal", output_format="markdown", include_ocr=True)
     - remarkable_export("Lecture Notes", pages="3-5,9")
+    - remarkable_export("Week 3 worksheet",
+        save_to="/Users/me/Projects/Course/Worksheets/Week 3 - done.pdf")
     </examples>
     """
     if output_format == "markdown" and pdf_mode != "merged":
@@ -2992,6 +3051,21 @@ async def remarkable_export(
                 error_type="invalid_page_selection",
                 message=str(exc),
                 suggestion="Examples: pages=5, pages='5-9', pages='1,3,10-12'.",
+            )
+
+    save_path = None
+    if overwrite and save_to is None:
+        return make_error(
+            error_type="invalid_export_options",
+            message="overwrite applies only with save_to.",
+            suggestion="Pass save_to with the path to save at, or omit overwrite.",
+        )
+    if save_to is not None:
+        try:
+            save_path = export_save.check_path(save_to, output_format, overwrite)
+        except export_save.SaveError as exc:
+            return make_error(
+                error_type=exc.error_type, message=exc.message, suggestion=exc.suggestion
             )
 
     try:
@@ -3058,6 +3132,10 @@ async def remarkable_export(
     resource = published.resource
     result = published.result
     build = result.build
+    if save_path is not None:
+        return await _saved_export_response(
+            published, output_format, save_path, overwrite, page_ranges
+        )
     response = {
         "document": result.metadata.title,
         "document_id": result.metadata.document_id,
