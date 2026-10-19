@@ -1292,8 +1292,9 @@ MARK_PREVIEW_DPI = 100
 
 
 def _page_obstacles(client, files: list, pdf: bytes):
-    """``obstacles(pdf_page, page_map)``: regions of the user's ink and the
-    PDF's printed text on a page, for placing marks with ``near``."""
+    """``obstacles(pdf_page, page_map)``: ``{"ink", "text"}`` regions of the
+    user's ink and the PDF's printed text on a page, for placing marks with
+    ``near``."""
     from remarkable_mcp.extract import page_ink_regions
     from remarkable_mcp.pdf_marks import original_pdf, tablet_page, text_lines
 
@@ -1307,7 +1308,8 @@ def _page_obstacles(client, files: list, pdf: bytes):
             if page:
                 with _document_dir(client, files, base) as root:
                     ink = page_ink_regions(root, page)
-            cache[pdf_page] = ink + [line["region"] for line in text_lines(base, pdf_page)]
+            text = [line["region"] for line in text_lines(base, pdf_page)]
+            cache[pdf_page] = {"ink": ink, "text": text}
         return cache[pdf_page]
 
     return obstacles
@@ -3029,8 +3031,10 @@ def register_write_tools():
                 near (with a leader when the free space is not right beside it)
                 on pages full of writing; give the point of what the mark is
                 about, at its edge (such as the end of an answer) rather than
-                its middle. A leader never crosses writing; if no place fits,
-                the tool says so: shorten the note or make it smaller.
+                its middle. A leader never crosses the user's handwriting or
+                other marks, and crosses printed text only when nothing else
+                reaches the point; if no place fits, the tool says so: shorten
+                the note or make it smaller.
                 Marks placed with `at` take an optional anchor: the point of the
                 mark placed at `at`: top-left, top, top-right, left, center,
                 right, bottom-left, bottom or bottom-right. Default center for

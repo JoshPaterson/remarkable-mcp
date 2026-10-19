@@ -1036,3 +1036,28 @@ def test_line_via_points():
     assert mark["via"] == [[0.3, 0.1]]
     with pymupdf.open("pdf", base64.b64decode(mark["pdf"])) as snippet:
         assert len(snippet[0].get_drawings()[0]["items"]) == 2
+
+
+def test_leader_crosses_printed_text_only_when_nothing_else_reaches():
+    # The point is boxed in by printed lines above and below; the only free
+    # space is beyond them.
+    printed = [[0.05, 0.35, 0.95, 0.37], [0.05, 0.38, 0.95, 0.40], [0.05, 0.40, 0.95, 0.42]]
+    ink = [[0.05, 0.30, 0.95, 0.35], [0.05, 0.47, 0.95, 0.9]]
+    near = [0.5, 0.375]
+
+    def place(obstacles):
+        return pdf_marks.edit_marks(
+            [],
+            add=[{"page": 1, "id": "n", "text": "note", "near": near, "leader": True}],
+            remove=[],
+            clear=False,
+            page_map=[0],
+            sizes=[A4],
+            color=None,
+            obstacles=lambda pdf_page: obstacles,
+        )["marks"][0]
+
+    mark = place({"ink": ink, "text": printed})
+    assert mark["box"][1] >= 0.42  # below the printed lines
+    with pytest.raises(MarkError, match="No free space"):
+        place(ink + printed)  # all treated as handwriting: no way through

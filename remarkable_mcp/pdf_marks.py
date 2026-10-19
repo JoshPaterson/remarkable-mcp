@@ -1191,14 +1191,19 @@ def _place_near(
     height: float,
     obstacles: Sequence[Sequence[float]],
     route=None,
+    printed: Sequence[Sequence[float]] = (),
 ) -> List[float]:
     """Top-left of the closest ``width`` x ``height`` box to ``near`` that is
-    clear of ``obstacles``; with ``route(box)`` (a leader's points), also one
-    whose leader crosses none of them, nor the note itself.
+    clear of ``obstacles`` and ``printed`` (printed text); with ``route(box)``
+    (a leader's points), also one whose leader crosses neither, nor the note
+    itself. Where no leader can reach the point without crossing printed
+    text, one that crosses printed text (never ``obstacles``) is used.
 
     Positions are tried on a grid around the point and flush against the
     edges of nearby obstacles, so narrow gaps between lines are found.
     """
+    hard = list(obstacles)
+    obstacles = hard + list(printed)
     left, top, right, bottom = PAGE_BOUNDS
     span = int(NEAR_RADIUS / NEAR_STEP)
     xs = {near[0] + i * NEAR_STEP - width / 2 for i in range(-span, span + 1)}
@@ -1217,7 +1222,9 @@ def _place_near(
     # A leader may run LEADER_ENTRY into what it points at (the region
     # holding the point), not across it.
     targets = [o for o in obstacles if o[0] <= near[0] <= o[2] and o[1] <= near[1] <= o[3]]
-    crossable = [o for o in obstacles if o not in targets]
+    passes = [[o for o in obstacles if o not in targets]]
+    if route and printed:
+        passes.append([o for o in hard if o not in targets])
 
     def distance(x0: float, y0: float) -> float:
         dx = max(x0 - near[0], 0, near[0] - (x0 + width))
@@ -1225,17 +1232,20 @@ def _place_near(
         return math.hypot(dx, dy)
 
     candidates = sorted((distance(x, y), x, y) for x in xs for y in ys)
+    free = []
     for cost, x0, y0 in candidates:
         if cost > NEAR_RADIUS:
             break
         box = (x0, y0, x0 + width, y0 + height)
-        if any(_overlaps(box, o, CLEARANCE) for o in obstacles):
-            continue
-        if route:
-            points = route(box)
-            if points and not _route_clear(points, box, crossable, targets):
-                continue
-        return [x0, y0]
+        if not any(_overlaps(box, o, CLEARANCE) for o in obstacles):
+            free.append(box)
+    for crossable in passes:
+        for box in free:
+            if route:
+                points = route(box)
+                if points and not _route_clear(points, box, crossable, targets):
+                    continue
+            return [box[0], box[1]]
     why = " with a leader that crosses no writing" if route else ""
     raise MarkError(
         f"No free space near that point fits the mark{why}; make it smaller or "
@@ -1248,8 +1258,10 @@ def _render_near(
     size: Tuple[float, float],
     color: Optional[str],
     obstacles: Sequence[Sequence[float]],
+    printed: Sequence[Sequence[float]] = (),
 ) -> Dict[str, Any]:
-    """Render a mark placed with ``near`` (and optionally a ``leader``).
+    """Render a mark placed with ``near`` (and optionally a ``leader``),
+    clear of ``obstacles`` (ink, marks) and ``printed`` (printed text).
 
     A text or latex note with a leader is drawn in a rounded border, or
     underlined when ``border`` is false; without ``border``, the border is
@@ -1277,7 +1289,7 @@ def _render_near(
         height = trial["box"][3] - trial["box"][1]
         route = (lambda box: _leader_route(box, near, underline)) if leader else None
         try:
-            x0, y0 = _place_near(near, width, height, obstacles, route)
+            x0, y0 = _place_near(near, width, height, obstacles, route, printed)
             break
         except MarkError:
             if i == len(styles) - 1:
@@ -1311,7 +1323,7 @@ def edit_marks(
     page_map: Sequence[Optional[int]],
     sizes: Sequence[Tuple[float, float]],
     color: Optional[str],
-    obstacles: Optional[Callable[[int], List[List[float]]]] = None,
+    obstacles: Optional[Callable[[int], Any]] = None,
 ) -> Dict[str, Any]:
     """Apply removals, then additions, to a copy of ``marks``.
 
@@ -1319,8 +1331,10 @@ def edit_marks(
     index (``None`` for pages added on the tablet); ``sizes`` are the PDF's
     page sizes in points. Each added mark needs a ``page`` and may give an
     ``id``; generated ids are ``mark-N``. A mark placed with ``near`` is put
-    in the closest free space, clear of ``obstacles(pdf_page)`` (ink and
-    printed text) and of the other marks on its page.
+    in the closest free space, clear of ``obstacles(pdf_page)`` and of the
+    other marks on its page. ``obstacles`` returns ``{"ink", "text"}``
+    regions (or one list, all treated as ink); leaders may cross printed
+    text where nothing else reaches the point, never ink or marks.
 
     Returns ``{"marks", "added", "removed", "notes", "changed"}``.
     """
@@ -1371,9 +1385,13 @@ def edit_marks(
             if "near" in options:
                 if obstacles is None:
                     raise MarkError("near is not available here.")
-                blocked = list(obstacles(pdf_page))
+                found = obstacles(pdf_page)
+                if isinstance(found, dict):
+                    blocked, printed = list(found.get("ink", [])), list(found.get("text", []))
+                else:
+                    blocked, printed = list(found), []
                 blocked += [other["box"] for other in result if other["pdf_page"] == pdf_page]
-                stored = _render_near(options, sizes[pdf_page], color, blocked)
+                stored = _render_near(options, sizes[pdf_page], color, blocked, printed)
             else:
                 stored = render_mark(options, sizes[pdf_page], color)
         except MarkError as e:
