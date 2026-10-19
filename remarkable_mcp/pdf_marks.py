@@ -28,12 +28,23 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import pymupdf
 
+from remarkable_mcp import svg_path
+
 BASE_FILE = "remarkable-mcp-original.pdf"
 MARKS_FILE = "remarkable-mcp-marks.json"
 MARKS_FORMAT = 2
 
 KINDS = ("text", "shape", "path", "latex", "graphic", "graphic_file")
-SHAPES = ("check", "cross", "circle", "box", "line", "arrow", "highlight")
+# Built-in shapes drawn as paths. A shape that stretches fills its region on
+# both axes; the others keep their aspect. A filled shape has no outline.
+SHAPE_PATHS: Dict[str, Dict[str, Any]] = {
+    "check": {"path": "M -1 0 L -0.3 0.7 L 1 -0.9", "width": 1.95},
+    "cross": {"path": "M -1 -1 L 1 1 M -1 1 L 1 -1", "width": 1.95},
+    "circle": {"path": "M 0 1 A 1 1 0 1 0 2 1 A 1 1 0 1 0 0 1", "stretch": True},
+    "box": {"path": "M 0 0 H 1 V 1 H 0 Z", "stretch": True},
+    "highlight": {"path": "M 0 0 H 1 V 1 H 0 Z", "stretch": True, "filled": True},
+}
+SHAPES = (*SHAPE_PATHS, "line", "arrow")
 ANCHORS = {
     "top-left": (0.0, 0.0),
     "top": (0.5, 0.0),
@@ -442,75 +453,108 @@ def _render_text(request: dict, color: List[float], page: _Page) -> Dict[str, An
     return dict(out, box=box, pdf=_snippet(width, height, draw))
 
 
+def _draw_path(
+    data: str,
+    request: dict,
+    page: _Page,
+    *,
+    stroke: Optional[List[float]],
+    width: float,
+    fill: Optional[List[float]],
+    opacity: float,
+    stretch: bool,
+) -> Tuple[List[float], bytes]:
+    """``(box, pdf)`` for path data placed by ``request``'s at or region.
+
+    With ``region`` the path is scaled to fit it, centered, keeping its
+    aspect unless ``stretch``; with ``at`` it is scaled so its larger side is
+    ``size`` points and placed by ``anchor`` (default center). The path's
+    coordinates are scaled, not the drawing, so line widths stay in points.
+    """
+    try:
+        commands = svg_path.parse(data)
+    except svg_path.PathError as e:
+        raise MarkError(str(e)) from None
+    # Measure the path in its own units; MuPDF reports its bounds even
+    # where it lies outside the canvas.
+    measure = _path_svg(data, (100, 100), 'stroke="black" fill="none"')
+    with pymupdf.open("pdf", _svg_to_pdf(measure)) as doc:
+        drawings = doc[0].get_drawings()
+    if not drawings:
+        raise MarkError("The path draws nothing.")
+    bounds = pymupdf.Rect(drawings[0]["rect"])
+    for drawing in drawings[1:]:
+        bounds |= drawing["rect"]
+    bw, bh = bounds.width, bounds.height
+    if bw <= 0 and bh <= 0:
+        raise MarkError("The path draws nothing.")
+    pad = width / 2 if stroke else 0.0
+
+    if ("at" in request) == ("region" in request):
+        raise MarkError("Place the mark with either at [x, y] or region.")
+    if "region" in request:
+        if "size" in request:
+            raise MarkError("size applies only with at; the region sets the size.")
+        region = _region(request["region"])
+        x0, y0 = page.pt(region[0], region[1])
+        x1, y1 = page.pt(region[2], region[3])
+        room_w, room_h = x1 - x0 - 2 * pad, y1 - y0 - 2 * pad
+        if room_w <= 0 or room_h <= 0:
+            raise MarkError("The region is too small for the mark's line width.")
+        if stretch:
+            sx = room_w / bw if bw > 0 else 1.0
+            sy = room_h / bh if bh > 0 else 1.0
+        else:
+            sx = sy = min(room_w / bw if bw > 0 else math.inf, room_h / bh if bh > 0 else math.inf)
+        out_w = room_w + 2 * pad if stretch else bw * sx + 2 * pad
+        out_h = room_h + 2 * pad if stretch else bh * sy + 2 * pad
+        left = x0 + (x1 - x0 - out_w) / 2
+        top = y0 + (y1 - y0 - out_h) / 2
+        box = page.box(left, top, left + out_w, top + out_h)
+    else:
+        size = _positive(request.get("size"), "size", DEFAULT_SYMBOL_SIZE)
+        sx = sy = size / max(bw, bh)
+        out_w, out_h = bw * sx + 2 * pad, bh * sy + 2 * pad
+        box = _place(request, out_w, out_h, page, "center")
+
+    # Center the path on any axis where it has no extent.
+    off_x = pad - bounds.x0 * sx + (out_w - 2 * pad - bw * sx) / 2
+    off_y = pad - bounds.y0 * sy + (out_h - 2 * pad - bh * sy) / 2
+    placed = svg_path.transform(commands, sx, sy, off_x, off_y)
+    style = (
+        f'stroke="{_hex(stroke) if stroke else "none"}" stroke-width="{width}" '
+        f'fill="{_hex(fill) if fill else "none"}" opacity="{opacity}"'
+    )
+    return box, _svg_to_pdf(_path_svg(placed, (out_w, out_h), style))
+
+
 def _render_shape(request: dict, color: List[float], page: _Page) -> Dict[str, Any]:
     shape = request["shape"]
     if shape not in SHAPES:
         raise MarkError(f"shape must be one of: {', '.join(SHAPES)}.")
     out: Dict[str, Any] = {"shape": shape}
 
-    if shape in ("check", "cross"):
-        width = _positive(request.get("width"), "width", DEFAULT_LINE_WIDTH * 1.3)
-        if ("at" in request) == ("region" in request):
-            raise MarkError(f"A {shape} needs either at [x, y] or region.")
-        if "region" in request:
-            if "size" in request:
-                raise MarkError("size does not apply with region; the region sets the size.")
-            region = _region(request["region"])
-            x0, y0 = page.pt(region[0], region[1])
-            x1, y1 = page.pt(region[2], region[3])
-            size = min(x1 - x0, y1 - y0) - 2 * width
-            if size <= 0:
-                raise MarkError("The region is too small for the mark.")
+    if shape in SHAPE_PATHS:
+        preset = SHAPE_PATHS[shape]
+        filled = preset.get("filled", False)
+        width = _positive(request.get("width"), "width", preset.get("width", DEFAULT_LINE_WIDTH))
+        if filled:
+            opacity = _opacity(request.get("opacity"), DEFAULT_HIGHLIGHT_OPACITY)
         else:
-            size = _positive(request.get("size"), "size", DEFAULT_SYMBOL_SIZE)
-        half = size / 2 + width
-        s = size / 2
-
-        def draw(snippet):
-            c = pymupdf.Point(half, half)
-            if shape == "check":
-                pts = [c + (-s, 0), c + (-s * 0.3, s * 0.7), c + (s, -s * 0.9)]
-                snippet.draw_polyline(pts, color=color, width=width)
-            else:
-                snippet.draw_line(c + (-s, -s), c + (s, s), color=color, width=width)
-                snippet.draw_line(c + (-s, s), c + (s, -s), color=color, width=width)
-
-        if "region" in request:
-            cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
-            box = page.box(cx - half, cy - half, cx + half, cy + half)
-        else:
-            box = _place(request, 2 * half, 2 * half, page, "center")
-        return dict(out, size=_round(size), box=box, pdf=_snippet(2 * half, 2 * half, draw))
-
-    if shape == "highlight":
-        region = _region(request.get("region"))
-        opacity = _opacity(request.get("opacity"), DEFAULT_HIGHLIGHT_OPACITY)
-        x0, y0 = page.pt(region[0], region[1])
-        x1, y1 = page.pt(region[2], region[3])
-
-        def draw(snippet):
-            snippet.draw_rect(snippet.rect, color=None, fill=color, fill_opacity=opacity)
-
-        box = page.box(x0, y0, x1, y1)
-        return dict(out, box=box, pdf=_snippet(x1 - x0, y1 - y0, draw))
+            opacity = _opacity(request.get("opacity"), 1.0)
+        box, pdf = _draw_path(
+            preset["path"],
+            request,
+            page,
+            stroke=None if filled else color,
+            width=width,
+            fill=color if filled else None,
+            opacity=opacity,
+            stretch=preset.get("stretch", False),
+        )
+        return dict(out, box=box, pdf=pdf)
 
     width = _positive(request.get("width"), "width", DEFAULT_LINE_WIDTH)
-    if shape in ("circle", "box"):
-        region = _region(request.get("region"))
-        x0, y0 = page.pt(region[0], region[1])
-        x1, y1 = page.pt(region[2], region[3])
-        w, h = x1 - x0 + width, y1 - y0 + width
-
-        def draw(snippet):
-            inner = pymupdf.Rect(width / 2, width / 2, w - width / 2, h - width / 2)
-            if shape == "circle":
-                snippet.draw_oval(inner, color=color, width=width)
-            else:
-                snippet.draw_rect(inner, color=color, width=width)
-
-        box = page.box(x0 - width / 2, y0 - width / 2, x1 + width / 2, y1 + width / 2)
-        return dict(out, box=box, pdf=_snippet(w, h, draw))
-
     start, end = _point(request.get("from"), "from"), _point(request.get("to"), "to")
     ax, ay = page.pt(*start)
     bx, by = page.pt(*end)
@@ -566,10 +610,10 @@ def _render_latex(request: dict, color: List[float], page: _Page) -> Dict[str, A
     return dict(out, box=_place(request, width, height, page, "top-left"))
 
 
-def _path_svg(data: str, view: Sequence[float], size: Sequence[float], style: str) -> str:
+def _path_svg(data: str, size: Sequence[float], style: str) -> str:
     return (
         f'<svg xmlns="http://www.w3.org/2000/svg" width="{size[0]}" height="{size[1]}" '
-        f'viewBox="{view[0]} {view[1]} {view[2]} {view[3]}">'
+        f'viewBox="0 0 {size[0]} {size[1]}">'
         f'<path d="{data}" {style} stroke-linecap="round" stroke-linejoin="round"/></svg>'
     )
 
@@ -583,10 +627,7 @@ def _svg_to_pdf(svg: str) -> bytes:
 
 
 def _render_path(request: dict, color: List[float], page: _Page) -> Dict[str, Any]:
-    """SVG path data in any units, scaled to fit ``region`` (aspect kept).
-
-    The line width stays in points however much the path is scaled.
-    """
+    """A path from SVG path data in any units (see ``_draw_path``)."""
     data = request["path"]
     if not isinstance(data, str) or not data.strip():
         raise MarkError('path must be SVG path data, e.g. "M 0 0 L 10 10".')
@@ -595,42 +636,16 @@ def _render_path(request: dict, color: List[float], page: _Page) -> Dict[str, An
             "path must be SVG path data (commands M L H V C S Q T A Z and numbers), "
             f"up to {MAX_PATH_CHARS} characters."
         )
-    width = _positive(request.get("width"), "width", DEFAULT_LINE_WIDTH)
-    fill = parse_color(request["fill"]) if request.get("fill") else None
-    opacity = _opacity(request.get("opacity"), 1.0)
-    region = _region(request.get("region"))
-
-    # Measure the path in its own units; MuPDF reports its bounds even
-    # where it lies outside the canvas.
-    measure = _path_svg(data, (0, 0, 100, 100), (100, 100), 'stroke="black" fill="none"')
-    with pymupdf.open("pdf", _svg_to_pdf(measure)) as doc:
-        drawings = doc[0].get_drawings()
-    if not drawings:
-        raise MarkError("The path draws nothing.")
-    bounds = pymupdf.Rect(drawings[0]["rect"])
-    for drawing in drawings[1:]:
-        bounds |= drawing["rect"]
-    if bounds.width <= 0 and bounds.height <= 0:
-        raise MarkError("The path draws nothing.")
-
-    x0, y0 = page.pt(region[0], region[1])
-    x1, y1 = page.pt(region[2], region[3])
-    room_w, room_h = x1 - x0 - width, y1 - y0 - width
-    if room_w <= 0 or room_h <= 0:
-        raise MarkError("The region is too small for the path's line width.")
-    scale = min(
-        room_w / bounds.width if bounds.width > 0 else math.inf,
-        room_h / bounds.height if bounds.height > 0 else math.inf,
+    box, pdf = _draw_path(
+        data,
+        request,
+        page,
+        stroke=color,
+        width=_positive(request.get("width"), "width", DEFAULT_LINE_WIDTH),
+        fill=parse_color(request["fill"]) if request.get("fill") else None,
+        opacity=_opacity(request.get("opacity"), 1.0),
+        stretch=bool(request.get("stretch", False)),
     )
-    out_w, out_h = bounds.width * scale + width, bounds.height * scale + width
-    pad = width / 2 / scale
-    view = (bounds.x0 - pad, bounds.y0 - pad, bounds.width + 2 * pad, bounds.height + 2 * pad)
-    style = (
-        f'stroke="{_hex(color)}" stroke-width="{width / scale}" '
-        f'fill="{_hex(fill) if fill else "none"}" opacity="{opacity}"'
-    )
-    pdf = _svg_to_pdf(_path_svg(data, view, (out_w, out_h), style))
-    box = page.box(x0, y0, x0 + out_w, y0 + out_h)
     return {"path": data, "box": box, "pdf": pdf}
 
 

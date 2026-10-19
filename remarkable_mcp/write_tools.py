@@ -2947,16 +2947,19 @@ def register_write_tools():
                 - text: string ("\n" starts a new line); at, or region to wrap
                   within; options size (default 11), bold, italic, underline
                 - shape: "check" or "cross" with at (option size) or region;
-                  "circle", "box" or "highlight" with region; "line" or "arrow"
-                  with from [x, y] and to [x, y]. Options: width (line width),
-                  opacity (highlight, default 0.35)
-                - path: SVG path data for any other shape, in any units, with
-                  region: the path is scaled to fit the region (aspect kept, at
-                  its top-left), e.g. "M 0 10 L 5 0 L 10 10" in a small region
-                  is a caret. Options: width (stays in points), fill (a color),
-                  opacity. Several subpaths (each starting with M) share one
-                  style; for drawings with several colors or text, or output
-                  from other tools, use graphic.
+                  "circle", "box" or "highlight" with region, stretched to fill
+                  it; "line" or "arrow" with from [x, y] and to [x, y].
+                  Options: width (line width), opacity (highlight, default
+                  0.35)
+                - path: SVG path data for any other shape, in any units. With
+                  region it is scaled to fit, centered, keeping its aspect
+                  (stretch: true fills the region instead); with at it is
+                  scaled so its larger side is size points (default 12).
+                  E.g. "M 0 10 L 5 0 L 10 10" is a caret. Options: width
+                  (stays in points), fill (a color), opacity. Several subpaths
+                  (each starting with M) share one style; for drawings with
+                  several colors or text, or output from other tools, use
+                  graphic.
                 - latex: LaTeX math, e.g. "\\frac{a}{b} = \\sqrt{2}"; at, or
                   region to scale into; option size (default 12)
                 - graphic: content rendered elsewhere: SVG markup, or base64 PDF

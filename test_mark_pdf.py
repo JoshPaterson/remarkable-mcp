@@ -20,6 +20,7 @@ from remarkable_mcp.sync import RemarkableClient, _hash_entries, _serialize_doc_
 
 DOC_ID = "4e93be85-f688-43ca-8ca2-f0f738301f13"
 A4 = (595.0, 842.0)
+DEFAULT_WIDTH = pdf_marks.DEFAULT_LINE_WIDTH
 
 
 def _pdf(pages=2, text="Answer: ____") -> bytes:
@@ -204,7 +205,8 @@ def test_path_is_scaled_into_its_region_keeping_line_width():
         "marks"
     ][0]
     left, top, right, bottom = mark["box"]
-    assert (left, top) == (0.2, 0.2)
+    assert (top, bottom) == (0.2, 0.3)
+    assert (left + right) / 2 == pytest.approx(0.4, abs=1e-3)
     # The path is twice as wide as tall; the region's height limits it.
     height_pt = (bottom - top) * A4[1]
     width_pt = (right - left) * A4[0]
@@ -313,7 +315,10 @@ def test_marks_follow_pdf_pages_not_tablet_positions():
             "too small",
         ),
         ({"page": 1, "path": "M 0 0 L 5 5"}, "region"),
-        ({"page": 1, "shape": "check", "region": [0.1, 0.1, 0.2, 0.2], "size": 5}, "size does not"),
+        (
+            {"page": 1, "shape": "check", "region": [0.1, 0.1, 0.2, 0.2], "size": 5},
+            "size applies only",
+        ),
         ({"shape": "check", "at": [0.1, 0.1]}, "page number"),
         ({"page": 1, "id": "bad id!", "shape": "check", "at": [0.1, 0.1]}, "Mark ids"),
     ],
@@ -617,3 +622,46 @@ def test_text_styles():
         assert len(snippet[0].get_drawings()) == 1
     plain = _edit(add=[{"page": 1, "text": "Plain", "at": [0.1, 0.1]}])["marks"][0]
     assert "bold" not in plain and "underline" not in plain
+
+
+def test_svg_path_parse_and_transform():
+    from remarkable_mcp import svg_path
+
+    commands = svg_path.parse("M0,0 10 0 l5 5 H 20 v-5 a5 5 0 1010 10 Z")
+    assert [c for c, _ in commands] == ["M", "L", "l", "H", "v", "a", "Z"]
+    assert commands[5][1] == [5, 5, 0, 1, 0, 10, 10]
+    moved = svg_path.parse(svg_path.transform(commands, 2, 3, 100, 200))
+    assert moved[0][1] == [100, 200]
+    assert moved[1][1] == [120, 200]
+    assert moved[2][1] == [10, 15]
+    assert moved[3][1] == [140]
+    assert moved[5][1] == [10, 15, 0, 1, 0, 20, 30]
+    with pytest.raises(svg_path.PathError):
+        svg_path.parse("10 10 L 5")
+
+
+def test_stretched_shape_fills_region_with_exact_line_width():
+    region = [0.1, 0.1, 0.5, 0.15]
+    mark = _edit(add=[{"page": 1, "shape": "circle", "region": region, "width": 2}])["marks"][0]
+    assert mark["box"] == region
+    with pymupdf.open("pdf", base64.b64decode(mark["pdf"])) as snippet:
+        drawings = snippet[0].get_drawings()
+        assert {round(d["width"], 2) for d in drawings} == {2.0}
+        bounds = drawings[0]["rect"]
+        for d in drawings[1:]:
+            bounds |= d["rect"]
+        assert bounds.width == pytest.approx(0.4 * A4[0] - 2, abs=0.5)
+        assert bounds.height == pytest.approx(0.05 * A4[1] - 2, abs=0.5)
+
+
+def test_path_stretch_and_at_placement():
+    stretched = _edit(
+        add=[{"page": 1, "path": "M 0 0 L 1 1", "region": [0.1, 0.1, 0.5, 0.2], "stretch": True}]
+    )["marks"][0]
+    assert stretched["box"] == [0.1, 0.1, 0.5, 0.2]
+    placed = _edit(add=[{"page": 1, "path": "M 0 0 L 2 1", "at": [0.5, 0.5], "size": 20}])["marks"][
+        0
+    ]
+    left, top, right, bottom = placed["box"]
+    assert (right - left) * A4[0] == pytest.approx(20 + DEFAULT_WIDTH, abs=0.1)
+    assert (left + right) / 2 == pytest.approx(0.5, abs=1e-3)
