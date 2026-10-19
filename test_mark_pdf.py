@@ -1029,7 +1029,7 @@ def test_end_leader_starts_beside_the_text_heading_away_from_it():
     start = mark["leader"]["from"]
     optical_top, optical_bottom, under = mark["optical"]
     assert top < optical_top < optical_bottom < bottom
-    if left + (right - left) / 3 <= 0.9 <= right - (right - left) / 3:
+    if left <= 0.9 <= right:
         # Directly above or below: from the middle of the top or bottom.
         assert start[0] == pytest.approx((left + right) / 2, abs=1e-3)
         assert start[1] > under if 0.45 > bottom else start[1] < optical_top
@@ -1100,13 +1100,13 @@ def test_optical_edges_of_text_and_latex():
 
 def test_leader_from_top_or_bottom_center_for_points_above_or_below():
     box = [0.2, 0.4, 0.5, 0.42]
-    below = pdf_marks._leader_route(box, [0.38, 0.5])
-    above = pdf_marks._leader_route(box, [0.32, 0.3])
+    below = pdf_marks._leader_route(box, [0.48, 0.5])
+    above = pdf_marks._leader_route(box, [0.22, 0.3])
     assert below[0][0] == above[0][0] == pytest.approx(0.35)
     assert below[0][1] > 0.42 and above[0][1] < 0.40
-    # Over the outer thirds the leader leaves from the corner instead.
-    corner = pdf_marks._leader_route(box, [0.48, 0.3])
-    assert corner[0][0] > 0.5 and corner[0][1] == pytest.approx(0.40)
+    # Beyond the note's ends the leader leaves from the facing end instead.
+    side = pdf_marks._leader_route(box, [0.6, 0.3])
+    assert side[0][0] > 0.5 and side[0][1] == pytest.approx(0.40)
 
 
 def test_bottom_center_clears_descenders():
@@ -1114,3 +1114,13 @@ def test_bottom_center_clears_descenders():
     hanging = _edit(add=[{"page": 1, "text": "gap", "at": [0.2, 0.2]}])["marks"][0]
     assert plain["optical"][2] == plain["optical"][1]  # no descenders: the baseline
     assert hanging["optical"][2] > hanging["optical"][1]  # below the descenders
+
+
+def test_placement_prefers_diagonal_leaders():
+    # A wide line of writing holds the point; there is room above and below.
+    ink = [[0.1, 0.4, 0.9, 0.45]]
+    result = _near_edit(
+        [{"page": 1, "id": "n", "text": "a note", "near": [0.6, 0.425], "leader": True}], ink
+    )
+    leader = result["marks"][0]["leader"]
+    assert not pdf_marks._near_axis(leader["from"], leader["to"], A4)

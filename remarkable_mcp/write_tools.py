@@ -3026,8 +3026,9 @@ def register_write_tools():
                 that point, clear of the user's ink, the printed text and other
                 marks, and "leader": true draws a thin line from the mark to the
                 point, ending in a dot; it is drawn only when the mark cannot sit
-                beside the point. It starts at the middle of the note's top or
-                bottom for a point above or below the note's middle, otherwise
+                beside the point; positions giving a diagonal leader are
+                preferred. It starts at the middle of the note's top or bottom
+                for a point above or below the note, otherwise
                 just past the end that faces the point, at the text's top,
                 middle or baseline, so it never crosses the note (a bordered
                 note's leader starts at its border). Use near, with a leader, on

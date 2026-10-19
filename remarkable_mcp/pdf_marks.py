@@ -1194,6 +1194,11 @@ def _segment_hits(p, q, box) -> bool:
 
 # Gap (points) between a mark and the start of its leader.
 LEADER_START_GAP = 2.0
+# Leaders within LEADER_AXIS_ANGLE degrees of horizontal or vertical count as
+# LEADER_AXIS_PENALTY farther away, so placement prefers diagonal leaders,
+# which are not mistaken for rules, underlines or fraction bars.
+LEADER_AXIS_ANGLE = 15.0
+LEADER_AXIS_PENALTY = 0.03
 
 
 def _leader_route(
@@ -1205,7 +1210,7 @@ def _leader_route(
     """Points of a leader from ``box`` to just short of ``near``, or None if
     the point is too close to need one.
 
-    A point above or below the middle third of the mark gets a leader from
+    A point above or below the mark (within its width) gets a leader from
     the middle of its top or bottom. Otherwise the leader starts
     just past the left or right edge, whichever faces the point: at the top
     for a point above, the bottom for one below, else the middle. Either way
@@ -1217,8 +1222,7 @@ def _leader_route(
     top, bottom = box[1] + inset[0], box[3] - inset[1]
     under = box[3] - inset[2] if len(inset) > 2 else bottom
     center = (box[0] + box[2]) / 2
-    third = (box[2] - box[0]) / 3
-    middle = box[0] + third <= near[0] <= box[2] - third
+    middle = box[0] <= near[0] <= box[2]
     if middle and near[1] < top:
         start = [center, top - gap_y]
     elif middle and near[1] > bottom:
@@ -1238,6 +1242,14 @@ def _leader_route(
     ux, uy = dx / length, dy / length
     end = [near[0] - ux * LEADER_GAP, near[1] - uy * LEADER_GAP]
     return [[_round(v) for v in p] for p in (start, end)]
+
+
+def _near_axis(p, q, size) -> bool:
+    """True if the segment p-q is within ``LEADER_AXIS_ANGLE`` of horizontal
+    or vertical on a page of ``size`` points."""
+    dx, dy = (q[0] - p[0]) * size[0], (q[1] - p[1]) * size[1]
+    angle = math.degrees(math.atan2(abs(dy), abs(dx)))
+    return angle < LEADER_AXIS_ANGLE or angle > 90 - LEADER_AXIS_ANGLE
 
 
 def _route_clear(points, box, crossable, targets) -> bool:
@@ -1266,6 +1278,7 @@ def _place_near(
     obstacles: Sequence[Sequence[float]],
     route=None,
     printed: Sequence[Sequence[float]] = (),
+    size: Tuple[float, float] = (1.0, 1.0),
 ) -> List[float]:
     """Top-left of the closest ``width`` x ``height`` box to ``near`` that is
     clear of ``obstacles`` and ``printed`` (printed text); with ``route(box)``
@@ -1314,12 +1327,22 @@ def _place_near(
         if not any(_overlaps(box, o, CLEARANCE) for o in obstacles):
             free.append(box)
     for crossable in passes:
+        best, best_cost = None, math.inf
         for box in free:
+            distance_cost = distance(box[0], box[1])
+            if distance_cost >= best_cost:
+                break
+            cost = distance_cost
             if route:
                 points = route(box)
                 if points and not _route_clear(points, box, crossable, targets):
                     continue
-            return [box[0], box[1]]
+                if points and _near_axis(points[-2], points[-1], size):
+                    cost += LEADER_AXIS_PENALTY
+            if cost < best_cost:
+                best, best_cost = box, cost
+        if best is not None:
+            return [best[0], best[1]]
     why = " with a leader that crosses no writing" if route else ""
     raise MarkError(
         f"No free space near that point fits the mark{why}; make it smaller or "
@@ -1360,7 +1383,7 @@ def _render_near(
         trial["box"][3] - optical[2],
     )
     route = (lambda box: _leader_route(box, near, size, inset)) if leader else None
-    x0, y0 = _place_near(near, width, height, obstacles, route, printed)
+    x0, y0 = _place_near(near, width, height, obstacles, route, printed, size)
     # A border lies outside the content, whose top-left at gives.
     pad_x, pad_y = (BORDER_PAD / size[0], BORDER_PAD / size[1]) if border and note else (0, 0)
     stored = render_mark(dict(base, at=[x0 + pad_x, y0 + pad_y], anchor="top-left"), size, color)
