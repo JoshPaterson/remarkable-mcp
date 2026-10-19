@@ -20,8 +20,11 @@ See [#118](https://github.com/SamMorrowDrums/remarkable-mcp/issues/118).
 `remarkable_mark_pdf` draws marks into the PDF, which only carries RGB. On the
 Paper Pro, PDF colors are dithered (speckled), while the tablet's own pen and
 highlighter colors, stored as color ids, render in the screen's native colors.
-Marks drawn as native ink would match the built-in colors exactly. What is
-known so far:
+Marks drawn as native ink would match the built-in colors exactly, on the
+tablet and in the desktop app alike: ink stores a color id, which each app maps
+to its own palette, while a PDF color is one RGB value for every viewer (marks
+use the pure colors the tablet shows natively, which look more saturated in the
+desktop app). What is known so far:
 
 - Adding ink to a PDF page through the cloud works: attaching a tablet-written
   `.rm` file to an uploaded PDF as `{doc_id}/{page_id}.rm` (a new doc-index
