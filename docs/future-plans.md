@@ -60,6 +60,21 @@ byte in ids, 1-255; 0 is structure) mapped to a UUID by the `AuthorIdsBlock`;
   `(1, 18)` while the cloud added `(2, 18)`; after syncing, both strokes were
   on the tablet and in the cloud, and the tablet kept the new author entry.
 
+- **Removal, tested:** the tablet records an erase as a tombstone in place
+  (the item keeps its id, loses its value, `deleted_length` 1; 25 bytes).
+  The MCP replaced its own stroke's block with an identical-format tombstone
+  while the tablet drew offline; after syncing the stroke stayed deleted and the
+  offline stroke was kept. A partial erase on the tablet tombstones the stroke
+  and adds the remaining pieces as new strokes under the tablet's author (each
+  piece's left neighbor chains back to the original), so a partly erased mark
+  is no longer the MCP's.
+- **First ink on a page, tested:** a page with no ink needs a new `.rm`.
+  `notebooks.blank_page_rm_bytes` (rmscene) includes an empty `RootTextBlock`;
+  the tablet then treated the page as a text page and moved the MCP's stroke
+  into its own anchored group, re-creating it under the tablet's author.
+  Without the text block the tablet accepted the file, added its `SceneInfo`,
+  joined as author 2 and left the MCP's stroke untouched.
+
 Plan (validated above): one random UUID per installation, stored in the config; reuse its
 author number in a file or take the lowest free one; counter = max over all ids
 + 1; replace only the `AuthorIdsBlock` (add the entry) and append strokes,
