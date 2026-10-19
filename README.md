@@ -934,6 +934,7 @@ The cache is purely a local accelerator: deleting `REMARKABLE_CACHE_DIR` only fo
 | [Resources Reference](docs/resources.md) | MCP resources documentation |
 | [Capability Negotiation](docs/capabilities.md) | MCP protocol capabilities |
 | [Development](docs/development.md) | Contributing and development setup |
+| [Mark Color Calibration](docs/color-calibration.md) | How mark colors were matched to the tablet's screen |
 | [Future Plans](docs/future-plans.md) | Roadmap and planned features |
 
 ---
