@@ -732,3 +732,38 @@ def test_rendered_highlighter_darkens_paper_and_keeps_ink_dark():
     assert image.getpixel((60, 20)) == (254, 253, 96)  # highlighter on paper
     assert image.getpixel((20, 20)) == (0, 0, 0)  # ink under the highlighter
     assert image.getpixel((60, 5)) == (255, 255, 255)  # paper
+
+
+def test_gray_highlight_darkens_colors_by_a_quarter():
+    doc = pymupdf.open()
+    page = doc.new_page(width=A4[0], height=A4[1])
+    page.draw_rect((0, 0, A4[0], A4[1] / 2), color=None, fill=(100 / 255, 200 / 255, 1.0))
+    original = doc.tobytes()
+    region = [0.1, 0.4, 0.9, 0.6]
+    result = _edit(add=[{"page": 1, "shape": "highlight", "region": region, "color": "gray"}])
+    assert pdf_marks.summarize(result["marks"][0], 1)["color"] == "gray"
+    with pymupdf.open(stream=pdf_marks.build(original, result["marks"]), filetype="pdf") as marked:
+        pix = marked[0].get_pixmap(dpi=72)
+    over_color = pix.pixel(int(0.5 * A4[0]), int(0.45 * A4[1]))
+    over_paper = pix.pixel(int(0.5 * A4[0]), int(0.55 * A4[1]))
+    assert all(abs(a - b) <= 2 for a, b in zip(over_color, (75, 150, 191)))
+    assert all(abs(a - 191) <= 2 for a in over_paper)
+
+
+def test_renderer_blends_translucent_highlighter_by_its_opacity():
+    from PIL import Image
+
+    from remarkable_mcp.colors import highlight_opacity
+    from remarkable_mcp.extract import HIGHLIGHT_BLEND, _svg_string_to_png
+
+    svg = (
+        '<svg xmlns="http://www.w3.org/2000/svg" width="100" height="40" viewBox="0 0 100 40">'
+        '<rect x="0" y="0" width="50" height="40" fill="#64C8FF"/>'
+        f'<rect x="0" y="15" width="100" height="10" fill="#000000"{highlight_opacity(8)} '
+        f"{HIGHLIGHT_BLEND}/>"
+        "</svg>"
+    )
+    image = Image.open(io.BytesIO(_svg_string_to_png(svg, 100, 40, "#FFFFFF"))).convert("RGB")
+    assert all(abs(a - b) <= 2 for a, b in zip(image.getpixel((25, 20)), (75, 150, 191)))
+    assert all(abs(a - 191) <= 2 for a in image.getpixel((75, 20)))
+    assert image.getpixel((25, 5)) == (100, 200, 255)

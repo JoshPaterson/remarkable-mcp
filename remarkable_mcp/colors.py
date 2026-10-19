@@ -31,8 +31,8 @@ COLOR_NAMES: Dict[int, str] = {
 
 # Render colors for v6 color ids when no ARGB value applies: the colors the
 # tablet's PDF export draws. Ids 3, 4, 5 and 8 are highlighter colors; the
-# export draws the gray highlighter as black at 25% with the Darken blend,
-# which is this gray on white paper.
+# export draws the gray highlighter (8) as black at 25% opacity with the
+# Darken blend (see HIGHLIGHT_OPACITY).
 RENDER_COLORS: Dict[int, str] = {
     0: "#000000",
     1: "#909090",
@@ -42,13 +42,16 @@ RENDER_COLORS: Dict[int, str] = {
     5: "#FF55CF",
     6: "#304AE0",
     7: "#C23132",
-    8: "#BFBFBF",
+    8: "#000000",
     9: "#FEFD60",
     10: "#91DA71",
     11: "#74D2E8",
     12: "#C07FD2",
     13: "#FAE719",
 }
+
+# Opacity of highlighter colors the export draws translucent; others are opaque.
+HIGHLIGHT_OPACITY: Dict[int, float] = {8: 0.2509804}
 
 # Highlighter colors written as color id 9 plus an ARGB value.
 ARGB_NAMES: Dict[int, str] = {
@@ -121,3 +124,10 @@ def render_color(color: Any, rgba: Any = None, default: str = "black") -> str:
     if argb is not None and (color_id == CUSTOM_COLOR_ID or color_id not in RENDER_COLORS):
         return _hex(argb)
     return RENDER_COLORS.get(color_id, default)
+
+
+def highlight_opacity(color: Any) -> str:
+    """SVG opacity attribute (with a leading space) for highlighter ink of
+    ``color``, or "" when it is opaque."""
+    opacity = HIGHLIGHT_OPACITY.get(_color_id(color))
+    return f' opacity="{opacity}"' if opacity is not None else ""

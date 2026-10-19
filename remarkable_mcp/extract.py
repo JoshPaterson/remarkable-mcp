@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 from xml.sax.saxutils import escape as _xml_escape
 
-from remarkable_mcp.colors import color_info, render_color
+from remarkable_mcp.colors import color_info, highlight_opacity, render_color
 from remarkable_mcp.pages import content_page_ids, deleted_page_ids, has_cpages, live_cpages_entries
 from remarkable_mcp.tags import page_tag_entries
 from remarkable_mcp.templates import BLANK_TEMPLATE, content_page_templates
@@ -1059,11 +1059,12 @@ def _v6_paths_from_blocks(
             hl_fill = render_color(
                 getattr(line, "color", 9), getattr(line, "color_rgba", None), "#FEFD60"
             )
+            hl_opacity = highlight_opacity(getattr(line, "color", 9))
             for r in line.rectangles:
                 paths.append(
                     f'<rect x="{r.x + dx:.1f}" y="{r.y + dy:.1f}" '
                     f'width="{r.w:.1f}" height="{r.h:.1f}" '
-                    f'fill="{hl_fill}" stroke="none" {HIGHLIGHT_BLEND}/>'
+                    f'fill="{hl_fill}" stroke="none"{hl_opacity} {HIGHLIGHT_BLEND}/>'
                 )
                 all_coords.append((r.x + dx, r.y + dy))
                 all_coords.append((r.x + dx + r.w, r.y + dy + r.h))
@@ -1102,7 +1103,7 @@ def _v6_paths_from_blocks(
             else 20.0
         )
         stroke_width = max(10.0, min(avg_width * 2.0, 40.0))
-        opacity = f" {HIGHLIGHT_BLEND}"
+        opacity = f"{highlight_opacity(color)} {HIGHLIGHT_BLEND}"
 
         d = f"M {line.points[0].x + dx:.1f} {line.points[0].y + dy:.1f}"
         d += "".join(f" L {p.x + dx:.1f} {p.y + dy:.1f}" for p in line.points[1:])
@@ -1665,35 +1666,59 @@ def _svg_string_to_png(
             image = image.resize((output_width, output_height), PILImage.Resampling.LANCZOS)
         return image
 
-    try:
-        highlights = _DARKEN_ELEMENT.findall(svg)
-        image = rasterize(_DARKEN_ELEMENT.sub("", svg) if highlights else svg)
-        highlight = None
-        if highlights:
-            close = svg.rindex("</svg>")
-            body_start = svg.index(">", svg.index("<svg")) + 1
-            highlight = rasterize(svg[:body_start] + "".join(highlights) + svg[close:])
+    def darken(under, ink):
+        """``under`` with ``ink`` drawn over it with the Darken blend.
 
+        Each pixel moves toward min(under, ink) by the ink's alpha; where
+        ``under`` is transparent the ink is drawn as it is.
+        """
+        base = under.convert("RGB")
+        darkest = ImageChops.darker(base, ink.convert("RGB"))
+        blended = PILImage.composite(darkest, base, ink.getchannel("A")).convert("RGBA")
+        blended.putalpha(under.getchannel("A"))
+        plain = PILImage.alpha_composite(under, ink)
+        return PILImage.composite(blended, plain, under.getchannel("A"))
+
+    try:
+        # Split the drawing into runs of ordinary ink and of highlighter ink,
+        # in drawing order, so each highlighter run darkens what is under it.
+        close = svg.rindex("</svg>")
+        body_start = svg.index(">", svg.index("<svg")) + 1
+        runs: List[Tuple[bool, str]] = []
+        pos = body_start
+        for match in _DARKEN_ELEMENT.finditer(svg, body_start, close):
+            runs.append((False, svg[pos : match.start()]))
+            runs.append((True, match.group()))
+            pos = match.end()
+        runs.append((False, svg[pos:close]))
+        merged: List[Tuple[bool, str]] = []
+        for is_highlight, text in runs:
+            if not text.strip():
+                continue
+            if merged and merged[-1][0] == is_highlight:
+                merged[-1] = (is_highlight, merged[-1][1] + text)
+            else:
+                merged.append((is_highlight, text))
+
+        size = (output_width, output_height)
         opaque = backdrop is not None
         if backdrop is None and background_color is not None:
             red, green, blue, alpha = _parse_hex_color(background_color)
-            backdrop = PILImage.new("RGBA", image.size, (red, green, blue, alpha))
+            backdrop = PILImage.new("RGBA", size, (red, green, blue, alpha))
             opaque = alpha == 255
         if backdrop is not None:
-            backdrop = backdrop.convert("RGBA")
-            if backdrop.size != image.size:
-                backdrop = backdrop.resize(image.size, PILImage.Resampling.LANCZOS)
-            if highlight is not None:
-                white = PILImage.new("RGBA", image.size, (255, 255, 255, 255))
-                ink = PILImage.alpha_composite(white, highlight).convert("RGB")
-                darkened = ImageChops.darker(backdrop.convert("RGB"), ink).convert("RGBA")
-                darkened.putalpha(backdrop.getchannel("A"))
-                backdrop = darkened
-            image = PILImage.alpha_composite(backdrop, image)
-            if opaque:
-                image = image.convert("RGB")
-        elif highlight is not None:
-            image = PILImage.alpha_composite(highlight, image)
+            image = backdrop.convert("RGBA")
+            if image.size != size:
+                image = image.resize(size, PILImage.Resampling.LANCZOS)
+        else:
+            image = PILImage.new("RGBA", size, (0, 0, 0, 0))
+
+        head, tail = svg[:body_start], svg[close:]
+        for is_highlight, text in merged or [(False, "")]:
+            layer = rasterize(head + text + tail)
+            image = darken(image, layer) if is_highlight else PILImage.alpha_composite(image, layer)
+        if opaque:
+            image = image.convert("RGB")
 
         output = io.BytesIO()
         image.save(output, format="PNG")

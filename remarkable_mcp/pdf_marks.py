@@ -91,9 +91,13 @@ HIGHLIGHT_COLORS = {
         "pink": "#EA9EFF",
         "orange": "#FFC38C",
         "green": "#ACFF80",
-        "gray": "#BFBFBF",
+        "gray": "#000000",
     }.items()
 }
+# Highlighter colors drawn translucent, as the export draws them: gray is
+# black at 25% opacity, which is #BFBFBF on white paper and darkens colors
+# under it by a quarter.
+HIGHLIGHT_OPACITY = {"gray": 0.2509804}
 DEFAULT_TEXT_SIZE = 11.0
 DEFAULT_LATEX_SIZE = 12.0
 DEFAULT_SYMBOL_SIZE = 12.0
@@ -835,6 +839,14 @@ def render_mark(
         stored = _render_graphic(request, page)
     else:
         palette = _palette(request.get("shape"))
+        name = request.get("color") or color or ""
+        if (
+            request.get("shape") == "highlight"
+            and "opacity" not in request
+            and isinstance(name, str)
+            and name.strip().lower() in HIGHLIGHT_OPACITY
+        ):
+            request = dict(request, opacity=HIGHLIGHT_OPACITY[name.strip().lower()])
         if "color" in request:
             rgb = parse_color(request["color"], palette)
         elif color:
