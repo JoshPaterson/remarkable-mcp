@@ -909,6 +909,9 @@ async def remarkable_read(
 
             if ocr_backend_used:
                 result["ocr_backend"] = ocr_backend_used
+            handwriting = (content or {}).get("handwriting") or []
+            if 1 <= page <= len(handwriting):
+                result["handwriting"] = [handwriting[page - 1]]
 
             if has_more:
                 result["next_page"] = page + 1
@@ -1089,6 +1092,8 @@ async def remarkable_read(
             ]
             if page_layers:
                 result["layers"] = page_layers
+        if content and content.get("handwriting"):
+            result["handwriting"] = content["handwriting"]
 
         if has_more:
             result["next_page"] = page + 1

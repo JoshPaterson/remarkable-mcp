@@ -3065,7 +3065,11 @@ def extract_text_from_document_zip(
         {
             "typed_text": [...],      # From rmscene parsing (list of strings)
             "highlights": [...],       # Highlighted text (GlyphRange + legacy JSON)
-            "handwritten_text": [...], # From OCR (if enabled) - one per page, in order
+            "handwritten_text": [...], # From OCR (if enabled): one text per page
+                                       # with text, headed "--- Page N ---"
+            "handwriting": [           # The same OCR as lines, in reading order
+                {"page": int, "lines": [{"text": str, "layers": [str]}]},
+            ],                         # "layers" only on pages with several
             "pages": int,
             "page_ids": [...],         # Page UUIDs in order
             "highlight_details": [     # GlyphRange highlights with colors
@@ -3307,8 +3311,10 @@ def extract_text_from_document_zip(
 
         # OCR for handwritten content (optional)
         if include_ocr and rm_files:
-            ocr_result, ocr_backend = extract_handwriting_ocr(rm_files)
-            result["handwritten_text"] = ocr_result
+            ocr_pages, ocr_backend = extract_handwriting_ocr(rm_files)
+            handwriting = handwriting_by_page(tmpdir_path, rm_files, ocr_pages or [])
+            result["handwriting"] = handwriting
+            result["handwritten_text"] = [ocr_page_text(e) for e in handwriting] or None
             result["ocr_backend"] = ocr_backend
 
     if doc_id and cache_token is not None:
@@ -3317,7 +3323,20 @@ def extract_text_from_document_zip(
     return result
 
 
-def extract_handwriting_ocr(rm_files: List[Path]) -> tuple[Optional[List[str]], Optional[str]]:
+# OCR renders: Google Vision gets the standard screen size, Tesseract a larger
+# image for small handwriting.
+GOOGLE_OCR_SIZE = (REMARKABLE_WIDTH, REMARKABLE_HEIGHT)
+TESSERACT_OCR_SIZE = (2106, 2808)
+# A layer is named on an OCR line when it drew at least this share of the
+# line's ink, relative to the layer that drew the most there.
+LINE_LAYER_SHARE = 0.2
+
+OcrLine = Tuple[str, Tuple[float, float, float, float]]
+
+
+def extract_handwriting_ocr(
+    rm_files: List[Path],
+) -> Tuple[Optional[List[Optional[List[Dict[str, Any]]]]], Optional[str]]:
     """
     Extract handwritten text using OCR.
 
@@ -3326,8 +3345,11 @@ def extract_handwriting_ocr(rm_files: List[Path]) -> tuple[Optional[List[str]], 
     - "tesseract": pytesseract - basic OCR, rasterized locally with PyMuPDF
     - "auto" (default): Google if API key provided, else Tesseract
 
-    Returns:
-        Tuple of (ocr_results, backend_used) where backend_used is "google" or "tesseract"
+    Returns ``(pages, backend_used)``. ``pages`` has one entry per file in
+    ``rm_files`` (None when that page could not be read), each a list of lines
+    ``{"text", "layers"}`` in reading order; ``layers`` (the layers that drew
+    the line) is present only on pages with several visible layers. ``pages``
+    is None when OCR found nothing or is unavailable.
     """
     backend = get_ocr_backend()
 
@@ -3349,7 +3371,141 @@ def extract_handwriting_ocr(rm_files: List[Path]) -> tuple[Optional[List[str]], 
     return (result, "tesseract")
 
 
-def _ocr_google_vision(rm_files: List[Path]) -> Optional[List[str]]:
+def _ocr_page_images(
+    rm_file: Path, size: Tuple[int, int]
+) -> Optional[Tuple[bytes, List[Tuple[str, bytes]]]]:
+    """``(page_png, [(layer_name, layer_png)])`` for OCR.
+
+    The page shows its visible layers on white. When it has several visible
+    layers, each is also rendered alone, transparent, in the same frame, so an
+    OCR line's box can be matched to the layers that drew it.
+    """
+    blocks = _v6_blocks(rm_file)
+    if blocks is None:
+        with tempfile.NamedTemporaryFile(suffix=".svg", delete=False) as tmp:
+            tmp_svg = Path(tmp.name)
+        try:
+            if not _rm_to_svg(rm_file, tmp_svg):
+                return None
+            png = _svg_string_to_png(tmp_svg.read_text(), size[0], size[1], "#FFFFFF")
+        finally:
+            tmp_svg.unlink(missing_ok=True)
+        return (png, []) if png is not None else None
+
+    text_elements, text_coords, anchor_pos = _v6_text_elements_with_bounds(blocks)
+    paths, coords = _v6_paths_from_blocks(blocks, anchor_pos)
+    frame = coords + text_coords
+    svg = _svg_from_paths(text_elements + paths, frame)
+    if svg is None:
+        return None
+    png = _svg_string_to_png(svg, size[0], size[1], "#FFFFFF")
+    if png is None:
+        return None
+    layer_pngs: List[Tuple[str, bytes]] = []
+    tree = _v6_tree(blocks)
+    visible = [la for la in _scene_layers(tree, blocks) if la["visible"]] if tree else []
+    if len(visible) > 1:
+        for layer in visible:
+            layer_paths, layer_coords = _v6_paths_from_blocks(blocks, anchor_pos, layer["name"])
+            if not layer_coords:
+                continue
+            layer_svg = _svg_from_paths(layer_paths, frame)
+            layer_png = _svg_string_to_png(layer_svg, size[0], size[1], None) if layer_svg else None
+            if layer_png is not None:
+                layer_pngs.append((layer["name"], layer_png))
+    return png, layer_pngs
+
+
+def _tag_line_layers(
+    lines: List[OcrLine], layer_pngs: List[Tuple[str, bytes]]
+) -> List[Dict[str, Any]]:
+    """OCR lines ``(text, pixel box)`` as ``{"text", "layers"}``.
+
+    With several layers, a line names each layer whose ink inside the line's
+    box is at least ``LINE_LAYER_SHARE`` of the most any layer drew there;
+    with fewer, lines carry no layers.
+    """
+    if len(layer_pngs) < 2:
+        return [{"text": text} for text, _ in lines]
+    import io
+
+    from PIL import Image
+
+    masks = []
+    for name, png in layer_pngs:
+        alpha = Image.open(io.BytesIO(png)).convert("RGBA").getchannel("A")
+        masks.append((name, alpha.point(lambda v: 255 if v > 32 else 0)))
+    out = []
+    for text, (x0, y0, x1, y1) in lines:
+        box = (int(x0), int(y0), max(int(x0) + 1, int(x1)), max(int(y0) + 1, int(y1)))
+        counts = [(name, mask.crop(box).histogram()[255]) for name, mask in masks]
+        most = max(count for _, count in counts)
+        layers = [name for name, count in counts if most and count >= most * LINE_LAYER_SHARE]
+        out.append({"text": text, "layers": layers})
+    return out
+
+
+def _ocr_pages(
+    rm_files: List[Path], size: Tuple[int, int], read_lines: Callable[[bytes], Any]
+) -> List[Optional[List[Dict[str, Any]]]]:
+    """OCR each file with ``read_lines(png) -> [(text, box)] | None``; a page
+    that fails to render or read is None."""
+    pages: List[Optional[List[Dict[str, Any]]]] = []
+    for rm_file in rm_files:
+        try:
+            images = _ocr_page_images(rm_file, size)
+            lines = read_lines(images[0]) if images else None
+            pages.append(None if lines is None else _tag_line_layers(lines, images[1]))
+        except _VisionAuthError:
+            raise
+        except Exception:
+            pages.append(None)
+    return pages
+
+
+def _vision_lines(annotation: Dict[str, Any]) -> List[OcrLine]:
+    """Lines ``(text, pixel box)`` from a Vision ``fullTextAnnotation``
+    (REST camelCase or SDK snake_case keys), in reading order."""
+
+    def get(obj: Any, *keys: str) -> Any:
+        for key in keys:
+            if isinstance(obj, dict) and key in obj:
+                return obj[key]
+        return None
+
+    spaces = {"SPACE", "SURE_SPACE", 1, 2}
+    hyphens = {"HYPHEN", 4}
+    line_ends = {"EOL_SURE_SPACE", "LINE_BREAK", 3, 5} | hyphens
+    lines: List[OcrLine] = []
+
+    def finish(text: str, xs: list, ys: list) -> None:
+        if text.strip() and xs:
+            lines.append((text.strip(), (min(xs), min(ys), max(xs), max(ys))))
+
+    for page in get(annotation, "pages") or []:
+        for block in get(page, "blocks") or []:
+            for paragraph in get(block, "paragraphs") or []:
+                text, xs, ys = "", [], []
+                for word in get(paragraph, "words") or []:
+                    for vertex in get(get(word, "boundingBox", "bounding_box"), "vertices") or []:
+                        xs.append(get(vertex, "x") or 0)
+                        ys.append(get(vertex, "y") or 0)
+                    for symbol in get(word, "symbols") or []:
+                        text += get(symbol, "text") or ""
+                        detected = get(get(symbol, "property"), "detectedBreak", "detected_break")
+                        kind = get(detected, "type", "type_")
+                        if kind in spaces:
+                            text += " "
+                        elif kind in line_ends:
+                            if kind in hyphens:
+                                text += "-"
+                            finish(text, xs, ys)
+                            text, xs, ys = "", [], []
+                finish(text, xs, ys)
+    return lines
+
+
+def _ocr_google_vision(rm_files: List[Path]) -> Optional[List[Optional[List[Dict[str, Any]]]]]:
     """
     OCR using Google Cloud Vision API.
     Best quality for handwriting recognition.
@@ -3370,124 +3526,65 @@ def _ocr_google_vision(rm_files: List[Path]) -> Optional[List[str]]:
         return _ocr_google_vision_sdk(rm_files)
 
 
-def _ocr_google_vision_rest(rm_files: List[Path], api_key: str) -> Optional[List[str]]:
+class _VisionAuthError(Exception):
+    """The Vision API key is invalid or the API is not enabled."""
+
+
+def _ocr_google_vision_rest(
+    rm_files: List[Path], api_key: str
+) -> Optional[List[Optional[List[Dict[str, Any]]]]]:
     """
     OCR using Google Cloud Vision REST API with API key.
     """
     import base64
-    import tempfile
 
     import requests
 
-    ocr_results = []
+    def read_lines(png: bytes) -> Optional[List[OcrLine]]:
+        url = f"https://vision.googleapis.com/v1/images:annotate?key={api_key}"
+        payload = {
+            "requests": [
+                {
+                    "image": {"content": base64.b64encode(png).decode("utf-8")},
+                    "features": [{"type": "DOCUMENT_TEXT_DETECTION"}],
+                }
+            ]
+        }
+        response = requests.post(url, json=payload, timeout=60)
+        if response.status_code in (401, 403):
+            raise _VisionAuthError()
+        if response.status_code != 200:
+            return None
+        responses = response.json().get("responses") or [{}]
+        return _vision_lines(responses[0].get("fullTextAnnotation") or {})
 
-    for rm_file in rm_files:
-        tmp_svg_path = None
-        try:
-            with tempfile.NamedTemporaryFile(suffix=".svg", delete=False) as tmp_svg:
-                tmp_svg_path = Path(tmp_svg.name)
-
-            # Convert .rm to SVG via the rmscene renderers
-            if not _rm_to_svg(rm_file, tmp_svg_path):
-                continue
-
-            png = _svg_string_to_png(
-                tmp_svg_path.read_text(),
-                REMARKABLE_WIDTH,
-                REMARKABLE_HEIGHT,
-                "#FFFFFF",
-            )
-            if png is None:
-                continue
-
-            # Read and encode image
-            image_content = base64.b64encode(png).decode("utf-8")
-
-            # Call Google Vision REST API
-            url = f"https://vision.googleapis.com/v1/images:annotate?key={api_key}"
-            payload = {
-                "requests": [
-                    {
-                        "image": {"content": image_content},
-                        "features": [{"type": "DOCUMENT_TEXT_DETECTION"}],
-                    }
-                ]
-            }
-
-            response = requests.post(url, json=payload, timeout=60)
-            if response.status_code == 200:
-                data = response.json()
-                if "responses" in data and data["responses"]:
-                    resp = data["responses"][0]
-                    if "fullTextAnnotation" in resp:
-                        text = resp["fullTextAnnotation"]["text"]
-                        if text.strip():
-                            ocr_results.append(text.strip())
-            elif response.status_code in (401, 403):
-                # API key invalid or API not enabled - fall back to Tesseract
-                return _ocr_tesseract(rm_files)
-
-        except Exception:
-            # API call or rendering failed - skip this page and continue
-            pass
-        finally:
-            if tmp_svg_path:
-                tmp_svg_path.unlink(missing_ok=True)
-
-    return ocr_results if ocr_results else None
+    try:
+        pages = _ocr_pages(rm_files, GOOGLE_OCR_SIZE, read_lines)
+    except _VisionAuthError:
+        # API key invalid or API not enabled - fall back to Tesseract
+        return _ocr_tesseract(rm_files)
+    return pages if any(pages) else None
 
 
-def _ocr_google_vision_sdk(rm_files: List[Path]) -> Optional[List[str]]:
+def _ocr_google_vision_sdk(rm_files: List[Path]) -> Optional[List[Optional[List[Dict[str, Any]]]]]:
     """
     OCR using Google Cloud Vision SDK with service account credentials.
     """
     try:
-        import tempfile
-
         from google.cloud import vision
 
         client = vision.ImageAnnotatorClient()
-        ocr_results = []
 
-        for rm_file in rm_files:
-            tmp_svg_path = None
-            try:
-                with tempfile.NamedTemporaryFile(suffix=".svg", delete=False) as tmp_svg:
-                    tmp_svg_path = Path(tmp_svg.name)
+        def read_lines(png: bytes) -> Optional[List[OcrLine]]:
+            # DOCUMENT_TEXT_DETECTION gives the best handwriting results.
+            response = client.document_text_detection(image=vision.Image(content=png))
+            if response.error.message:
+                return None
+            annotation = response.full_text_annotation
+            return _vision_lines(type(annotation).to_dict(annotation))
 
-                # Convert .rm to SVG via the rmscene renderers
-                if not _rm_to_svg(rm_file, tmp_svg_path):
-                    continue
-
-                png = _svg_string_to_png(
-                    tmp_svg_path.read_text(),
-                    REMARKABLE_WIDTH,
-                    REMARKABLE_HEIGHT,
-                    "#FFFFFF",
-                )
-                if png is None:
-                    continue
-
-                # Send to Google Vision API
-                image = vision.Image(content=png)
-
-                # Use DOCUMENT_TEXT_DETECTION for best handwriting results
-                response = client.document_text_detection(image=image)
-
-                if response.error.message:
-                    continue
-
-                if response.full_text_annotation.text:
-                    ocr_results.append(response.full_text_annotation.text.strip())
-
-            except Exception:
-                # Rendering or API error - skip this page and continue
-                pass
-            finally:
-                if tmp_svg_path:
-                    tmp_svg_path.unlink(missing_ok=True)
-
-        return ocr_results if ocr_results else None
+        pages = _ocr_pages(rm_files, GOOGLE_OCR_SIZE, read_lines)
+        return pages if any(pages) else None
 
     except ImportError:
         # google-cloud-vision not installed, fall back to tesseract
@@ -3497,7 +3594,49 @@ def _ocr_google_vision_sdk(rm_files: List[Path]) -> Optional[List[str]]:
         return _ocr_tesseract(rm_files)
 
 
-def _ocr_tesseract(rm_files: List[Path]) -> Optional[List[str]]:
+def _tesseract_lines(png: bytes) -> List[OcrLine]:
+    """Lines ``(text, pixel box)`` found by Tesseract, in reading order."""
+    import io
+
+    import pytesseract
+    from PIL import Image, ImageFilter, ImageOps
+
+    # Grayscale, more contrast and slight sharpening help with handwriting.
+    img = Image.open(io.BytesIO(png)).convert("L")
+    img = ImageOps.autocontrast(img, cutoff=2)
+    img = img.filter(ImageFilter.SHARPEN)
+    # PSM 11 = sparse text: find as much text as possible.
+    data = pytesseract.image_to_data(
+        img, config=r"--psm 11 --oem 3", output_type=pytesseract.Output.DICT
+    )
+    grouped: Dict[tuple, list] = {}
+    for i, word in enumerate(data["text"]):
+        word = str(word).strip()
+        if not word:
+            continue
+        key = (data["block_num"][i], data["par_num"][i], data["line_num"][i])
+        left, top = data["left"][i], data["top"][i]
+        box = (left, top, left + data["width"][i], top + data["height"][i])
+        grouped.setdefault(key, []).append((word, box))
+    lines: List[OcrLine] = []
+    for words in grouped.values():
+        boxes = [box for _, box in words]
+        text = " ".join(word for word, _ in words)
+        lines.append(
+            (
+                text,
+                (
+                    min(b[0] for b in boxes),
+                    min(b[1] for b in boxes),
+                    max(b[2] for b in boxes),
+                    max(b[3] for b in boxes),
+                ),
+            )
+        )
+    return lines
+
+
+def _ocr_tesseract(rm_files: List[Path]) -> Optional[List[Optional[List[Dict[str, Any]]]]]:
     """
     OCR using Tesseract.
     Basic quality - designed for printed text, not handwriting.
@@ -3505,64 +3644,34 @@ def _ocr_tesseract(rm_files: List[Path]) -> Optional[List[str]]:
     Requires: pytesseract and PyMuPDF.
     """
     try:
-        import io
-        import tempfile
-
-        import pytesseract
-        from PIL import Image, ImageFilter, ImageOps
-
-        ocr_results = []
-
-        for rm_file in rm_files:
-            tmp_svg_path = None
-            try:
-                with tempfile.NamedTemporaryFile(suffix=".svg", delete=False) as tmp_svg:
-                    tmp_svg_path = Path(tmp_svg.name)
-
-                # Convert .rm to SVG via the rmscene renderers
-                if not _rm_to_svg(rm_file, tmp_svg_path):
-                    continue
-
-                # Convert SVG to PNG with higher resolution for better OCR
-                png = _svg_string_to_png(
-                    tmp_svg_path.read_text(),
-                    2106,
-                    2808,
-                    "#FFFFFF",
-                )
-                if png is None:
-                    continue
-
-                # Preprocess image for better OCR
-                img = Image.open(io.BytesIO(png))
-
-                # Convert to grayscale
-                img = img.convert("L")
-
-                # Increase contrast
-                img = ImageOps.autocontrast(img, cutoff=2)
-
-                # Slight sharpening
-                img = img.filter(ImageFilter.SHARPEN)
-
-                # Run OCR with optimized settings for sparse handwriting
-                # PSM 11 = Sparse text - find as much text as possible
-                # PSM 6 = Uniform block of text (alternative)
-                custom_config = r"--psm 11 --oem 3"
-                text = pytesseract.image_to_string(img, config=custom_config)
-
-                if text.strip():
-                    ocr_results.append(text.strip())
-
-            except Exception:
-                # Rendering or OCR error - skip this page and continue
-                pass
-            finally:
-                if tmp_svg_path:
-                    tmp_svg_path.unlink(missing_ok=True)
-
-        return ocr_results if ocr_results else None
-
+        import pytesseract  # noqa: F401
     except ImportError:
         # OCR dependencies not installed
         return None
+    pages = _ocr_pages(rm_files, TESSERACT_OCR_SIZE, _tesseract_lines)
+    return pages if any(pages) else None
+
+
+def ocr_page_text(entry: Dict[str, Any]) -> str:
+    """One OCR'd page as text: a page heading, then its lines in reading
+    order; on pages with several layers each line ends with its layers."""
+    out = [f"--- Page {entry['page']} ---"]
+    for line in entry["lines"]:
+        layers = line.get("layers")
+        out.append(f"{line['text']}  [{', '.join(layers)}]" if layers else line["text"])
+    return "\n".join(out)
+
+
+def handwriting_by_page(
+    tmpdir_path: Path, rm_files: List[Path], pages: List[Optional[List[Dict[str, Any]]]]
+) -> List[Dict[str, Any]]:
+    """``[{"page", "lines"}]`` for the OCR'd pages that have text, numbered by
+    their place in the document."""
+    order = _get_page_order(tmpdir_path)
+    out = []
+    for position, (rm_file, lines) in enumerate(zip(rm_files, pages), start=1):
+        if not lines:
+            continue
+        page = order.index(rm_file.stem) + 1 if rm_file.stem in order else position
+        out.append({"page": page, "lines": lines})
+    return sorted(out, key=lambda entry: entry["page"])
