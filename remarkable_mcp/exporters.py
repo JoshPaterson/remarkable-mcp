@@ -474,10 +474,24 @@ def write_markdown_export(
     if include_ocr:
         if ocr_backend:
             lines.extend([f"Backend: `{ocr_backend}`", ""])
+        handwriting = content.get("handwriting") or []
         handwritten = [
             str(value) for value in content.get("handwritten_text") or [] if str(value).strip()
         ]
-        if handwritten:
+        if handwriting:
+            for entry in handwriting:
+                lines.extend([f"### Page {entry['page']}", ""])
+                text = "\n".join(
+                    (
+                        f"{line['text']}  [{', '.join(line['layers'])}]"
+                        if line.get("layers")
+                        else line["text"]
+                    )
+                    for line in entry["lines"]
+                )
+                lines.extend(_verbatim_block(text))
+                lines.append("")
+        elif handwritten:
             lines.extend(
                 [
                     "_OCR excerpts remain in extraction order. Sparse OCR results are "
