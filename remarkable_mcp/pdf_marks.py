@@ -173,6 +173,10 @@ _ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}$")
 _URL_PATTERN = re.compile(r"url\(\s*['\"]?([^'\")\s]*)", re.IGNORECASE)
 
 
+MAX_OUTLINE_ENTRIES = 5000
+MAX_OUTLINE_TITLE = 300
+
+
 class MarkError(ValueError):
     """A mark that cannot be drawn (bad coordinates, content or page)."""
 
@@ -202,6 +206,77 @@ def load_state(pdf_bytes: bytes) -> Tuple[bytes, List[Dict[str, Any]]]:
     return base, marks
 
 
+def load_outline(pdf_bytes: bytes) -> Optional[List[Dict[str, Any]]]:
+    """The outline set with ``remarkable_pdf_outline``, or None when the PDF
+    keeps its own: ``[{"level", "title", "pdf_page"}]``."""
+    try:
+        with pymupdf.open(stream=pdf_bytes, filetype="pdf") as doc:
+            if MARKS_FILE not in doc.embfile_names():
+                return None
+            data = json.loads(doc.embfile_get(MARKS_FILE).decode("utf-8"))
+    except Exception:
+        return None
+    outline = data.get("outline") if isinstance(data, dict) else None
+    return outline if isinstance(outline, list) else None
+
+
+def pdf_outline(pdf_bytes: bytes) -> List[Dict[str, Any]]:
+    """A PDF's outline (table of contents): ``[{"level", "title", "pdf_page"}]``,
+    ``pdf_page`` 0-based, or None for an entry that points nowhere."""
+    with pymupdf.open(stream=pdf_bytes, filetype="pdf") as doc:
+        count = len(doc)
+        return [
+            {
+                "level": level,
+                "title": title,
+                "pdf_page": page - 1 if 1 <= page <= count else None,
+            }
+            for level, title, page in doc.get_toc(simple=True)
+        ]
+
+
+def check_outline(entries: Any, page_map: Sequence[Optional[int]]) -> List[Dict[str, Any]]:
+    """Outline entries from a request: ``{"title", "page", "level"}`` with
+    tablet page numbers, as stored entries with PDF page indexes."""
+    if not isinstance(entries, list):
+        raise MarkError('outline must be a list of entries, [] to remove it, or "original".')
+    if len(entries) > MAX_OUTLINE_ENTRIES:
+        raise MarkError(f"An outline can have at most {MAX_OUTLINE_ENTRIES} entries.")
+    out: List[Dict[str, Any]] = []
+    previous = 0
+    for number, entry in enumerate(entries, start=1):
+        where = f"Outline entry {number}"
+        if not isinstance(entry, dict):
+            raise MarkError(f'{where} must be an object with "title" and "page".')
+        unknown = set(entry) - {"title", "page", "level"}
+        if unknown:
+            raise MarkError(f"{where} has unknown keys: {', '.join(sorted(unknown))}.")
+        title = entry.get("title")
+        if not isinstance(title, str) or not title.strip():
+            raise MarkError(f"{where} needs a title.")
+        if len(title) > MAX_OUTLINE_TITLE:
+            raise MarkError(f"{where}: titles are limited to {MAX_OUTLINE_TITLE} characters.")
+        page = entry.get("page")
+        if isinstance(page, bool) or not isinstance(page, int):
+            raise MarkError(f"{where} needs a page number (1-based).")
+        if not 1 <= page <= len(page_map):
+            raise MarkError(
+                f"{where}: page {page} does not exist; the document has {len(page_map)}."
+            )
+        if page_map[page - 1] is None:
+            raise MarkError(f"{where}: page {page} was added on the tablet and is not in the PDF.")
+        level = entry.get("level", 1)
+        if isinstance(level, bool) or not isinstance(level, int) or level < 1:
+            raise MarkError(f"{where}: level must be 1 or more.")
+        if level > previous + 1:
+            raise MarkError(
+                f"{where}: level {level} must be at most one deeper than the entry before it."
+            )
+        previous = level
+        out.append({"level": level, "title": title.strip(), "pdf_page": page_map[page - 1]})
+    return out
+
+
 def for_export(pdf_bytes: bytes) -> bytes:
     """A marked PDF as the desktop and browser apps would show it.
 
@@ -213,7 +288,8 @@ def for_export(pdf_bytes: bytes) -> bytes:
         base, marks = load_state(pdf_bytes)
     except Exception:
         return pdf_bytes
-    if not marks:
+    outline = load_outline(pdf_bytes)
+    if not marks and outline is None:
         return pdf_bytes
     sizes = page_sizes(base)
 
@@ -237,7 +313,7 @@ def for_export(pdf_bytes: bytes) -> bytes:
         if mark.get("leader"):
             mark = dict(mark, leader=redraw(mark["leader"], size))
         drawn.append(mark)
-    return build(base, drawn, embed=False)
+    return build(base, drawn, embed=False, outline=outline)
 
 
 def original_pdf(pdf_bytes: bytes) -> bytes:
@@ -293,15 +369,22 @@ def page_sizes(pdf_bytes: bytes) -> List[Tuple[float, float]]:
         return [(page.rect.width, page.rect.height) for page in doc]
 
 
-def build(base: bytes, marks: Sequence[Dict[str, Any]], embed: bool = True) -> bytes:
-    """The PDF with ``marks`` placed on ``base``; ``base`` itself when none.
+def build(
+    base: bytes,
+    marks: Sequence[Dict[str, Any]],
+    embed: bool = True,
+    outline: Optional[Sequence[Dict[str, Any]]] = None,
+) -> bytes:
+    """The PDF with ``marks`` placed on ``base``; ``base`` itself when there
+    are no marks and no outline.
 
-    With ``embed`` (the default) the original PDF and the mark list are
-    embedded, so the marks can be changed later; exports pass False.
-    Raises MarkError if placing would change the page count or a page size,
-    which would move the tablet's ink relative to the page.
+    ``outline`` (see ``check_outline``) replaces the PDF's own outline; None
+    keeps it. With ``embed`` (the default) the original PDF, the mark list and
+    the outline are embedded, so they can be changed later; exports pass
+    False. Raises MarkError if placing would change the page count or a page
+    size, which would move the tablet's ink relative to the page.
     """
-    if not marks:
+    if not marks and outline is None:
         return base
     doc = pymupdf.open(stream=base, filetype="pdf")
     try:
@@ -317,9 +400,14 @@ def build(base: bytes, marks: Sequence[Dict[str, Any]], embed: bool = True) -> b
                 if part:
                     with pymupdf.open("pdf", base64.b64decode(part["pdf"])) as snippet:
                         page.show_pdf_page(_points(page.rect, part["box"]), snippet, 0)
+        if outline is not None:
+            doc.set_toc([[e["level"], e["title"], e["pdf_page"] + 1] for e in outline])
         if embed:
             doc.embfile_add(BASE_FILE, base, filename=BASE_FILE, desc="PDF before marks")
-            payload = json.dumps({"format": MARKS_FORMAT, "marks": list(marks)}, indent=1)
+            state: Dict[str, Any] = {"format": MARKS_FORMAT, "marks": list(marks)}
+            if outline is not None:
+                state["outline"] = list(outline)
+            payload = json.dumps(state, indent=1)
             doc.embfile_add(MARKS_FILE, payload.encode("utf-8"), filename=MARKS_FILE, desc="Marks")
         result = doc.tobytes(garbage=3, deflate=True)
     finally:

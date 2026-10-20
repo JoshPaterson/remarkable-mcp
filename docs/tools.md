@@ -198,6 +198,10 @@ mark with a cover layer adds `[cover 'Mark cover': hidden on tablet]` to its
 line and `"cover": {"layer", "state"}` to its entry; the state is `hidden on
 tablet`, `shown on tablet` or `cover erased on tablet`.
 
+A PDF with an outline (table of contents) also returns `outline: [{"level",
+"title", "page"}]` with tablet page numbers (`page` is null for an entry that
+points nowhere). `remarkable_pdf_outline` lists, sets and removes it.
+
 ### Smart Features
 
 - **Auto-OCR**: If a notebook has no typed text and `include_ocr=False`, OCR is automatically enabled and you're notified via `_ocr_auto_enabled: true`

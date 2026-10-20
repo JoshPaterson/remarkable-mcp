@@ -67,7 +67,7 @@ from remarkable_mcp.extract import (
     render_page_full_page_from_document_zip,
     render_tablet_pdf_page_to_png,
 )
-from remarkable_mcp.pdf_marks import for_export, original_pdf, stored_marks
+from remarkable_mcp.pdf_marks import for_export, original_pdf, pdf_outline, stored_marks
 from remarkable_mcp.responses import make_error, make_response
 from remarkable_mcp.server import mcp
 from remarkable_mcp.tags import matches_tags, tag_names
@@ -588,12 +588,17 @@ async def remarkable_read(
         page_count_note = None
         mark_list: list = []
         mark_summaries: list = []
+        outline_entries: list = []
 
         # Get raw PDF/EPUB content if requested or for "text" mode
         if content_type in ("text", "raw") and file_type in ("pdf", "epub"):
             raw_data = await run_blocking(download_raw_file, client, target_doc, file_type)
             if raw_data and file_type == "pdf":
                 mark_list = stored_marks(raw_data)
+                try:
+                    outline_entries = pdf_outline(raw_data)
+                except Exception:
+                    outline_entries = []
                 raw_data = original_pdf(raw_data)
             if raw_data:
                 raw_available = True
@@ -1074,6 +1079,8 @@ async def remarkable_read(
             result["page_tags"] = content["page_tags"]
         if mark_summaries:
             result["marks"] = mark_summaries
+        if outline_entries:
+            result["outline"] = _outline_summaries(outline_entries, await load_archive())
         if content_type in ("text", "annotations") and content:
             page_layers = [
                 {"page": ap["page"], "layers": ap["layers"]}
@@ -2592,6 +2599,36 @@ def _archive_for_export(archive: bytes) -> bytes:
     """A document archive with marks in the desktop apps' colors (see
     ``pdf_marks.for_export``)."""
     return _archive_with_pdf(archive, for_export)
+
+
+def _archive_page_map(archive: bytes) -> list:
+    """The tablet page -> PDF page map of a document archive, or []."""
+    from remarkable_mcp.pages import pdf_page_map
+
+    if _is_pdf_payload(archive):
+        return []
+    try:
+        with zipfile.ZipFile(io.BytesIO(archive)) as zf:
+            name = next((n for n in zf.namelist() if n.endswith(".content")), None)
+            return pdf_page_map(json.loads(zf.read(name))) if name else []
+    except Exception:
+        return []
+
+
+def _outline_summaries(entries: list, archive: bytes) -> list:
+    """A PDF's outline entries with the tablet page each points to."""
+    from remarkable_mcp.pdf_marks import tablet_page
+
+    page_map = _archive_page_map(archive)
+    out = []
+    for entry in entries:
+        index = entry["pdf_page"]
+        if index is None:
+            page = None
+        else:
+            page = tablet_page(index, page_map) if page_map else index + 1
+        out.append({"level": entry["level"], "title": entry["title"], "page": page})
+    return out
 
 
 def _mark_summaries(marks: list, archive: bytes) -> list:

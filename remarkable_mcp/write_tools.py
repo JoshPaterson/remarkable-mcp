@@ -33,7 +33,7 @@ import time
 import uuid
 from contextlib import contextmanager, nullcontext
 from datetime import datetime
-from typing import Annotated, Dict, List, Optional, Union
+from typing import Annotated, Any, Dict, List, Optional, Union
 
 from mcp.server.mcpserver import Context, Elicit, ElicitationResult, Resolve
 from mcp.types import ToolAnnotations
@@ -1418,7 +1418,11 @@ def _mark_editor(
                 read_ink=lambda page_id: written.get(page_id) or read_ink(page_id),
             )
         result["notes"] = result["notes"] + cover_notes
-        result["pdf"] = pdf_marks.build(base, result["marks"]) if result["changed"] else None
+        result["pdf"] = (
+            pdf_marks.build(base, result["marks"], outline=pdf_marks.load_outline(pdf))
+            if result["changed"]
+            else None
+        )
         if not build:
             result["preview_pdf"], result["pdf"] = result["pdf"], None
         return result
@@ -1548,6 +1552,72 @@ def _mark_response(target, result: dict, dry_run: bool) -> str:
         )
     else:
         hint = f"Marks on '{name}' updated. Changes reach the tablet on its next sync."
+    return make_response(data, hint)
+
+
+def _outline_editor(outline, build: bool):
+    """``edit(pdf, content)`` for ``replace_document_pdf`` that sets a PDF's
+    outline (None lists it, "original" restores the PDF's own)."""
+    from remarkable_mcp import pdf_marks
+    from remarkable_mcp.pages import pdf_page_map
+
+    def edit(pdf: bytes, content: dict) -> dict:
+        base, marks = pdf_marks.load_state(pdf)
+        current = pdf_marks.load_outline(pdf)
+        page_map = pdf_page_map(content)
+        if outline is None:
+            new = current
+        elif outline == "original":
+            new = None
+        else:
+            new = pdf_marks.check_outline(outline, page_map)
+        changed = outline is not None and new != current
+        entries = new if new is not None else pdf_marks.pdf_outline(base)
+        first_lines: dict = {}
+        listed = []
+        for entry in entries:
+            index = entry["pdf_page"]
+            if index is not None and index not in first_lines:
+                lines = pdf_marks.text_lines(base, index)
+                first_lines[index] = lines[0]["text"] if lines else ""
+            listed.append(
+                {
+                    "level": entry["level"],
+                    "title": entry["title"],
+                    "page": (pdf_marks.tablet_page(index, page_map) if index is not None else None),
+                    "first_line": first_lines.get(index, ""),
+                }
+            )
+        return {
+            "outline": listed,
+            "source": "set with remarkable_pdf_outline" if new is not None else "the PDF's own",
+            "changed": changed,
+            "pdf": pdf_marks.build(base, marks, outline=new) if changed and build else None,
+        }
+
+    return edit
+
+
+def _outline_response(target, result: dict, dry_run: bool) -> str:
+    data = {
+        "document": target.VissibleName,
+        "outline": result["outline"],
+        "entries": len(result["outline"]),
+        "source": result["source"],
+        "changed": result["changed"],
+        "transport": "cloud",
+    }
+    if dry_run:
+        data["dry_run"] = True
+    name = target.VissibleName
+    if dry_run and result["changed"]:
+        hint = f"Dry run: nothing was written to '{name}'. Repeat without dry_run to apply."
+    elif result["changed"]:
+        hint = f"Outline of '{name}' updated. The tablet shows it after its next sync."
+    elif not result["outline"]:
+        hint = f"'{name}' has no outline."
+    else:
+        hint = f"No outline changes made on '{name}'."
     return make_response(data, hint)
 
 
@@ -3320,6 +3390,115 @@ def register_write_tools():
                         return make_error(
                             error_type="mark_failed",
                             message=f"Failed to change marks: {e}",
+                            suggestion="Check that the document is a PDF and try again.",
+                        )
+
+                return await asyncio.to_thread(_impl)
+
+            @mcp.tool(annotations=WRITE_ANNOTATIONS)
+            async def remarkable_pdf_outline(
+                document: str,
+                outline: Optional[Union[List[Dict[str, Any]], str]] = None,
+                dry_run: bool = False,
+            ):
+                """
+                <usecase>Read, set or remove a PDF document's outline: the table of
+                contents the tablet shows for it, e.g. chapter entries for a book
+                that has none.</usecase>
+                <instructions>
+                With no outline, lists the document's current outline. Each entry
+                gives its level, title, tablet page and the first line of text on
+                that page, so it can be checked against the page it points to.
+
+                outline replaces the whole outline: a list of entries
+                {"title": ..., "page": <tablet page, 1-based>, "level": <1 for
+                top-level, 2 for an entry under the one before, ...>} in reading
+                order; level defaults to 1 and may go at most one deeper than the
+                entry before it. [] removes the outline, and "original" restores
+                the PDF's own (or none, if it had none).
+
+                To build one for a book, find the chapter headings with
+                remarkable_read (its grep option finds lines such as "Chapter"),
+                then set every entry in one call. Use dry_run=True to check the
+                entries, with each page's first line, before writing.
+
+                The PDF's pages, the user's ink and marks added with
+                remarkable_mark_pdf are not changed; the tablet shows the new
+                table of contents after its next sync. Pages added on the tablet
+                are not in the PDF and cannot be outline targets.
+
+                Cloud mode only. PDF documents only.
+                </instructions>
+                <parameters>
+                - document: Document name or path
+                - outline: List of entries, [] to remove the outline, or "original"
+                - dry_run: Return the resulting outline without writing
+                </parameters>
+                <examples>
+                - remarkable_pdf_outline("Moby Dick")  # list the outline
+                - remarkable_pdf_outline("Moby Dick", outline=[
+                    {"title": "Etymology", "page": 3},
+                    {"title": "Chapter 1: Loomings", "page": 9},
+                    {"title": "Chapter 2: The Carpet-Bag", "page": 15}], dry_run=True)
+                - remarkable_pdf_outline("Field Guide", outline=[
+                    {"title": "Part I: Birds", "page": 5},
+                    {"title": "Raptors", "page": 7, "level": 2}])
+                - remarkable_pdf_outline("Moby Dick", outline="original")
+                </examples>
+                """
+                from remarkable_mcp.pdf_marks import MarkError
+
+                def invalid(message: str, suggestion: str) -> str:
+                    return make_error(
+                        error_type="invalid_parameter", message=message, suggestion=suggestion
+                    )
+
+                if isinstance(outline, str) and outline != "original":
+                    return invalid(
+                        'outline must be a list of entries, [] or "original".',
+                        'Example: outline=[{"title": "Chapter 1", "page": 3}]',
+                    )
+                writing = outline is not None and not dry_run
+
+                def _impl():
+                    error = _require_managed_write_mode()
+                    if error:
+                        return error
+                    client = get_rmapi()
+                    try:
+                        collection = client.get_meta_items()
+                        items_by_id = get_items_by_id(collection)
+                        target = _resolve_document(document, collection, items_by_id)
+                        if not target:
+                            from remarkable_mcp.extract import find_similar_documents
+
+                            similar = find_similar_documents(document, collection)
+                            return make_error(
+                                error_type="document_not_found",
+                                message=f"Document not found: '{document}'",
+                                suggestion="Use remarkable_browse() to find the correct name.",
+                                did_you_mean=similar if similar else None,
+                            )
+                        if target.is_folder:
+                            return invalid(
+                                f"'{target.VissibleName}' is a folder.",
+                                "Give a PDF document instead.",
+                            )
+                        edit = _outline_editor(outline, build=writing)
+                        if writing:
+                            result = client.replace_document_pdf(target.ID, edit)
+                            if result["changed"]:
+                                _invalidate_client_cache(client)
+                        else:
+                            pdf, content, _ = client.read_document_pdf(target.ID)
+                            result = edit(pdf, content)
+                        return _outline_response(target, result, dry_run)
+                    except MarkError as e:
+                        return invalid(str(e), "Fix the outline and try again.")
+                    except Exception as e:
+                        return make_error(
+                            error_type="outline_failed",
+                            message=f"Failed to change the outline: {e}",
                             suggestion="Check that the document is a PDF and try again.",
                         )
 
