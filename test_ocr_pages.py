@@ -6,7 +6,7 @@ from pathlib import Path
 
 from PIL import Image, ImageDraw
 
-from remarkable_mcp import extract
+from remarkable_mcp import extract, ocr
 from remarkable_mcp.exporters import ExportMetadata, write_markdown_export
 
 
@@ -48,7 +48,7 @@ def test_vision_lines_follow_detected_breaks():
             }
         ]
     }
-    assert extract._vision_lines(annotation) == [
+    assert ocr.vision_lines(annotation) == [
         ("x = 3", (10, 10, 50, 30)),
         ("check", (10, 50, 60, 70)),
     ]
@@ -128,9 +128,9 @@ def test_tesseract_found_outside_path(monkeypatch, tmp_path):
     program.write_text("")
     monkeypatch.setattr(pytesseract.pytesseract, "tesseract_cmd", "tesseract")
     monkeypatch.setenv("PATH", "/nonexistent")
-    monkeypatch.setattr(extract, "TESSERACT_LOCATIONS", ("/missing", str(program)))
+    monkeypatch.setattr(ocr, "TESSERACT_LOCATIONS", ("/missing", str(program)))
 
-    assert extract.tesseract_module().pytesseract.tesseract_cmd == str(program)
+    assert ocr.tesseract_module().pytesseract.tesseract_cmd == str(program)
 
 
 def test_tesseract_words_are_put_in_reading_order():
@@ -142,7 +142,7 @@ def test_tesseract_words_are_put_in_reading_order():
         ("FORTY", (120, 8, 200, 38)),
         ("STEP", (90, 58, 150, 88)),
     ]
-    assert [text for text, _ in extract._rows(words)] == [
+    assert [text for text, _ in ocr._rows(words)] == [
         "ANSWER FORTY WRONG",
         "CHECK STEP TWO",
     ]
@@ -159,7 +159,7 @@ def test_tesseract_lines_carry_confidence_and_flag_low_ones():
         ("=", (12, 0, 20, 10), 30.0),
         ("4", (22, 0, 30, 10), 30.0),
     ]
-    (line,) = extract._rows(words)
+    (line,) = ocr._rows(words)
     assert line[0] == "x = 4" and line[2] == 50
     (entry,) = extract._tag_line_layers([line], [])
     assert entry == {"text": "x = 4", "confidence": 50, "low_confidence": True}

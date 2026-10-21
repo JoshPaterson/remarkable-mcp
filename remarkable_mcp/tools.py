@@ -28,7 +28,7 @@ from mcp.types import (
     ToolAnnotations,
 )
 
-from remarkable_mcp import export_save
+from remarkable_mcp import export_save, ocr
 from remarkable_mcp.api import (
     REMARKABLE_TOKEN,
     document_version,
@@ -58,7 +58,6 @@ from remarkable_mcp.extract import (
     get_cached_ocr_result,
     get_document_file_type,
     get_document_page_count,
-    get_ocr_backend,
     get_page_layers_from_document_zip,
     render_mapped_pdf_page_from_document_zip,
     render_merged_page_from_document_zip,
@@ -386,95 +385,6 @@ def _count_pdf_pages(pdf_bytes: bytes) -> int:
 
     with fitz.open(stream=pdf_bytes, filetype="pdf") as document:
         return len(document)
-
-
-def _ocr_png_tesseract(png_path: Path) -> Optional[str]:
-    """
-    OCR a PNG file using Tesseract.
-
-    Args:
-        png_path: Path to the PNG file
-
-    Returns:
-        Extracted text, or None if OCR failed
-    """
-    try:
-        from PIL import Image as PILImage
-        from PIL import ImageFilter, ImageOps
-
-        from remarkable_mcp.extract import tesseract_module
-
-        pytesseract = tesseract_module()
-
-        img = PILImage.open(png_path)
-
-        # Convert to grayscale
-        img = img.convert("L")
-
-        # Increase contrast
-        img = ImageOps.autocontrast(img, cutoff=2)
-
-        # Slight sharpening
-        img = img.filter(ImageFilter.SHARPEN)
-
-        # Run OCR with settings optimized for sparse handwriting
-        custom_config = r"--psm 11 --oem 3"
-        text = pytesseract.image_to_string(img, config=custom_config)
-
-        return text.strip() if text.strip() else None
-
-    except ImportError:
-        return None
-    except Exception:
-        return None
-
-
-def _ocr_png_google_vision(png_path: Path) -> Optional[str]:
-    """
-    OCR a PNG file using Google Cloud Vision API.
-
-    Args:
-        png_path: Path to the PNG file
-
-    Returns:
-        Extracted text, or None if OCR failed
-    """
-    import base64
-
-    import requests
-
-    api_key = os.environ.get("GOOGLE_VISION_API_KEY")
-    if not api_key:
-        return None
-
-    try:
-        with open(png_path, "rb") as f:
-            image_content = base64.b64encode(f.read()).decode("utf-8")
-
-        url = f"https://vision.googleapis.com/v1/images:annotate?key={api_key}"
-        payload = {
-            "requests": [
-                {
-                    "image": {"content": image_content},
-                    "features": [{"type": "DOCUMENT_TEXT_DETECTION"}],
-                }
-            ]
-        }
-
-        response = requests.post(url, json=payload, timeout=60)
-        if response.status_code == 200:
-            data = response.json()
-            if "responses" in data and data["responses"]:
-                resp = data["responses"][0]
-                if "fullTextAnnotation" in resp:
-                    text = resp["fullTextAnnotation"]["text"]
-                    return text.strip() if text.strip() else None
-
-    except Exception:
-        # Silently fail - OCR is best-effort and caller will handle None
-        pass
-
-    return None
 
 
 @mcp.tool(annotations=READ_ANNOTATIONS)
@@ -2456,24 +2366,7 @@ async def remarkable_image(
                 ocr_text = None
                 ocr_backend_used = None
                 if include_ocr:
-                    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as ocr_tmp:
-                        ocr_tmp.write(png_data)
-                        ocr_tmp_path = Path(ocr_tmp.name)
-                    try:
-                        backend = get_ocr_backend()
-                        use_google = backend == "google" or (
-                            backend == "auto" and os.environ.get("GOOGLE_VISION_API_KEY")
-                        )
-                        if use_google:
-                            ocr_text = await run_blocking(_ocr_png_google_vision, ocr_tmp_path)
-                            if ocr_text:
-                                ocr_backend_used = "google"
-                        if ocr_text is None:
-                            ocr_text = await run_blocking(_ocr_png_tesseract, ocr_tmp_path)
-                            if ocr_text:
-                                ocr_backend_used = "tesseract"
-                    finally:
-                        ocr_tmp_path.unlink(missing_ok=True)
+                    ocr_text, ocr_backend_used = await run_blocking(ocr.image_text, png_data)
 
                 uri_suffix = ".merged.png" if is_merged else ".png"
                 resource_uri = f"remarkableimg:///{uri_path}.page-{page}{uri_suffix}"

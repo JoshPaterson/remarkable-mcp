@@ -23,6 +23,8 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import pymupdf
 
+from remarkable_mcp import ocr
+
 # A page needs OCR when it has no text but images cover at least this share
 # of it (a scan), rather than being blank.
 SCAN_COVERAGE = 0.5
@@ -36,11 +38,8 @@ FONT_NAME = "ocrtext"
 
 # A word: (text, x0, y0, x1, y1) in image pixels, then the id of its line;
 # words of one line are written together, in order.
-Word = tuple
-
-
-class OcrError(Exception):
-    """OCR cannot be run (no backend) or failed."""
+Word = ocr.Word
+OcrError = ocr.OcrError
 
 
 def pages_needing_ocr(pdf_bytes: bytes) -> Dict[str, List[int]]:
@@ -72,99 +71,9 @@ def _render(page: "pymupdf.Page") -> Tuple[bytes, float]:
     return pix.tobytes("png"), zoom
 
 
-def tesseract_words(png: bytes) -> List[Word]:
-    """Words found by Tesseract (page layout analysis, for printed pages)."""
-    import io
-
-    from PIL import Image
-
-    pytesseract = _tesseract()
-    data = pytesseract.image_to_data(
-        Image.open(io.BytesIO(png)), config="--psm 3 --oem 3", output_type=pytesseract.Output.DICT
-    )
-    words = []
-    for i, text in enumerate(data["text"]):
-        text = str(text).strip()
-        if not text or float(data["conf"][i]) < 0:
-            continue
-        x, y, w, h = data["left"][i], data["top"][i], data["width"][i], data["height"][i]
-        line = f"{data['block_num'][i]}.{data['par_num'][i]}.{data['line_num'][i]}"
-        words.append((text, x, y, x + w, y + h, line))
-    return words
-
-
-def google_words(png: bytes, api_key: str) -> List[Word]:
-    """Words found by Google Vision's document text detection."""
-    import base64
-
-    import requests
-
-    response = requests.post(
-        f"https://vision.googleapis.com/v1/images:annotate?key={api_key}",
-        json={
-            "requests": [
-                {
-                    "image": {"content": base64.b64encode(png).decode("ascii")},
-                    "features": [{"type": "DOCUMENT_TEXT_DETECTION"}],
-                }
-            ]
-        },
-        timeout=120,
-    )
-    if response.status_code != 200:
-        raise OcrError(f"Google Vision returned {response.status_code}.")
-    annotation = (response.json().get("responses") or [{}])[0].get("fullTextAnnotation") or {}
-    words, line = [], 0
-    for page in annotation.get("pages") or []:
-        for block in page.get("blocks") or []:
-            for paragraph in block.get("paragraphs") or []:
-                line += 1
-                for word in paragraph.get("words") or []:
-                    symbols = word.get("symbols") or []
-                    text = "".join(s.get("text", "") for s in symbols)
-                    vertices = (word.get("boundingBox") or {}).get("vertices") or []
-                    if text.strip() and vertices:
-                        xs = [v.get("x", 0) for v in vertices]
-                        ys = [v.get("y", 0) for v in vertices]
-                        words.append((text, min(xs), min(ys), max(xs), max(ys), line))
-                    end = (
-                        ((symbols[-1].get("property") or {}).get("detectedBreak") or {}).get("type")
-                        if symbols
-                        else None
-                    )
-                    if end in ("EOL_SURE_SPACE", "LINE_BREAK", "HYPHEN"):
-                        line += 1
-    return words
-
-
-def _tesseract():
-    """``pytesseract``, finding Homebrew's Tesseract when it is not on PATH."""
-    import shutil
-
-    try:
-        import pytesseract
-    except ImportError as e:
-        raise OcrError("OCR needs pytesseract and Tesseract installed.") from e
-    if shutil.which(pytesseract.pytesseract.tesseract_cmd) is None:
-        for path in ("/opt/homebrew/bin/tesseract", "/usr/local/bin/tesseract"):
-            if os.path.exists(path):
-                pytesseract.pytesseract.tesseract_cmd = path
-                break
-        else:
-            raise OcrError("Tesseract is not installed (brew install tesseract).")
-    return pytesseract
-
-
 def ocr_backend() -> Tuple[str, Callable[[bytes], List[Word]]]:
     """``(name, words_fn)``: Google Vision when an API key is set, else Tesseract."""
-    from remarkable_mcp.extract import get_ocr_backend
-
-    api_key = os.environ.get("GOOGLE_VISION_API_KEY")
-    choice = get_ocr_backend()
-    if api_key and choice in ("auto", "google"):
-        return "google", lambda png: google_words(png, api_key)
-    _tesseract()
-    return "tesseract", tesseract_words
+    return ocr.pdf_words_backend()
 
 
 def _lines(words: List[Word]) -> List[Word]:

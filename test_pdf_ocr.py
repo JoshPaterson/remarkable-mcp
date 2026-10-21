@@ -7,7 +7,7 @@ from unittest.mock import patch
 import pymupdf
 import pytest
 
-from remarkable_mcp import pdf_marks, pdf_ocr
+from remarkable_mcp import ocr, pdf_marks, pdf_ocr
 from remarkable_mcp.server import mcp
 from test_mark_pdf import A4, CONTENT, FakeCloud, _mark_tool  # noqa: F401
 
@@ -80,7 +80,7 @@ def test_work_resumes_after_the_time_budget(tmp_path):
 def test_tesseract_reads_a_scanned_page():
     doc = pymupdf.open(stream=_book(), filetype="pdf")
     png, zoom = pdf_ocr._render(doc[1])
-    words = pdf_ocr.tesseract_words(png)
+    words = ocr.tesseract_words(png)
     assert "Chapter" in [w[0] for w in words]
     pdf_ocr.add_text_layer(doc, 1, words, zoom)
     assert "Chapter One" in doc[1].get_text()
