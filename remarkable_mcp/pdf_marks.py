@@ -136,7 +136,7 @@ DEFAULT_TEXT_SIZE = 11.0
 DEFAULT_LATEX_SIZE = 12.0
 DEFAULT_SYMBOL_SIZE = 12.0
 DEFAULT_LINE_WIDTH = 1.5
-MAX_PATH_CHARS = 20_000
+MAX_PATH_CHARS = 200_000
 MAX_DESCRIPTION_CHARS = 200
 # Placement with "near": marks keep this clearance (page fraction) from ink,
 # printed text and other marks, stay inside PAGE_BOUNDS, and are looked for
@@ -1239,6 +1239,13 @@ def summarize(
         out["color"] = mark.get("color_name")
         if cover_state:
             out["state"] = cover_state
+    elif isinstance(mark.get("ink"), dict):
+        out["color"] = mark["ink"].get("color")
+        out["erasable"] = True
+        if mark["ink"].get("layer"):
+            out["layer"] = mark["ink"]["layer"]
+        if cover_state:
+            out["state"] = cover_state
     elif mark.get("color"):
         out["color"] = color_name(mark["color"], _palette(mark.get("shape")))
     if "from" in mark:
@@ -1647,6 +1654,17 @@ def edit_marks(
         try:
             description = _description(request.get("description"))
             cover = _cover(request)
+            ink = None
+            if options.get("erasable") is True:
+                from remarkable_mcp.ink_marks import erasable_request
+
+                if cover:
+                    raise MarkError("An erasable mark cannot have a cover; it can be erased.")
+                original = options
+                options, ink = erasable_request(options, color, sizes[pdf_page])
+            elif "erasable" in options:
+                if options.pop("erasable") is not False:
+                    raise MarkError("erasable must be true or false.")
             if "text_highlight" in options:
                 if cover:
                     raise MarkError("A text highlight cannot have a cover; it can be erased.")
@@ -1665,9 +1683,22 @@ def edit_marks(
                 stored = _render_near(options, sizes[pdf_page], color, blocked, printed)
             else:
                 stored = render_mark(options, sizes[pdf_page], color)
+            if ink is not None and "text" in original:
+                stored.pop("path", None)
+                stored.update(
+                    kind="text",
+                    text=original["text"],
+                    request={
+                        k: v
+                        for k, v in original.items()
+                        if k not in ("color", "erasable", "layer", "text")
+                    },
+                )
         except MarkError as e:
             raise MarkError(f"Mark '{mark_id}': {e}") from None
         mark = {"id": mark_id, "pdf_page": pdf_page, **stored}
+        if ink is not None:
+            mark["ink"] = ink
         if description:
             mark["description"] = description
         if cover:

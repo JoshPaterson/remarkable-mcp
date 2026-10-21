@@ -1368,7 +1368,7 @@ def _mark_editor(
     def edit(pdf: bytes, content: dict, read_ink=None) -> dict:
         """``read_ink(page_id)`` returns a page's ink file (or None); it is
         needed to write marks' covers and report their state."""
-        from remarkable_mcp import cover_layers, text_highlights
+        from remarkable_mcp import cover_layers, ink_marks, text_highlights
         from remarkable_mcp.pages import content_page_ids
 
         base, marks = pdf_marks.load_state(pdf)
@@ -1437,6 +1437,27 @@ def _mark_editor(
                 )
             except text_highlights.HighlightError as e:
                 raise pdf_marks.MarkError(str(e)) from None
+        inks = [m.get("ink") for m in marks + result["marks"]]
+        if build and result["changed"] and any(isinstance(i, dict) for i in inks):
+            if read_ink is None:
+                raise pdf_marks.MarkError("Erasable marks cannot be written here.")
+            written_so_far = result["ink"]
+            try:
+                result["ink"] = dict(
+                    written_so_far,
+                    **ink_marks.write_mark_ink(
+                        marks,
+                        result["marks"],
+                        result["removed"],
+                        page_ids=page_ids,
+                        page_map=page_map,
+                        sizes=pdf_marks.page_sizes(base),
+                        read_ink=lambda page_id: written_so_far.get(page_id) or read_ink(page_id),
+                        author=cover_layers.author_uuid(),
+                    ),
+                )
+            except ink_marks.InkError as e:
+                raise pdf_marks.MarkError(str(e)) from None
         result["cover_states"], cover_notes = {}, []
         if read_ink is not None:
             written = result["ink"]
@@ -1445,6 +1466,14 @@ def _mark_editor(
                 page_ids=page_ids,
                 page_map=page_map,
                 read_ink=lambda page_id: written.get(page_id) or read_ink(page_id),
+            )
+            result["cover_states"].update(
+                ink_marks.mark_ink_states(
+                    result["marks"],
+                    page_ids=page_ids,
+                    page_map=page_map,
+                    read_ink=lambda page_id: written.get(page_id) or read_ink(page_id),
+                )
             )
             result["cover_states"].update(
                 text_highlights.mark_highlight_states(
@@ -3928,6 +3957,15 @@ def register_write_tools():
                   or data: URIs.
                 - graphic_file: path of such a file on the machine running this
                   server (up to 10 MB), with region
+                Text, shape (including highlight) and path marks can take
+                "erasable": true: they are written as tablet ink instead of
+                into the PDF, so the user can erase, move or recolor them on the
+                tablet, and their colors match in every app. Text is drawn in a
+                single-stroke font (bold is a thicker line); shapes, paths and
+                leaders with a pen, highlights with the highlighter. Named
+                colors only (pen colors; highlighter colors for highlights), no
+                fill or opacity; option layer as for text_highlight. Listings
+                give their state: on tablet, partly erased or erased on tablet.
                 - text_highlight: text on the page to highlight as the tablet's
                   own highlighter does (the user can erase it on the tablet);
                   it may run over several lines. Options: color (a highlighter
