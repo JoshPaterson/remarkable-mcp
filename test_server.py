@@ -6,6 +6,7 @@ Focused handler tests call MCPServer directly. Dual-era protocol behavior is
 covered through SDK v2's first-class in-memory Client in test_mcp_v2.py.
 """
 
+import hashlib
 import io
 import json
 import os
@@ -4056,13 +4057,46 @@ class TestCloudBlobCache:
 
         mock_request.return_value = self._response(content=b"blob-bytes")
         client = RemarkableClient(user_token="user-token")
+        blob_hash = hashlib.sha256(b"blob-bytes").hexdigest()
 
-        first = client._get_file("hash-a", "a.docSchema")
-        second = client._get_file("hash-a", "a.docSchema")
+        first = client._get_file(blob_hash, "a.pdf")
+        second = client._get_file(blob_hash, "a.pdf")
 
         assert first == b"blob-bytes"
         assert second == b"blob-bytes"
         assert mock_request.call_count == 1
+
+    @patch("remarkable_mcp.sync._http_request_with_retry")
+    def test_doc_index_cached_under_hash_entries(self, mock_request):
+        """Schema-3 document indexes (stored under HashEntries) are cache hits."""
+        from remarkable_mcp.sync import RemarkableClient, _hash_entries
+
+        child = hashlib.sha256(b"page").hexdigest()
+        body = f"3\n{child}:0:doc/p.rm:0:4\n".encode()
+        mock_request.return_value = self._response(content=body)
+        client = RemarkableClient(user_token="user-token")
+        index_hash = _hash_entries(client._parse_index(body))
+
+        assert client._get_file(index_hash, "doc.docSchema") == body
+        assert client._get_file(index_hash, "doc.docSchema") == body
+        assert mock_request.call_count == 1
+
+    @patch("remarkable_mcp.sync._http_request_with_retry")
+    def test_corrupted_cache_entry_is_refetched(self, mock_request):
+        """A cached blob that no longer matches its hash is a cache miss."""
+        from remarkable_mcp import sync
+        from remarkable_mcp.sync import RemarkableClient
+
+        good = b"blob-bytes"
+        blob_hash = hashlib.sha256(good).hexdigest()
+        mock_request.return_value = self._response(content=good)
+        client = RemarkableClient(user_token="user-token")
+        client._get_file(blob_hash, "a.pdf")
+        (sync._cache_dir() / blob_hash).write_bytes(b"blob-by")
+
+        assert client._get_file(blob_hash, "a.pdf") == good
+        assert mock_request.call_count == 2
+        assert (sync._cache_dir() / blob_hash).read_bytes() == good
 
     @patch("remarkable_mcp.sync._http_request_with_retry")
     def test_different_hash_is_refetched(self, mock_request):

@@ -443,14 +443,37 @@ class RemarkableClient:
 
         return response
 
+    def _blob_matches_hash(self, content: bytes, file_hash: str) -> bool:
+        """Whether ``content`` is the blob stored under ``file_hash``.
+
+        File blobs and schema-4 indexes are stored under ``sha256(body)``;
+        schema-3 document indexes under ``HashEntries`` of their entries.
+        """
+        if hashlib.sha256(content).hexdigest() == file_hash:
+            return True
+        if not content.startswith(b"3\n"):
+            return False
+        try:
+            return _hash_entries(self._parse_index(content)) == file_hash
+        except Exception:
+            return False
+
     def _cache_read(self, file_hash: str) -> Optional[bytes]:
-        """Return cached bytes for a content hash, or None on miss/disabled."""
+        """Return cached bytes for a content hash, or None on miss/disabled.
+
+        A cached blob whose bytes do not match its hash (a truncated or
+        corrupted file) is deleted and treated as a miss.
+        """
         if not _cache_enabled():
             return None
         try:
             path = _cache_dir() / file_hash
             if path.is_file():
-                return path.read_bytes()
+                content = path.read_bytes()
+                if self._blob_matches_hash(content, file_hash):
+                    return content
+                logger.debug(f"Blob cache entry {file_hash} does not match its hash; refetching")
+                path.unlink(missing_ok=True)
         except Exception as e:  # pragma: no cover - cache must never break fetches
             logger.debug(f"Blob cache read failed for {file_hash}: {e}")
         return None
