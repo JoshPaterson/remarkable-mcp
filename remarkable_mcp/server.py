@@ -303,8 +303,9 @@ synced. Each call reads the current cloud state (cached blobs are immutable
 content, so they never go stale). If results disagree with what the user sees
 at my.remarkable.com or in the desktop app, say so rather than relying on them.
 
-Known tablet sync problem (firmware; seen on the reMarkable 2, not yet tested
-on the Paper Pro): after a capture is pasted into a document, the tablet may
+Known tablet sync problem (firmware; only seen on the reMarkable 2; paste
+tests on a Paper Pro synced normally): after a capture is pasted into a
+document, a reMarkable 2 may
 stop syncing that document until it is restarted, while its own sync check
 reports no problem. Signs: pages blank or missing recent marks, few annotations
 on a document the user says is finished, a tag the user added is missing.
