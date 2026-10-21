@@ -159,3 +159,16 @@ async def test_ocr_without_marks_does_not_embed_a_copy(cloud):
 async def test_folder_needs_check(cloud):
     data = await _ocr(folder="/")
     assert data["_error"]["type"] == "invalid_parameter"
+
+
+def test_words_of_a_line_are_written_together():
+    doc = pymupdf.open(stream=_book(), filetype="pdf")
+    words = [
+        ("waste", 100, 150, 200, 200, "1.1.1"),
+        ("crown", 210, 150, 320, 200, "1.1.1"),
+        ("land", 100, 220, 180, 270, "1.1.2"),
+    ]
+    assert pdf_ocr.add_text_layer(doc, 1, words, 300 / 72) == 2
+    out = pymupdf.open("pdf", doc.tobytes())
+    assert out[1].get_text().splitlines() == ["waste crown", "land"]
+    assert out[1].search_for("waste crown")
