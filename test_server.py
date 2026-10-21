@@ -2434,6 +2434,30 @@ class TestUSBWebInterface:
         content = client.download(doc)
         assert content == b"fake zip content"
 
+    @patch("requests.request")
+    def test_usb_web_without_rmdoc_returns_native_pdf_once(self, mock_request):
+        """Firmware without rmdoc falls back to the rendered PDF, fetched once."""
+        from remarkable_mcp.usb_web import Document, USBWebClient
+
+        def fake_request(method, url, **kwargs):
+            response = Mock(status_code=200, content=b"%PDF-1.7 rendered")
+            if url.endswith("/rmdoc"):
+                response.raise_for_status.side_effect = requests.HTTPError("404 Not Found")
+            return response
+
+        mock_request.side_effect = fake_request
+        client = USBWebClient()
+        doc = Document(id="doc1", hash="doc1", name="Test", doc_type="DocumentType")
+
+        assert client.download(doc) == b"%PDF-1.7 rendered"
+        mock_request.reset_mock()
+        assert client.download_raw_file(doc, "pdf") == b"%PDF-1.7 rendered"
+        assert [c.args[1].rsplit("/", 1)[-1] for c in mock_request.call_args_list] == [
+            "rmdoc",
+            "pdf",
+        ]
+        assert client.download_raw_file(doc, "epub") is None
+
     @patch("remarkable_mcp.usb_web.time.sleep")
     @patch("requests.request")
     def test_usb_web_get_retries_408_until_success(self, mock_request, mock_sleep):

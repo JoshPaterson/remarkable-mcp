@@ -372,10 +372,15 @@ class USBWebClient:
 
     def download(self, doc: Document) -> bytes:
         """
-        Download a document's content as a zip file.
+        Download a document's content.
 
-        Uses the /download/{guid}/rmdoc endpoint (requires firmware v3.9+).
-        Returns the raw .rmdoc archive which is essentially a zip file.
+        Uses the /download/{guid}/rmdoc endpoint (requires firmware v3.9+) and
+        returns the .rmdoc archive, a zip with the same layout as the other
+        transports' downloads. Older firmware has no rmdoc endpoint; then the
+        tablet-rendered PDF from /download/{guid}/pdf is returned instead.
+        Callers detect that native PDF payload (it starts with ``%PDF``) and
+        report that annotations are unavailable rather than treating the
+        flattened PDF as a document archive.
         """
         endpoint = DOWNLOAD_URL.format(guid=doc.id)
         try:
@@ -408,6 +413,9 @@ class USBWebClient:
         # Try extracting from the .rmdoc archive first
         try:
             rmdoc_data = self.download(doc)
+            if rmdoc_data.lstrip().startswith(b"%PDF"):
+                # Firmware without rmdoc already returned the rendered PDF.
+                return rmdoc_data if ext == "pdf" else None
             import io
             import zipfile
 
