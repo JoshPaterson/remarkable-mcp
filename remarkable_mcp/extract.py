@@ -3331,7 +3331,10 @@ TESSERACT_OCR_SIZE = (2106, 2808)
 # line's ink, relative to the layer that drew the most there.
 LINE_LAYER_SHARE = 0.2
 
-OcrLine = Tuple[str, Tuple[float, float, float, float]]
+# An OCR line: (text, pixel box), plus Tesseract's confidence (0-100).
+OcrLine = tuple
+# Tesseract lines below this confidence are marked low_confidence.
+LOW_CONFIDENCE = 80
 
 
 def extract_handwriting_ocr(
@@ -3443,8 +3446,17 @@ def _tag_line_layers(
     box is at least ``LINE_LAYER_SHARE`` of the most any layer drew there;
     with fewer, lines carry no layers.
     """
+
+    def entry(line: OcrLine) -> Dict[str, Any]:
+        out: Dict[str, Any] = {"text": line[0]}
+        if len(line) > 2:
+            out["confidence"] = line[2]
+            if line[2] < LOW_CONFIDENCE:
+                out["low_confidence"] = True
+        return out
+
     if len(layer_pngs) < 2:
-        return [{"text": text} for text, _ in lines]
+        return [entry(line) for line in lines]
     import io
 
     from PIL import Image
@@ -3454,12 +3466,13 @@ def _tag_line_layers(
         alpha = Image.open(io.BytesIO(png)).convert("RGBA").getchannel("A")
         masks.append((name, alpha.point(lambda v: 255 if v > 32 else 0)))
     out = []
-    for text, (x0, y0, x1, y1) in lines:
+    for line in lines:
+        x0, y0, x1, y1 = line[1]
         box = (int(x0), int(y0), max(int(x0) + 1, int(x1)), max(int(y0) + 1, int(y1)))
         counts = [(name, mask.crop(box).histogram()[255]) for name, mask in masks]
         most = max(count for _, count in counts)
         layers = [name for name, count in counts if most and count >= most * LINE_LAYER_SHARE]
-        out.append({"text": text, "layers": layers})
+        out.append(dict(entry(line), layers=layers))
     return out
 
 
@@ -3659,7 +3672,8 @@ def _tesseract_lines(png: bytes) -> List[OcrLine]:
         key = (data["block_num"][i], data["par_num"][i], data["line_num"][i])
         left, top = data["left"][i], data["top"][i]
         box = (left, top, left + data["width"][i], top + data["height"][i])
-        grouped.setdefault(key, []).append((word, box))
+        confidence = max(0.0, float(data["conf"][i]))
+        grouped.setdefault(key, []).append((word, box, confidence))
     return _rows([word for words in grouped.values() for word in words])
 
 
@@ -3670,10 +3684,10 @@ def _rows(words: List[OcrLine]) -> List[OcrLine]:
     order."""
     rows: List[List[OcrLine]] = []
     for word in sorted(words, key=lambda w: (w[1][1] + w[1][3]) / 2):
-        _, (_, top, _, bottom) = word
+        _, top, _, bottom = word[1]
         for row in rows:
-            row_top = min(b[1] for _, b in row)
-            row_bottom = max(b[3] for _, b in row)
+            row_top = min(w[1][1] for w in row)
+            row_bottom = max(w[1][3] for w in row)
             overlap = min(bottom, row_bottom) - max(top, row_top)
             if overlap >= 0.5 * min(bottom - top, row_bottom - row_top):
                 row.append(word)
@@ -3683,14 +3697,19 @@ def _rows(words: List[OcrLine]) -> List[OcrLine]:
     lines: List[OcrLine] = []
     for row in rows:
         row.sort(key=lambda w: w[1][0])
-        boxes = [box for _, box in row]
+        boxes = [w[1] for w in row]
         box = (
             min(b[0] for b in boxes),
             min(b[1] for b in boxes),
             max(b[2] for b in boxes),
             max(b[3] for b in boxes),
         )
-        lines.append((" ".join(text for text, _ in row), box))
+        line: tuple = (" ".join(w[0] for w in row), box)
+        if all(len(w) > 2 for w in row):
+            # Confidence weighted by word length.
+            chars = sum(len(w[0]) for w in row)
+            line += (round(sum(w[2] * len(w[0]) for w in row) / chars),)
+        lines.append(line)
     return sorted(lines, key=lambda line: line[1][1])
 
 
@@ -3715,8 +3734,12 @@ def ocr_page_text(entry: Dict[str, Any]) -> str:
     order; on pages with several layers each line ends with its layers."""
     out = [f"--- Page {entry['page']} ---"]
     for line in entry["lines"]:
-        layers = line.get("layers")
-        out.append(f"{line['text']}  [{', '.join(layers)}]" if layers else line["text"])
+        text = line["text"]
+        if line.get("layers"):
+            text += f"  [{', '.join(line['layers'])}]"
+        if line.get("low_confidence"):
+            text += " (low confidence)"
+        out.append(text)
     return "\n".join(out)
 
 

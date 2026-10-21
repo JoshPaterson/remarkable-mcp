@@ -151,3 +151,30 @@ def test_tesseract_words_are_put_in_reading_order():
 def test_ocr_image_keeps_the_writings_proportions():
     svg = '<svg viewBox="-10 5 400 100" width="400" height="100"></svg>'
     assert extract._ocr_image_size(svg, (2106, 2808)) == (2106, 526)
+
+
+def test_tesseract_lines_carry_confidence_and_flag_low_ones():
+    words = [
+        ("x", (0, 0, 10, 10), 90.0),
+        ("=", (12, 0, 20, 10), 30.0),
+        ("4", (22, 0, 30, 10), 30.0),
+    ]
+    (line,) = extract._rows(words)
+    assert line[0] == "x = 4" and line[2] == 50
+    (entry,) = extract._tag_line_layers([line], [])
+    assert entry == {"text": "x = 4", "confidence": 50, "low_confidence": True}
+    page = {"page": 4, "lines": [entry]}
+    assert extract.ocr_page_text(page) == "--- Page 4 ---\nx = 4 (low confidence)"
+
+
+def test_read_notes_that_tesseract_handwriting_is_approximate():
+    from remarkable_mcp.tools import _ocr_reliability_note
+
+    handwriting = [
+        {"page": 2, "lines": [{"text": "a", "confidence": 90}]},
+        {"page": 5, "lines": [{"text": "b", "confidence": 20, "low_confidence": True}]},
+    ]
+    note = _ocr_reliability_note(handwriting, "tesseract", "Sheet")
+    assert "approximate" in note and "remarkable_image('Sheet', page=N)" in note
+    assert note.endswith("(low-confidence lines on page 5).")
+    assert _ocr_reliability_note(handwriting, "google", "Sheet") is None

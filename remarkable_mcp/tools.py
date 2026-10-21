@@ -924,6 +924,12 @@ async def remarkable_read(
                 result["grep_matches"] = grep_matches
 
             hint_parts = [f"Notebook content page {page}/{content_pages}; {physical_page_summary}."]
+            ocr_note = _ocr_reliability_note(
+                result.get("handwriting"), ocr_backend_used, target_doc.VissibleName
+            )
+            if ocr_note:
+                result["ocr_note"] = ocr_note
+                hint_parts.append(ocr_note)
             if has_more:
                 doc_name = target_doc.VissibleName
                 hint_parts.append(f"Next: remarkable_read('{doc_name}', page={page + 1}).")
@@ -1128,6 +1134,15 @@ async def remarkable_read(
         if page_count_note:
             result["page_count_note"] = page_count_note
             hint_parts.append(page_count_note)
+
+        ocr_note = _ocr_reliability_note(
+            result.get("handwriting"),
+            ocr_backend_used or (content or {}).get("ocr_backend"),
+            document,
+        )
+        if ocr_note:
+            result["ocr_note"] = ocr_note
+            hint_parts.append(ocr_note)
 
         if content_type == "text" and not raw_available and file_type in ("pdf", "epub"):
             hint_parts.append(
@@ -2709,6 +2724,26 @@ def _mark_line(summary: dict) -> str:
     if summary.get("description"):
         line += f" [description: {summary['description']}]"
     return line
+
+
+def _ocr_reliability_note(handwriting, backend, document: str) -> Optional[str]:
+    """For Tesseract OCR of handwriting: a note that the text is approximate,
+    naming the pages with low-confidence lines to view first."""
+    if backend != "tesseract" or not handwriting:
+        return None
+    doubtful = [
+        entry["page"]
+        for entry in handwriting
+        if any(line.get("low_confidence") for line in entry.get("lines") or [])
+    ]
+    note = (
+        "Handwriting OCR is from Tesseract and only approximate; view a page with "
+        f"remarkable_image('{document}', page=N) before relying on its text"
+    )
+    if doubtful:
+        pages = ", ".join(str(p) for p in doubtful)
+        note += f" (low-confidence lines on page{'s' if len(doubtful) > 1 else ''} {pages})"
+    return note + "."
 
 
 class _ExportRequestError(Exception):
