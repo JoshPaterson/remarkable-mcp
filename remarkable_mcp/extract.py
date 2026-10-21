@@ -2207,14 +2207,16 @@ def _pdf_page_index_for_cpages_entry(entry: Dict[str, Any]) -> Optional[int]:
         entry: A single cPages page entry dict
 
     Returns:
-        0-based PDF page index, or None if no redirect exists
+        0-based PDF page index, or None if no redirect exists or it is negative
+        (a page with no PDF underlay)
     """
     redir = entry.get("redir", {})
     if isinstance(redir, dict) and "value" in redir:
         try:
-            return int(redir["value"])
+            index = int(redir["value"])
         except (ValueError, TypeError):
             return None
+        return index if index >= 0 else None
     return None
 
 

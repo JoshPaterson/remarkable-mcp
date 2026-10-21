@@ -69,6 +69,25 @@ def test_formatversion2_cpages_redir_still_works():
         assert _resolve_pdf_page_index(tmp, 2) == 1
 
 
+def test_formatversion2_negative_redir_has_no_underlay():
+    """A negative redir must not index the PDF from its end."""
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        _write_content(
+            tmp,
+            {
+                "cPages": {
+                    "pages": [
+                        {"id": "a", "redir": {"value": 0}},
+                        {"id": "b", "redir": {"value": -1}},
+                    ]
+                }
+            },
+        )
+        assert _resolve_pdf_page_index(tmp, 1) == 0
+        assert _resolve_pdf_page_index(tmp, 2) is None
+
+
 def test_cpages_is_authoritative_over_stale_redirection_page_map():
     """A v2 user-added page (cPages entry without redir) must resolve to None.
 
