@@ -1,62 +1,8 @@
-"""
-Client capability checking utilities for reMarkable MCP Server.
+"""Client capability checks for tool and resource handlers.
 
-This module provides utilities to check MCP client capabilities during
-the request lifecycle. MCPServer supports capability negotiation through
-the MCP protocol's initialize handshake.
-
-## How MCP Capability Negotiation Works
-
-When a client connects to an MCP server, the following handshake occurs:
-1. Client sends `initialize` request with its capabilities
-2. Server responds with its capabilities
-3. Client sends `initialized` notification
-
-## Client Capabilities (from client to server)
-
-Clients declare what features they support:
-- `elicitation`: Server can request user input during tool execution
-- `roots`: Server can query filesystem roots
-- `experimental`: Dictionary of experimental feature support
-
-## Server Capabilities (from server to client)
-
-Servers declare what they offer:
-- `tools`: Server provides tool definitions
-- `resources`: Server provides resource access (subscribe, listChanged)
-- `prompts`: Server provides prompt templates
-- `logging`: Server can send log messages
-- `completions`: Server supports argument completions
-
-## Checking Client Capabilities
-
-Use the Context object in tools to check what the client supports:
-
-```python
-from mcp.server.mcpserver import Context
-from remarkable_mcp.capabilities import client_supports_elicitation, get_client_capabilities
-
-@mcp.tool()
-async def my_tool(query: str, ctx: Context) -> str:
-    if client_supports_elicitation(ctx):
-        # Can request user input
-        pass
-
-    # Get full capabilities object
-    caps = get_client_capabilities(ctx)
-    if caps and caps.experimental:
-        # Check experimental features
-        pass
-
-    return "result"
-```
-
-## Note on Embedded Resources
-
-The MCP protocol does not have a specific capability flag for "embedded resources
-in tool calls". Support for EmbeddedResource and ImageContent in tool responses
-is part of the base protocol and determined by the protocol version. All clients
-supporting protocol version 2024-11-05 or later should handle embedded resources.
+Each helper takes the request's MCPServer ``Context`` and reports what the
+connected client declared: elicitation support and protocol extensions such as
+the MCP Apps UI extension.
 """
 
 from typing import TYPE_CHECKING, Optional
@@ -116,84 +62,6 @@ def client_supports_elicitation(ctx: "Context") -> bool:
     """
     caps = get_client_capabilities(ctx)
     return caps is not None and caps.elicitation is not None
-
-
-def client_supports_roots(ctx: "Context") -> bool:
-    """Check if the client supports filesystem roots.
-
-    When true, the server can query for filesystem root directories.
-
-    Args:
-        ctx: The MCPServer Context object
-
-    Returns:
-        True if client supports roots, False otherwise
-    """
-    caps = get_client_capabilities(ctx)
-    return caps is not None and caps.roots is not None
-
-
-def client_supports_experimental(ctx: "Context", feature: str) -> bool:
-    """Check if the client supports a specific experimental feature.
-
-    Args:
-        ctx: The MCPServer Context object
-        feature: The experimental feature name to check
-
-    Returns:
-        True if client declares support for the experimental feature
-    """
-    caps = get_client_capabilities(ctx)
-    if caps is None or caps.experimental is None:
-        return False
-    return feature in caps.experimental
-
-
-def get_client_info(ctx: "Context") -> Optional[dict]:
-    """Get information about the connected client.
-
-    Returns client name, version, and other metadata from the initialize request.
-
-    Args:
-        ctx: The MCPServer Context object
-
-    Returns:
-        Dictionary with client info or None if not available
-    """
-    try:
-        session = ctx.session
-        params = session.client_params if session else None
-        if params:
-            return {
-                "name": params.client_info.name if params.client_info else None,
-                "version": params.client_info.version if params.client_info else None,
-                "protocol_version": ctx.protocol_version,
-            }
-        if ctx.protocol_version:
-            return {
-                "name": None,
-                "version": None,
-                "protocol_version": ctx.protocol_version,
-            }
-    except (ValueError, AttributeError):
-        pass
-    return None
-
-
-def get_protocol_version(ctx: "Context") -> Optional[str]:
-    """Get the MCP protocol version negotiated with the client.
-
-    Args:
-        ctx: The MCPServer Context object
-
-    Returns:
-        Protocol version string (e.g., "2024-11-05") or None
-    """
-    try:
-        return ctx.protocol_version
-    except (ValueError, AttributeError):
-        pass
-    return None
 
 
 def get_client_extensions(ctx: "Context") -> dict:

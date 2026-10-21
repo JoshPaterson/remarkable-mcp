@@ -37,6 +37,7 @@ from remarkable_mcp.ssh_reliability import (
     _uncancel_current_task,
     classify_pre_execution_failure,
 )
+from remarkable_mcp.tags import document_tag_names, page_tag_names
 
 logger = logging.getLogger(__name__)
 T = TypeVar("T")
@@ -123,8 +124,50 @@ class Document:
         return self.last_modified
 
 
-# Alias for compatibility
-Folder = Document
+_CONTENT_MARKER = "===CONTENT==="
+
+
+def _split_metadata_output(output: str) -> List[tuple]:
+    """Split the batched listing into ``(doc_id, metadata, content)`` texts.
+
+    Each document starts with ``===FILE===<id>`` followed by its ``.metadata``
+    JSON and, optionally, a ``===CONTENT===`` line and its ``.content`` JSON.
+    """
+    entries = []
+    current_id = None
+    metadata_lines: List[str] = []
+    content_lines: List[str] = []
+    in_content = False
+
+    def flush() -> None:
+        if current_id and any(line.strip() for line in metadata_lines):
+            entries.append((current_id, "\n".join(metadata_lines), "\n".join(content_lines)))
+
+    for line in output.split("\n"):
+        if line.startswith("===FILE==="):
+            flush()
+            current_id = line[len("===FILE===") :].strip()
+            metadata_lines, content_lines = [], []
+            in_content = False
+        elif line.strip() == _CONTENT_MARKER and not in_content:
+            in_content = True
+        elif in_content:
+            content_lines.append(line)
+        else:
+            metadata_lines.append(line)
+    flush()
+    return entries
+
+
+def _parse_content(text: str) -> Optional[dict]:
+    """Parse ``.content`` JSON text, or None when empty or invalid."""
+    if not text.strip():
+        return None
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        return None
+    return data if isinstance(data, dict) else None
 
 
 class SSHClient:
@@ -149,6 +192,9 @@ class SSHClient:
         self._metadata_lock = threading.RLock()
         self._file_type_lock = threading.RLock()
         self._file_type_cache: Optional[dict[str, Optional[str]]] = None
+        # Per-document file types read outside the batch preload, keyed by
+        # doc id with the _file_type_generation they were read under.
+        self._single_file_types: dict[str, tuple[int, str]] = {}
         self._metadata_generation = 0
         self._file_type_generation = 0
         self._dispatcher = SSHDispatcher()
@@ -361,9 +407,8 @@ class SSHClient:
                 if self._file_type_cache is not None:
                     return func(*args, **kwargs)
         elif name == "get_file_type" and args:
-            with self._file_type_lock:
-                if self._file_type_cache is not None and args[0].id in self._file_type_cache:
-                    return func(*args, **kwargs)
+            if self._cached_file_type(args[0].id)[0]:
+                return func(*args, **kwargs)
         return await self.run_operation_async(
             name.replace("_", "-"),
             lambda: func(*args, **kwargs),
@@ -416,7 +461,7 @@ class SSHClient:
 
         # Use sshpass for password authentication
         if self.password:
-            ssh_args = ["sshpass", "-p", self.password] + ssh_args
+            ssh_args = ["sshpass", "-e"] + ssh_args
 
         try:
             returncode, stdout, stderr = self._run_process(
@@ -459,7 +504,7 @@ class SSHClient:
 
         # Use sshpass for password authentication
         if self.password:
-            ssh_args = ["sshpass", "-p", self.password] + ssh_args
+            ssh_args = ["sshpass", "-e"] + ssh_args
 
         try:
             returncode, stdout, stderr = self._run_process(
@@ -498,7 +543,7 @@ class SSHClient:
             (f"printf '{_REMOTE_EXECUTION_MARKER.decode()}\\n' >&2; cat > '{remote_path}'"),
         ]
         if self.password:
-            ssh_args = ["sshpass", "-p", self.password] + ssh_args
+            ssh_args = ["sshpass", "-e"] + ssh_args
 
         try:
             with open(local_path, "rb") as source:
@@ -513,6 +558,17 @@ class SSHClient:
                 raise self._command_failure("Upload", returncode, stdout, stderr)
         finally:
             self._trace_finish(trace, operation, returncode, output_bytes)
+
+    def _process_env(self) -> Optional[Dict[str, str]]:
+        """Environment for ssh subprocesses.
+
+        With password auth, ``sshpass -e`` reads the password from ``SSHPASS``
+        so it never appears in the process list; otherwise the parent
+        environment is inherited unchanged (None).
+        """
+        if not self.password:
+            return None
+        return {**os.environ, "SSHPASS": self.password}
 
     def _run_process(
         self,
@@ -545,6 +601,7 @@ class SSHClient:
                     stdin=subprocess.DEVNULL if stdin is None else stdin,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
+                    env=self._process_env(),
                 )
             except FileNotFoundError as exc:
                 if self.password and "sshpass" in str(exc):
@@ -714,38 +771,29 @@ class SSHClient:
             if limit is not None and len(self._documents) >= limit:
                 return self._documents[:limit]
             generation = self._metadata_generation
+        with self._file_type_lock:
+            file_type_generation = self._file_type_generation
         try:
             output = self._ssh_command(
                 f"for f in {XOCHITL_PATH}/*.metadata; do "
-                f'echo; echo "===FILE===$(basename $f .metadata)"; cat "$f" 2>/dev/null; '
+                f'id=$(basename "$f" .metadata); '
+                f'echo; echo "===FILE===$id"; cat "$f" 2>/dev/null; '
+                f'echo; echo "{_CONTENT_MARKER}"; cat "{XOCHITL_PATH}/$id.content" 2>/dev/null; '
                 f"done",
                 timeout=60,
             )
         except Exception as e:
             raise RuntimeError(f"Failed to read metadata: {e}") from e
 
-        documents = []
-        current_id = None
-        current_content = []
-
-        for line in output.split("\n"):
-            if line.startswith("===FILE==="):
-                if current_id and current_content:
-                    self._parse_and_add_document(
-                        current_id, "\n".join(current_content), documents, limit
-                    )
-                    if limit is not None and len(documents) >= limit:
-                        break
-                current_id = line.replace("===FILE===", "").strip()
-                current_content = []
-            else:
-                current_content.append(line)
-
-        if current_id and current_content:
-            if limit is None or len(documents) < limit:
-                self._parse_and_add_document(
-                    current_id, "\n".join(current_content), documents, limit
-                )
+        documents: List[Document] = []
+        file_types: dict[str, Optional[str]] = {}
+        for doc_id, metadata_text, content_text in _split_metadata_output(output):
+            content = _parse_content(content_text)
+            if content_text.strip():
+                file_types[doc_id] = content.get("fileType") if content else None
+            if limit is not None and len(documents) >= limit:
+                break
+            self._parse_and_add_document(doc_id, metadata_text, content, documents, limit)
 
         with self._metadata_lock:
             if generation == self._metadata_generation:
@@ -753,22 +801,37 @@ class SSHClient:
                 self._documents_by_id = {d.id: d for d in documents}
                 self._metadata_loaded_all = limit is None
 
+        if limit is None:
+            # The listing read every .content file, so it doubles as the
+            # file-type preload.
+            with self._file_type_lock:
+                if (
+                    self._file_type_cache is None
+                    and file_type_generation == self._file_type_generation
+                ):
+                    self._file_type_cache = file_types
+
         logger.info(f"Loaded {len(documents)} documents via SSH")
         return documents
 
     def _parse_and_add_document(
         self,
         doc_id: str,
-        content: str,
+        metadata_text: str,
+        content: Optional[dict],
         documents: List[Document],
         limit: Optional[int],
     ) -> None:
-        """Parse metadata JSON and add document to list."""
+        """Parse metadata JSON and add document to list.
+
+        ``content`` is the parsed ``.content`` file (or None); document and
+        page tags are read from it.
+        """
         if limit is not None and len(documents) >= limit:
             return
 
         try:
-            metadata = json.loads(content.strip())
+            metadata = json.loads(metadata_text.strip())
 
             # Skip deleted documents
             if metadata.get("deleted", False):
@@ -794,7 +857,8 @@ class SSHClient:
                 synced=metadata.get("synced", True),
                 last_modified=last_modified,
                 size=0,
-                tags=metadata.get("tags", []),
+                tags=document_tag_names(metadata, content),
+                page_tags=page_tag_names(content),
                 local_path=f"{XOCHITL_PATH}/{doc_id}",
             )
 
@@ -816,35 +880,34 @@ class SSHClient:
         Creates a zip archive with the same structure as the cloud API.
         Includes the document folder contents, .content metadata, and
         any associated PDF/EPUB file for merged rendering support.
+
+        A failed file listing or file fetch raises (SSH transport errors
+        unchanged, anything else as RuntimeError), and a document with no files
+        on the tablet raises RuntimeError, so a failed fetch never yields an
+        empty or partial document.
         """
         if not self.in_dispatcher_thread():
             return self.run_operation("document-download", lambda: self.download(doc))
         doc_path = f"{XOCHITL_PATH}/{doc.id}"
 
-        # List files in the document folder
+        # One command lists the document folder plus the .content file and any
+        # PDF/EPUB source used for merged rendering.
+        sidecars = " ".join(
+            f"'{XOCHITL_PATH}/{doc.id}.{ext}'" for ext in ("content", "pdf", "epub")
+        )
         try:
-            output = self._ssh_command(f"find '{doc_path}' -type f 2>/dev/null || true")
-        except Exception:
-            output = ""
+            output = self._ssh_command(
+                f"find '{doc_path}' -type f 2>/dev/null; "
+                f'for f in {sidecars}; do [ -f "$f" ] && echo "$f"; done; true'
+            )
+        except SSHReliabilityError:
+            raise
+        except Exception as e:
+            raise RuntimeError(f"Failed to list files of '{doc.name}' ({doc.id}): {e}") from e
 
         file_list = [f.strip() for f in output.strip().split("\n") if f.strip()]
-
-        # Also include the .content file if it exists
-        content_file = f"{XOCHITL_PATH}/{doc.id}.content"
-        try:
-            self._ssh_command(f"test -f '{content_file}' && echo exists")
-            file_list.append(content_file)
-        except Exception:
-            pass
-
-        # Include the associated PDF or EPUB file for merged rendering
-        for ext in ("pdf", "epub"):
-            raw_file = f"{XOCHITL_PATH}/{doc.id}.{ext}"
-            try:
-                self._ssh_command(f"test -f '{raw_file}' && echo exists")
-                file_list.append(raw_file)
-            except Exception:
-                pass
+        if not file_list:
+            raise RuntimeError(f"No files found on the tablet for '{doc.name}' ({doc.id}).")
 
         # Create zip archive. This archive is an internal transport container that
         # is extracted in-memory by the caller and never written to disk, so we use
@@ -854,15 +917,18 @@ class SSHClient:
             for remote_path in file_list:
                 try:
                     content = self._scp_download(remote_path)
-                    # Use relative path in zip
-                    rel_path = os.path.basename(remote_path)
-                    if "/" in remote_path.replace(f"{XOCHITL_PATH}/{doc.id}", ""):
-                        # Preserve subdirectory structure
-                        rel_path = remote_path.replace(f"{XOCHITL_PATH}/{doc.id}/", "")
-                    zf.writestr(rel_path, content)
+                except SSHReliabilityError:
+                    raise
                 except Exception as e:
-                    logger.debug(f"Failed to download {remote_path}: {e}")
-                    continue
+                    raise RuntimeError(
+                        f"Failed to download {remote_path} of '{doc.name}' ({doc.id}): {e}"
+                    ) from e
+                # Use relative path in zip
+                rel_path = os.path.basename(remote_path)
+                if "/" in remote_path.replace(f"{XOCHITL_PATH}/{doc.id}", ""):
+                    # Preserve subdirectory structure
+                    rel_path = remote_path.replace(f"{XOCHITL_PATH}/{doc.id}/", "")
+                zf.writestr(rel_path, content)
 
         zip_buffer.seek(0)
         return zip_buffer.read()
@@ -900,22 +966,40 @@ class SSHClient:
 
         Returns the extension without dot, or None if not a file-based document.
         """
-        with self._file_type_lock:
-            if self._file_type_cache is not None and doc.id in self._file_type_cache:
-                return self._file_type_cache[doc.id]
+        found, file_type = self._cached_file_type(doc.id)
+        if found:
+            return file_type
         return self.run_operation("file-type-read", lambda: self._load_file_type(doc))
 
-    def _load_file_type(self, doc: Document) -> Optional[str]:
+    def _cached_file_type(self, doc_id: str) -> tuple[bool, Optional[str]]:
+        """``(found, file_type)`` from the batch or per-document cache."""
         with self._file_type_lock:
-            if self._file_type_cache is not None and doc.id in self._file_type_cache:
-                return self._file_type_cache[doc.id]
-            content_file = f"{XOCHITL_PATH}/{doc.id}.content"
+            if self._file_type_cache is not None and doc_id in self._file_type_cache:
+                return True, self._file_type_cache[doc_id]
+            single = self._single_file_types.get(doc_id)
+            if single is not None and single[0] == self._file_type_generation:
+                return True, single[1]
+        return False, None
+
+    def _load_file_type(self, doc: Document) -> Optional[str]:
+        found, file_type = self._cached_file_type(doc.id)
+        if found:
+            return file_type
+        with self._file_type_lock:
+            generation = self._file_type_generation
+        content_file = f"{XOCHITL_PATH}/{doc.id}.content"
         try:
             content = self._scp_download(content_file, timeout=10)
             data = json.loads(content.decode("utf-8"))
-            return data.get("fileType")
+            file_type = data.get("fileType")
         except Exception:
             return None
+        # Only a definite type is cached: a failed read or a missing field
+        # may be transient and is retried on the next call.
+        if isinstance(file_type, str) and file_type:
+            with self._file_type_lock:
+                self._single_file_types[doc.id] = (generation, file_type)
+        return file_type
 
     def get_all_file_types(self) -> dict[str, Optional[str]]:
         """

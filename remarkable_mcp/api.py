@@ -45,8 +45,6 @@ REMARKABLE_DISABLE_CLOUD_FALLBACK = os.environ.get(
     "yes",
 )
 REMARKABLE_CONFIG_DIR = Path.home() / ".remarkable"
-REMARKABLE_TOKEN_FILE = REMARKABLE_CONFIG_DIR / "token"
-CACHE_DIR = REMARKABLE_CONFIG_DIR / "cache"
 
 # Process-level cloud client cache. The cloud client exchanges its long-lived
 # device token for a short-lived user token on first use; caching the client
@@ -249,6 +247,12 @@ def get_rmapi():
     return _get_cloud_client()
 
 
+def fell_back_to_cloud() -> bool:
+    """True when a configured device transport was unreachable and get_rmapi()
+    returned the cloud client instead."""
+    return _fell_back_to_cloud
+
+
 def get_active_transport() -> str:
     """Return the transport actually in use ("cloud", "ssh", "usb-web", or "local-dir").
 
@@ -258,7 +262,7 @@ def get_active_transport() -> str:
     has been called, so callers should resolve the client first if they need an
     accurate post-fallback value.
     """
-    if _fell_back_to_cloud:
+    if fell_back_to_cloud():
         return "cloud"
     if REMARKABLE_USE_LOCAL_DIR:
         return "local-dir"
@@ -267,12 +271,6 @@ def get_active_transport() -> str:
     if REMARKABLE_USE_SSH:
         return "ssh"
     return "cloud"
-
-
-def ensure_config_dir():
-    """Ensure configuration directory exists."""
-    REMARKABLE_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def register_and_get_token(one_time_code: str) -> str:

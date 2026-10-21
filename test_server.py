@@ -6,6 +6,8 @@ Focused handler tests call MCPServer directly. Dual-era protocol behavior is
 covered through SDK v2's first-class in-memory Client in test_mcp_v2.py.
 """
 
+import hashlib
+import io
 import json
 import os
 import sys
@@ -1786,119 +1788,13 @@ class TestCapabilityChecking:
 
         assert client_supports_elicitation(mock_ctx) is False
 
-    def test_client_supports_roots(self):
-        """Test client_supports_roots."""
-        from mcp.types import ClientCapabilities, RootsCapability
-
-        from remarkable_mcp.capabilities import client_supports_roots
-
-        # Test with roots enabled
-        mock_caps = ClientCapabilities(roots=RootsCapability())
-
-        mock_ctx = Mock()
-        mock_ctx.client_capabilities = mock_caps
-
-        assert client_supports_roots(mock_ctx) is True
-
-        # Test with roots disabled
-        mock_caps = ClientCapabilities(roots=None)
-        mock_ctx.client_capabilities = mock_caps
-
-        assert client_supports_roots(mock_ctx) is False
-
-    def test_client_supports_experimental(self):
-        """Test client_supports_experimental."""
-        from mcp.types import ClientCapabilities
-
-        from remarkable_mcp.capabilities import client_supports_experimental
-
-        # Test with experimental feature present
-        mock_caps = ClientCapabilities(experimental={"my_feature": {}})
-
-        mock_ctx = Mock()
-        mock_ctx.client_capabilities = mock_caps
-
-        assert client_supports_experimental(mock_ctx, "my_feature") is True
-        assert client_supports_experimental(mock_ctx, "other_feature") is False
-
-        # Test with no experimental features
-        mock_caps = ClientCapabilities(experimental=None)
-        mock_ctx.client_capabilities = mock_caps
-
-        assert client_supports_experimental(mock_ctx, "my_feature") is False
-
-    def test_get_client_info(self):
-        """Test get_client_info."""
-        from remarkable_mcp.capabilities import get_client_info
-
-        mock_ctx = Mock()
-        mock_ctx.session = Mock()
-        mock_ctx.session.client_params = Mock()
-        mock_ctx.session.client_params.client_info = Mock()
-        mock_ctx.session.client_params.client_info.name = "Test Client"
-        mock_ctx.session.client_params.client_info.version = "1.0.0"
-        mock_ctx.protocol_version = "2024-11-05"
-
-        result = get_client_info(mock_ctx)
-        assert result is not None
-        assert result["name"] == "Test Client"
-        assert result["version"] == "1.0.0"
-        assert result["protocol_version"] == "2024-11-05"
-
-    def test_get_client_info_without_client_info(self):
-        """Test get_client_info when clientInfo is None."""
-        from remarkable_mcp.capabilities import get_client_info
-
-        mock_ctx = Mock()
-        mock_ctx.session = Mock()
-        mock_ctx.session.client_params = Mock()
-        mock_ctx.session.client_params.client_info = None
-        mock_ctx.protocol_version = "2024-11-05"
-
-        result = get_client_info(mock_ctx)
-        assert result is not None
-        assert result["name"] is None
-        assert result["version"] is None
-        assert result["protocol_version"] == "2024-11-05"
-
-    def test_get_protocol_version(self):
-        """Test get_protocol_version."""
-        from remarkable_mcp.capabilities import get_protocol_version
-
-        mock_ctx = Mock()
-        mock_ctx.protocol_version = "2024-11-05"
-
-        result = get_protocol_version(mock_ctx)
-        assert result == "2024-11-05"
-
-    def test_get_protocol_version_without_context(self):
-        """Test get_protocol_version returns None without valid context."""
-        from remarkable_mcp.capabilities import get_protocol_version
-
-        mock_ctx = Mock()
-        mock_ctx.protocol_version = None
-
-        result = get_protocol_version(mock_ctx)
-        assert result is None
-
     def test_capability_imports_from_package(self):
         """Test that capability utilities can be imported from main package."""
-        from remarkable_mcp import (
-            client_supports_elicitation,
-            client_supports_experimental,
-            client_supports_roots,
-            get_client_capabilities,
-            get_client_info,
-            get_protocol_version,
-        )
+        from remarkable_mcp import client_supports_elicitation, get_client_capabilities
 
         # Verify all functions are callable
         assert callable(get_client_capabilities)
         assert callable(client_supports_elicitation)
-        assert callable(client_supports_roots)
-        assert callable(client_supports_experimental)
-        assert callable(get_client_info)
-        assert callable(get_protocol_version)
 
 
 # =============================================================================
@@ -2432,6 +2328,30 @@ class TestUSBWebInterface:
 
         content = client.download(doc)
         assert content == b"fake zip content"
+
+    @patch("requests.request")
+    def test_usb_web_without_rmdoc_returns_native_pdf_once(self, mock_request):
+        """Firmware without rmdoc falls back to the rendered PDF, fetched once."""
+        from remarkable_mcp.usb_web import Document, USBWebClient
+
+        def fake_request(method, url, **kwargs):
+            response = Mock(status_code=200, content=b"%PDF-1.7 rendered")
+            if url.endswith("/rmdoc"):
+                response.raise_for_status.side_effect = requests.HTTPError("404 Not Found")
+            return response
+
+        mock_request.side_effect = fake_request
+        client = USBWebClient()
+        doc = Document(id="doc1", hash="doc1", name="Test", doc_type="DocumentType")
+
+        assert client.download(doc) == b"%PDF-1.7 rendered"
+        mock_request.reset_mock()
+        assert client.download_raw_file(doc, "pdf") == b"%PDF-1.7 rendered"
+        assert [c.args[1].rsplit("/", 1)[-1] for c in mock_request.call_args_list] == [
+            "rmdoc",
+            "pdf",
+        ]
+        assert client.download_raw_file(doc, "epub") is None
 
     @patch("remarkable_mcp.usb_web.time.sleep")
     @patch("requests.request")
@@ -4031,13 +3951,46 @@ class TestCloudBlobCache:
 
         mock_request.return_value = self._response(content=b"blob-bytes")
         client = RemarkableClient(user_token="user-token")
+        blob_hash = hashlib.sha256(b"blob-bytes").hexdigest()
 
-        first = client._get_file("hash-a", "a.docSchema")
-        second = client._get_file("hash-a", "a.docSchema")
+        first = client._get_file(blob_hash, "a.pdf")
+        second = client._get_file(blob_hash, "a.pdf")
 
         assert first == b"blob-bytes"
         assert second == b"blob-bytes"
         assert mock_request.call_count == 1
+
+    @patch("remarkable_mcp.sync._http_request_with_retry")
+    def test_doc_index_cached_under_hash_entries(self, mock_request):
+        """Schema-3 document indexes (stored under HashEntries) are cache hits."""
+        from remarkable_mcp.sync import RemarkableClient, _hash_entries
+
+        child = hashlib.sha256(b"page").hexdigest()
+        body = f"3\n{child}:0:doc/p.rm:0:4\n".encode()
+        mock_request.return_value = self._response(content=body)
+        client = RemarkableClient(user_token="user-token")
+        index_hash = _hash_entries(client._parse_index(body))
+
+        assert client._get_file(index_hash, "doc.docSchema") == body
+        assert client._get_file(index_hash, "doc.docSchema") == body
+        assert mock_request.call_count == 1
+
+    @patch("remarkable_mcp.sync._http_request_with_retry")
+    def test_corrupted_cache_entry_is_refetched(self, mock_request):
+        """A cached blob that no longer matches its hash is a cache miss."""
+        from remarkable_mcp import sync
+        from remarkable_mcp.sync import RemarkableClient
+
+        good = b"blob-bytes"
+        blob_hash = hashlib.sha256(good).hexdigest()
+        mock_request.return_value = self._response(content=good)
+        client = RemarkableClient(user_token="user-token")
+        client._get_file(blob_hash, "a.pdf")
+        (sync._cache_dir() / blob_hash).write_bytes(b"blob-by")
+
+        assert client._get_file(blob_hash, "a.pdf") == good
+        assert mock_request.call_count == 2
+        assert (sync._cache_dir() / blob_hash).read_bytes() == good
 
     @patch("remarkable_mcp.sync._http_request_with_retry")
     def test_different_hash_is_refetched(self, mock_request):
@@ -4334,6 +4287,50 @@ class TestCloudStartupFallback:
             assert api.get_active_transport() == "cloud"
         finally:
             api.reset_client_cache()
+
+    @pytest.mark.parametrize("transport", ["ssh", "usb-web"])
+    def test_mode_checks_follow_cloud_fallback(self, monkeypatch, tmp_path, transport):
+        from remarkable_mcp import resources, write_tools
+
+        api, cloud = self._setup_cloud(monkeypatch, tmp_path, '{"devicetoken": "d"}')
+        use_ssh = transport == "ssh"
+        monkeypatch.setattr(api, "REMARKABLE_USE_SSH", use_ssh)
+        monkeypatch.setattr(api, "REMARKABLE_USE_USB_WEB", not use_ssh)
+        monkeypatch.setattr(api, "REMARKABLE_DISABLE_CLOUD_FALLBACK", False)
+        monkeypatch.delenv("REMARKABLE_USE_LOCAL_DIR", raising=False)
+        monkeypatch.delenv("REMARKABLE_LOCAL_DIR", raising=False)
+        monkeypatch.setenv("REMARKABLE_USE_SSH", "1" if use_ssh else "")
+        monkeypatch.setenv("REMARKABLE_USE_USB_WEB", "" if use_ssh else "1")
+        device = self._device_client(reachable=False)
+        monkeypatch.setattr("remarkable_mcp.ssh.create_ssh_client", lambda: device)
+        monkeypatch.setattr("remarkable_mcp.usb_web.create_usb_web_client", lambda: device)
+
+        api.reset_client_cache()
+        try:
+            assert write_tools._is_ssh_mode() is use_ssh
+            assert write_tools._is_usb_web_mode() is not use_ssh
+            assert resources._is_ssh_mode() is use_ssh
+            assert write_tools._is_cloud_mode() is False
+
+            assert api.get_rmapi() is cloud
+
+            assert write_tools._is_ssh_mode() is False
+            assert write_tools._is_usb_web_mode() is False
+            assert resources._is_ssh_mode() is False
+            assert write_tools._is_cloud_mode() is True
+        finally:
+            api.reset_client_cache()
+
+    def test_ssh_mode_defers_to_usb_web_like_get_rmapi(self, monkeypatch):
+        from remarkable_mcp import write_tools
+
+        monkeypatch.delenv("REMARKABLE_USE_LOCAL_DIR", raising=False)
+        monkeypatch.delenv("REMARKABLE_LOCAL_DIR", raising=False)
+        monkeypatch.setenv("REMARKABLE_USE_SSH", "1")
+        monkeypatch.setenv("REMARKABLE_USE_USB_WEB", "1")
+
+        assert write_tools._is_usb_web_mode() is True
+        assert write_tools._is_ssh_mode() is False
 
     def test_device_reachable_no_fallback(self, monkeypatch, tmp_path):
         api, cloud = self._setup_cloud(monkeypatch, tmp_path, '{"devicetoken": "d"}')
@@ -4642,6 +4639,129 @@ class TestSSHCacheConcurrency:
             release_preload.set()
             assert preload.result(timeout=2) == {"doc-1": "pdf"}
             assert upload.result(timeout=2) is None
+
+
+class TestSSHSingleFileType:
+    def test_single_file_type_is_cached_until_invalidated(self):
+        from remarkable_mcp.ssh import Document, SSHClient
+        from remarkable_mcp.write_tools import _invalidate_client_cache
+
+        client = SSHClient()
+        reads = []
+
+        def fake_download(remote_path, timeout=60):
+            reads.append(remote_path)
+            return b'{"fileType": "pdf"}'
+
+        client._scp_download = fake_download
+        doc = Document(id="doc-1", hash="doc-1", name="One", doc_type="DocumentType")
+        try:
+            assert client.get_file_type(doc) == "pdf"
+            assert client.get_file_type(doc) == "pdf"
+            assert len(reads) == 1
+            # The batch cache stays unset, so a full preload is still complete.
+            assert client._file_type_cache is None
+
+            _invalidate_client_cache(client)
+            assert client.get_file_type(doc) == "pdf"
+            assert len(reads) == 2
+        finally:
+            client.close()
+
+    def test_failed_single_file_type_read_is_not_cached(self):
+        from remarkable_mcp.ssh import Document, SSHClient
+
+        client = SSHClient()
+        reads = []
+
+        def fake_download(remote_path, timeout=60):
+            reads.append(remote_path)
+            if len(reads) == 1:
+                raise RuntimeError("transient")
+            return b'{"fileType": "epub"}'
+
+        client._scp_download = fake_download
+        doc = Document(id="doc-1", hash="doc-1", name="One", doc_type="DocumentType")
+        try:
+            assert client.get_file_type(doc) is None
+            assert client.get_file_type(doc) == "epub"
+        finally:
+            client.close()
+
+
+class TestSSHDownload:
+    XOCHITL = "/home/root/.local/share/remarkable/xochitl"
+
+    def _client(self, listing, files):
+        from remarkable_mcp.ssh import SSHClient
+
+        client = SSHClient()
+        commands = []
+
+        def fake_command(command, timeout=30):
+            commands.append(command)
+            return listing
+
+        def fake_download(remote_path, timeout=60):
+            if remote_path not in files:
+                raise RuntimeError("cat: No such file")
+            return files[remote_path]
+
+        client._ssh_command = fake_command
+        client._scp_download = fake_download
+        return client, commands
+
+    def _doc(self):
+        from remarkable_mcp.ssh import Document
+
+        return Document(id="doc-1", hash="doc-1", name="One", doc_type="DocumentType")
+
+    def test_download_lists_files_in_one_command(self):
+        page = f"{self.XOCHITL}/doc-1/page-1.rm"
+        content = f"{self.XOCHITL}/doc-1.content"
+        client, commands = self._client(
+            f"{page}\n{content}\n", {page: b"rm", content: b'{"fileType": "notebook"}'}
+        )
+        try:
+            with zipfile.ZipFile(io.BytesIO(client.download(self._doc()))) as zf:
+                assert sorted(zf.namelist()) == ["doc-1.content", "page-1.rm"]
+            assert len(commands) == 1
+            assert "doc-1.pdf" in commands[0] and "doc-1.epub" in commands[0]
+        finally:
+            client.close()
+
+    def test_failed_file_fetch_raises(self):
+        page = f"{self.XOCHITL}/doc-1/page-1.rm"
+        content = f"{self.XOCHITL}/doc-1.content"
+        client, _ = self._client(f"{page}\n{content}\n", {content: b"{}"})
+        try:
+            with pytest.raises(RuntimeError, match="page-1.rm"):
+                client.download(self._doc())
+        finally:
+            client.close()
+
+    def test_document_without_files_raises(self):
+        client, _ = self._client("", {})
+        try:
+            with pytest.raises(RuntimeError, match="No files found"):
+                client.download(self._doc())
+        finally:
+            client.close()
+
+    def test_failed_listing_raises(self):
+        from remarkable_mcp.ssh import SSHClient
+
+        client = SSHClient()
+
+        def failing(command, timeout=30):
+            raise OSError("connection reset")
+
+        client._ssh_command = failing
+        try:
+            with pytest.raises(RuntimeError, match="Failed to list files"):
+                client.download(self._doc())
+        finally:
+            client.close()
 
 
 class TestOperationDispatcher:
@@ -5932,6 +6052,44 @@ class TestSSHKeyAuth:
             client.close()
         assert captured["kwargs"]["stdin"] == ssh_mod.subprocess.DEVNULL
 
+    @pytest.mark.parametrize("password", [None, "secret"])
+    def test_password_is_passed_in_env_not_argv(self, monkeypatch, password):
+        import remarkable_mcp.ssh as ssh_mod
+        from remarkable_mcp.ssh import SSHClient
+
+        captured = {}
+
+        class Process:
+            returncode = 0
+
+            def communicate(self, timeout=None):
+                return b"ok", b""
+
+            def poll(self):
+                return self.returncode
+
+        def popen(args, **kwargs):
+            captured["args"] = args
+            captured["kwargs"] = kwargs
+            return Process()
+
+        monkeypatch.setattr(ssh_mod.subprocess, "Popen", popen)
+        client = SSHClient(password=password)
+        try:
+            client._ssh_command("echo ok")
+            client._scp_download("/home/root/file.pdf")
+        finally:
+            client.close()
+        env = captured["kwargs"]["env"]
+        if password:
+            assert captured["args"][:2] == ["sshpass", "-e"]
+            assert password not in captured["args"]
+            assert env["SSHPASS"] == password
+            assert env["PATH"] == os.environ["PATH"]
+        else:
+            assert "sshpass" not in captured["args"]
+            assert env is None
+
     def test_fresh_probe_disables_ssh_multiplexing(self, monkeypatch):
         from remarkable_mcp.ssh import SSHClient
 
@@ -5970,7 +6128,8 @@ class TestSSHKeyAuth:
         client._ssh_command("echo ok")
 
         argv = captured["args"]
-        assert argv[:3] == ["sshpass", "-p", "secret"]
+        assert argv[:2] == ["sshpass", "-e"]
+        assert "secret" not in argv
         # Password auth must not force BatchMode (it would block the password).
         assert "BatchMode=yes" not in argv
         assert "IdentitiesOnly=yes" not in argv
@@ -6033,7 +6192,8 @@ class TestSSHKeyAuth:
         _upload_file_bytes(client, str(local), "/home/root/remote.rm")
 
         argv = captured["args"]
-        assert argv[:3] == ["sshpass", "-p", "secret"]
+        assert argv[:2] == ["sshpass", "-e"]
+        assert "secret" not in argv
         # Password auth must not force BatchMode (it would block the password).
         assert "BatchMode=yes" not in argv
         assert "IdentitiesOnly=yes" not in argv

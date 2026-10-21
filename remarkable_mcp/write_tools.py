@@ -108,31 +108,49 @@ def _require_write_transport() -> Optional[str]:
     return None
 
 
+def _env_flag(name: str) -> bool:
+    return os.environ.get(name, "").lower() in ("1", "true", "yes")
+
+
+def _device_fell_back_to_cloud() -> bool:
+    """True when the configured device transport was unreachable and
+    ``get_rmapi()`` returned the cloud client instead."""
+    from remarkable_mcp.api import fell_back_to_cloud
+
+    return fell_back_to_cloud()
+
+
 def _is_ssh_mode() -> bool:
-    """Check if SSH transport is active."""
-    return os.environ.get("REMARKABLE_USE_SSH", "").lower() in (
-        "1",
-        "true",
-        "yes",
+    """Check if SSH transport is active.
+
+    SSH is configured and neither local-directory nor USB web (which
+    ``get_rmapi`` prefers) is, and the server has not fallen back to cloud.
+    """
+    return (
+        _env_flag("REMARKABLE_USE_SSH")
+        and not _is_local_dir_mode()
+        and not _env_flag("REMARKABLE_USE_USB_WEB")
+        and not _device_fell_back_to_cloud()
     )
 
 
 def _is_usb_web_mode() -> bool:
-    """Check if USB web transport is active."""
-    return os.environ.get("REMARKABLE_USE_USB_WEB", "").lower() in (
-        "1",
-        "true",
-        "yes",
+    """Check if USB web transport is active (configured, local-directory mode
+    off, and no fallback to cloud)."""
+    return (
+        _env_flag("REMARKABLE_USE_USB_WEB")
+        and not _is_local_dir_mode()
+        and not _device_fell_back_to_cloud()
     )
 
 
 def _is_local_dir_mode() -> bool:
-    """Check if the local-directory transport is active."""
-    return os.environ.get("REMARKABLE_USE_LOCAL_DIR", "").lower() in (
-        "1",
-        "true",
-        "yes",
-    ) or bool(os.environ.get("REMARKABLE_LOCAL_DIR"))
+    """Check if the local-directory transport is configured.
+
+    This stays True after a fallback to cloud, so a server configured for the
+    read-only local directory never gains write tools.
+    """
+    return _env_flag("REMARKABLE_USE_LOCAL_DIR") or bool(os.environ.get("REMARKABLE_LOCAL_DIR"))
 
 
 def _is_cloud_mode() -> bool:

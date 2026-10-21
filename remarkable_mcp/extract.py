@@ -2144,22 +2144,6 @@ def render_page_full_page_from_extracted_document(
     return png, (paper_w, paper_h)
 
 
-def document_zip_has_pdf_underlay(zip_path: Path) -> bool:
-    """Check if a reMarkable document zip contains a PDF underlay.
-
-    Args:
-        zip_path: Path to the document zip file
-
-    Returns:
-        True if the zip contains a .pdf file
-    """
-    try:
-        with zipfile.ZipFile(zip_path, "r") as zf:
-            return any(name.endswith(".pdf") for name in zf.namelist())
-    except Exception:
-        return False
-
-
 def _read_cpages_entries(tmpdir_path: Path) -> List[Dict[str, Any]]:
     """Read cPages.pages entries from the .content metadata file.
 
@@ -2183,14 +2167,16 @@ def _pdf_page_index_for_cpages_entry(entry: Dict[str, Any]) -> Optional[int]:
         entry: A single cPages page entry dict
 
     Returns:
-        0-based PDF page index, or None if no redirect exists
+        0-based PDF page index, or None if no redirect exists or it is negative
+        (a page with no PDF underlay)
     """
     redir = entry.get("redir", {})
     if isinstance(redir, dict) and "value" in redir:
         try:
-            return int(redir["value"])
+            index = int(redir["value"])
         except (ValueError, TypeError):
             return None
+        return index if index >= 0 else None
     return None
 
 

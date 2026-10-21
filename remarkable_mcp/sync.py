@@ -372,12 +372,6 @@ class Document:
         return self.last_modified
 
 
-# Alias for backward compatibility with rmapy-style code
-# In our sync module, both Document and Folder are the same class,
-# distinguished by the is_folder property
-Folder = Document
-
-
 class RemarkableClient:
     """Client for reMarkable Cloud sync API."""
 
@@ -443,14 +437,37 @@ class RemarkableClient:
 
         return response
 
+    def _blob_matches_hash(self, content: bytes, file_hash: str) -> bool:
+        """Whether ``content`` is the blob stored under ``file_hash``.
+
+        File blobs and schema-4 indexes are stored under ``sha256(body)``;
+        schema-3 document indexes under ``HashEntries`` of their entries.
+        """
+        if hashlib.sha256(content).hexdigest() == file_hash:
+            return True
+        if not content.startswith(b"3\n"):
+            return False
+        try:
+            return _hash_entries(self._parse_index(content)) == file_hash
+        except Exception:
+            return False
+
     def _cache_read(self, file_hash: str) -> Optional[bytes]:
-        """Return cached bytes for a content hash, or None on miss/disabled."""
+        """Return cached bytes for a content hash, or None on miss/disabled.
+
+        A cached blob whose bytes do not match its hash (a truncated or
+        corrupted file) is deleted and treated as a miss.
+        """
         if not _cache_enabled():
             return None
         try:
             path = _cache_dir() / file_hash
             if path.is_file():
-                return path.read_bytes()
+                content = path.read_bytes()
+                if self._blob_matches_hash(content, file_hash):
+                    return content
+                logger.debug(f"Blob cache entry {file_hash} does not match its hash; refetching")
+                path.unlink(missing_ok=True)
         except Exception as e:  # pragma: no cover - cache must never break fetches
             logger.debug(f"Blob cache read failed for {file_hash}: {e}")
         return None
@@ -660,11 +677,19 @@ class RemarkableClient:
         content-addressed cache when present) so multi-page documents render
         without paying a sequential round-trip per page. The zip is assembled
         in the original blob order for deterministic output.
+
+        Raises RuntimeError when the index or any blob cannot be fetched, so a
+        failed fetch never yields a partial document.
         """
         import io
         import zipfile
 
-        blob_content = self._get_file(doc.hash, f"{doc.id}.docSchema")
+        try:
+            blob_content = self._get_file(doc.hash, f"{doc.id}.docSchema")
+        except Exception as e:
+            raise RuntimeError(
+                f"Failed to download the file index of '{doc.name}' ({doc.id}): {e}"
+            ) from e
         blob_entries = self._parse_index(blob_content)
 
         contents: List[Optional[bytes]] = [None] * len(blob_entries)
@@ -672,8 +697,10 @@ class RemarkableClient:
         def fetch(index: int, entry: Dict[str, Any]) -> None:
             try:
                 contents[index] = self._get_file(entry["hash"], entry["id"])
-            except Exception:
-                contents[index] = None
+            except Exception as e:
+                raise RuntimeError(
+                    f"Failed to download {entry['id']} of '{doc.name}' ({doc.id}): {e}"
+                ) from e
 
         workers = _get_sync_workers()
         if workers > 1 and len(blob_entries) > 1:
@@ -911,7 +938,6 @@ class RemarkableClient:
         root is committed. On success all in-memory document caches are
         invalidated.
         """
-        last_error: Optional[Exception] = None
         for attempt in range(_ROOT_COMMIT_ATTEMPTS):
             entries, generation = self._read_root_entries()
             current = list(entries)
@@ -923,17 +949,19 @@ class RemarkableClient:
             self._put_blob(root_body, root_hash, "root.docSchema", "text/plain; charset=UTF-8")
             try:
                 self._commit_root(root_hash, generation)
-                self._invalidate_caches()
-                return
             except CloudWriteError as e:
-                if getattr(e, "conflict", False) and attempt < _ROOT_COMMIT_ATTEMPTS - 1:
-                    last_error = e
-                    time.sleep(_compute_sleep(_get_retry_delay(), attempt))
-                    continue
-                raise
-        raise CloudWriteError(
-            f"Could not commit root after {_ROOT_COMMIT_ATTEMPTS} attempts: {last_error}"
-        )
+                if not getattr(e, "conflict", False):
+                    raise
+                if attempt == _ROOT_COMMIT_ATTEMPTS - 1:
+                    raise CloudWriteError(
+                        f"Could not commit root: generation conflict on all "
+                        f"{_ROOT_COMMIT_ATTEMPTS} attempts (another device or app kept "
+                        "changing the library). Retry the write."
+                    ) from e
+                time.sleep(_compute_sleep(_get_retry_delay(), attempt))
+                continue
+            self._invalidate_caches()
+            return
 
     def _invalidate_caches(self) -> None:
         """Drop in-memory document/file-type caches after a mutation."""

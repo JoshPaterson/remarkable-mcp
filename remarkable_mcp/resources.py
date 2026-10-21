@@ -13,7 +13,6 @@ Respects REMARKABLE_ROOT_PATH environment variable for folder filtering.
 
 import asyncio
 import logging
-import os
 import tempfile
 from pathlib import Path
 from typing import Optional, Set
@@ -21,53 +20,12 @@ from typing import Optional, Set
 from mcp.types import Completion, ResourceTemplateReference
 
 from remarkable_mcp.api import document_version
+from remarkable_mcp.roots import get_root as _get_root_path
+from remarkable_mcp.roots import is_under_root as _is_within_root
+from remarkable_mcp.roots import to_root_relative as _apply_root_filter
 from remarkable_mcp.server import mcp
 
 logger = logging.getLogger(__name__)
-
-
-def _get_root_path() -> str:
-    """Get the configured root path filter, or '/' for full access.
-
-    Handles: empty string, '/', '/Work', '/Work/', 'Work' -> normalized path
-    """
-    root = os.environ.get("REMARKABLE_ROOT_PATH", "").strip()
-    # Empty or "/" means full access
-    if not root or root == "/":
-        return "/"
-    # Normalize: ensure starts with / and no trailing slash
-    if not root.startswith("/"):
-        root = "/" + root
-    if root.endswith("/"):
-        root = root.rstrip("/")
-    return root
-
-
-def _is_within_root(path: str, root: str) -> bool:
-    """Check if a path is within the configured root (case-insensitive)."""
-    if root == "/":
-        return True
-    # Path must equal root or be a child of root (case-insensitive)
-    path_lower = path.lower()
-    root_lower = root.lower()
-    return path_lower == root_lower or path_lower.startswith(root_lower + "/")
-
-
-def _apply_root_filter(path: str, root: str) -> str:
-    """Apply root filter to a path for display/URI purposes.
-
-    If root is '/Work', then '/Work/Project' becomes '/Project' in output.
-    Case-insensitive matching, preserves original case in output.
-    """
-    if root == "/":
-        return path
-    path_lower = path.lower()
-    root_lower = root.lower()
-    if path_lower == root_lower:
-        return "/"
-    if path_lower.startswith(root_lower + "/"):
-        return path[len(root) :]
-    return path
 
 
 # Background loader state
@@ -79,8 +37,10 @@ _img_uri_to_doc: dict[str, tuple] = {}  # Map image URI template -> (client, doc
 
 
 def _is_ssh_mode() -> bool:
-    """Check if SSH transport is enabled (evaluated at runtime)."""
-    return os.environ.get("REMARKABLE_USE_SSH", "").lower() in ("1", "true", "yes")
+    """Check if the SSH transport is in use (False after a fallback to cloud)."""
+    from remarkable_mcp.api import get_active_transport
+
+    return get_active_transport() == "ssh"
 
 
 def _make_doc_resource(client, document):
