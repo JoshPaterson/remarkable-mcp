@@ -333,14 +333,19 @@ def append_strokes(original_bytes: bytes, strokes: list[dict], author=None) -> b
 
     The strokes are written under ``author`` (default: this installation's
     author id, see ``rm_ink.author_uuid``) with ids from the page's shared
-    counter. Every block of the original is kept unchanged except the author
-    table, which gains the author.
+    counter, on the layer ``rm_ink.PageWriter.ink_layer`` picks: the page's
+    selected layer, never a layer holding the MCP's mark covers. Every block
+    of the original is kept unchanged except the author table, which gains
+    the author.
     """
     if not strokes:
         raise StrokeError("No strokes provided to write.")
 
     page = rm_ink.PageWriter(original_bytes, author or rm_ink.author_uuid())
-    layer_id = find_target_layer(page.blocks)
+    try:
+        layer_id = rm_ink.crdt(page.ink_layer(None))
+    except rm_ink.InkError as e:
+        raise StrokeError(str(e)) from e
     paper_w, paper_h = get_paper_size(page.blocks)
     ids = page.new_ids(len(strokes))
     page.append(
