@@ -174,3 +174,14 @@ async def test_erasable_near_note_has_ink_leader(cloud):
     )
     (mark,) = data["marks"]
     assert mark["erasable"] and mark["state"] == "on tablet"
+
+
+def test_dots_are_drawn_as_small_filled_circles():
+    mark = pdf_marks.render_mark(
+        {"shape": "line", "from": [0.1, 0.1], "to": [0.3, 0.1], "dot": True}, A4, None
+    )
+    strokes = ink_marks.part_strokes(mark, A4)
+    dot = [s for s in strokes if len(s["points"]) == 9]
+    assert len(dot) == 1
+    xs = [p[0] for p in dot[0]["points"]]
+    assert max(xs) - min(xs) > 0.5  # a real loop, not a single point

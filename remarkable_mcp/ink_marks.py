@@ -16,6 +16,7 @@ from __future__ import annotations
 import base64
 import dataclasses
 import functools
+import math
 import uuid
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -256,10 +257,24 @@ def part_strokes(part: Dict[str, Any], page_size: Tuple[float, float]) -> List[D
                 span = max(max(xs) - min(xs), max(ys) - min(ys))
                 if span <= 4.0:
                     centre = ((max(xs) + min(xs)) / 2, (max(ys) + min(ys)) / 2)
-                    strokes.append({"points": [centre, centre], "width": max(span, MIN_WIDTH)})
+                    strokes.append(_dot(centre, max(span, MIN_WIDTH)))
                 else:
                     strokes.append({"points": line, "width": 1.0})
     return strokes
+
+
+def _dot(centre: Tuple[float, float], diameter: float) -> Dict[str, Any]:
+    """A filled dot: a small closed circle drawn with a line as wide as its
+    radius (the tablet does not draw a stroke of zero length)."""
+    radius = diameter / 4
+    points = [
+        (
+            centre[0] + radius * math.cos(2 * math.pi * i / 8),
+            centre[1] + radius * math.sin(2 * math.pi * i / 8),
+        )
+        for i in range(9)
+    ]
+    return {"points": points, "width": diameter / 2}
 
 
 def highlight_strokes(box: Sequence[float], page_size: Tuple[float, float]) -> List[Dict[str, Any]]:
