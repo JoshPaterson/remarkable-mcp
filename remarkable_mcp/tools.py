@@ -2428,6 +2428,128 @@ def _publish_document_export(
     )
 
 
+MAX_BATCH_EXPORTS = 200
+
+
+def _export_targets(collection, items_by_id: dict, folder: Optional[str], tags):
+    """``(base_path, documents)`` for a batch export: the documents in
+    ``folder`` (the library when None) and its subfolders, keeping those with
+    any of ``tags``; raises _ExportRequestError if the folder is not found."""
+    root = _get_root_path()
+    base = _resolve_root_path(folder) if folder and folder.startswith("/") else folder
+    base = (base or root).rstrip("/") or "/"
+    if base != "/":
+        found = any(
+            item.is_folder
+            and not _is_cloud_archived(item)
+            and get_item_path(item, items_by_id).lower() == base.lower()
+            for item in collection
+        )
+        if not found or not _is_within_root(base, root):
+            raise _ExportRequestError(
+                "folder_not_found",
+                f"Folder not found: '{folder}'",
+                "Use remarkable_browse() to find the folder path.",
+            )
+    wanted = {str(tag).lower() for tag in tags or []}
+    prefix = "" if base == "/" else base.lower() + "/"
+    documents = []
+    for item in collection:
+        if item.is_folder or _is_cloud_archived(item):
+            continue
+        path = get_item_path(item, items_by_id)
+        if not _is_within_root(path, root) or not path.lower().startswith(prefix or "/"):
+            continue
+        if wanted and not wanted & {t.lower() for t in getattr(item, "tags", None) or []}:
+            continue
+        documents.append((path, item))
+    documents.sort(key=lambda entry: entry[0].lower())
+    return base, documents
+
+
+def _export_many(
+    client,
+    collection,
+    items_by_id: dict,
+    documents: list,
+    base: str,
+    save_dir: Path,
+    *,
+    output_format: str,
+    pdf_mode: str,
+    include_ocr: bool,
+    overwrite: bool,
+) -> dict:
+    """Export each document into ``save_dir``, mirroring its folders under
+    ``base``; one failure does not stop the others."""
+    suffix = export_save.SUFFIXES[output_format]
+    background = get_background_color()
+    planned: dict = {}
+    saved, failed = [], []
+    for path, item in documents:
+        relative = path[len(base) :].strip("/") if base != "/" else path.strip("/")
+        parts = [export_save.safe_file_name(part) for part in relative.split("/")]
+        target = save_dir.joinpath(*parts[:-1], parts[-1] + suffix)
+        if str(target).lower() in planned:
+            target = target.with_name(f"{target.stem} ({item.ID[:8]}){suffix}")
+        planned[str(target).lower()] = item.ID
+        display_path = _apply_root_filter(path)
+        try:
+            checked = export_save.check_path(str(target), output_format, overwrite)
+            if overwrite:
+                export_save.check_replace(checked, item.ID)
+            metadata = ExportMetadata(
+                document_id=item.ID,
+                title=item.VissibleName,
+                path=display_path,
+                source_type=get_file_type(client, item),
+                page_count=None,
+                modified=getattr(item, "ModifiedClient", None),
+                tags=tuple(getattr(item, "tags", None) or ()),
+            )
+            published = _publish_document_export(
+                client,
+                item,
+                metadata,
+                output_format=output_format,
+                pdf_mode=pdf_mode,
+                include_ocr=include_ocr,
+                background_color=background,
+            )
+            data = export_store.read_bytes(published.resource.export_id, output_format)
+            result = export_save.save(data, checked, overwrite, item.ID)
+            build = published.result.build
+            saved.append(
+                {
+                    "document": item.VissibleName,
+                    "path": display_path,
+                    **result,
+                    "pages": build.pages,
+                    "status": build.status,
+                    "warnings": list(build.warnings),
+                }
+            )
+        except (export_save.SaveError, _ExportRequestError) as exc:
+            failed.append(
+                {
+                    "document": item.VissibleName,
+                    "path": display_path,
+                    "error": exc.error_type,
+                    "message": exc.message,
+                }
+            )
+        except Exception as exc:
+            failed.append(
+                {
+                    "document": item.VissibleName,
+                    "path": display_path,
+                    "error": "export_failed",
+                    "message": str(exc),
+                }
+            )
+    return {"saved": saved, "failed": failed}
+
+
 async def _saved_export_response(published, output_format, save_path, overwrite, page_ranges):
     """Save a published export at ``save_path`` and describe the saved copy."""
     resource, result = published.resource, published.result
@@ -2474,15 +2596,91 @@ async def _saved_export_response(published, output_format, save_path, overwrite,
     return make_response(response, hint)
 
 
+async def _remarkable_export_many(
+    document, output_format, pdf_mode, include_ocr, pages, save_to, overwrite, folder, tags
+):
+    """remarkable_export for a folder and/or tags."""
+
+    def invalid(message: str, suggestion: str):
+        return make_error(
+            error_type="invalid_export_options", message=message, suggestion=suggestion
+        )
+
+    if document is not None:
+        return invalid(
+            "Give document, or folder and/or tags, not both.",
+            "Omit document to export a folder or tagged documents.",
+        )
+    if pages is not None:
+        return invalid("pages applies to one document only.", "Omit pages.")
+    if output_format == "markdown" and pdf_mode != "merged":
+        return invalid("pdf_mode applies only to PDF exports.", "Use pdf_mode='merged'.")
+    if output_format == "pdf" and include_ocr:
+        return invalid("include_ocr applies only to Markdown exports.", "Set include_ocr=False.")
+    if tags is not None and (
+        not isinstance(tags, list) or not tags or not all(isinstance(t, str) for t in tags)
+    ):
+        return invalid("tags must be a non-empty list of tag names.", 'Example: tags=["Graded"]')
+    if save_to is None:
+        return invalid(
+            "Exporting several documents needs save_to, a folder to save them in.",
+            "Pass save_to as a folder inside REMARKABLE_EXPORT_DIRS.",
+        )
+    try:
+        save_dir = export_save.check_dir(save_to)
+        client = await run_blocking(get_rmapi)
+        collection = await run_blocking(client.get_meta_items)
+        items_by_id = get_items_by_id(collection)
+        base, documents = _export_targets(collection, items_by_id, folder, tags)
+    except (_ExportRequestError, export_save.SaveError) as exc:
+        return make_error(error_type=exc.error_type, message=exc.message, suggestion=exc.suggestion)
+    if not documents:
+        return make_response(
+            {"saved": [], "failed": [], "count": 0, "save_to": str(save_dir)},
+            "No documents matched; nothing was exported.",
+        )
+    if len(documents) > MAX_BATCH_EXPORTS:
+        return invalid(
+            f"{len(documents)} documents match; at most {MAX_BATCH_EXPORTS} are exported at once.",
+            "Narrow the export with a subfolder or tags.",
+        )
+    result = await run_blocking(
+        _export_many,
+        client,
+        collection,
+        items_by_id,
+        documents,
+        base,
+        save_dir,
+        output_format=output_format,
+        pdf_mode=pdf_mode,
+        include_ocr=include_ocr,
+        overwrite=overwrite,
+    )
+    data = {
+        "saved": result["saved"],
+        "failed": result["failed"],
+        "count": len(documents),
+        "save_to": str(save_dir),
+        "format": output_format,
+    }
+    hint = f"Saved {len(result['saved'])} of {len(documents)} documents to {save_dir}."
+    if result["failed"]:
+        hint += f" {len(result['failed'])} failed; see failed."
+    return make_response(data, hint + " The tablet was not modified.")
+
+
 @mcp.tool(annotations=EXPORT_ANNOTATIONS)
 async def remarkable_export(
-    document: str,
+    document: Optional[str] = None,
     output_format: Literal["pdf", "markdown"] = "pdf",
     pdf_mode: Literal["merged", "annotations"] = "merged",
     include_ocr: bool = False,
     pages: Optional[int | str] = None,
     save_to: Optional[str] = None,
     overwrite: bool = False,
+    folder: Optional[str] = None,
+    tags: Optional[List[str]] = None,
 ):
     """
     <usecase>Export one reMarkable document as a reusable PDF or Markdown file.</usecase>
@@ -2502,6 +2700,14 @@ async def remarkable_export(
     temporary name and renamed into place. An existing file is replaced only
     with `overwrite=True`, and only when it is an earlier export of the same
     document. Nothing is ever deleted.
+
+    To export many documents, give `folder` (its documents and those in its
+    subfolders) and/or `tags` (documents with any of them; the whole library
+    when no folder is given) instead of `document`, with `save_to` a folder
+    inside REMARKABLE_EXPORT_DIRS. Subfolders are recreated under it and
+    files are named after the documents. Each document is exported on its
+    own: the response lists every saved file (path, size, page count,
+    SHA-256) and every failure, such as a file that already exists.
 
     PDF behavior:
     - `pdf_mode="merged"` (default) preserves complete physical pages, combining
@@ -2530,6 +2736,10 @@ async def remarkable_export(
       inside a folder listed in REMARKABLE_EXPORT_DIRS.
     - overwrite: Replace an existing file at save_to that is an earlier export
       of the same document (default: False).
+    - folder: Export every document in this folder and its subfolders
+      (needs save_to as a folder).
+    - tags: Export documents with any of these tags (needs save_to as a
+      folder); combined with folder, only those inside it.
     </parameters>
     <examples>
     - remarkable_export("Meeting Notes")
@@ -2538,8 +2748,20 @@ async def remarkable_export(
     - remarkable_export("Lecture Notes", pages="3-5,9")
     - remarkable_export("Week 3 worksheet",
         save_to="/Users/me/Projects/Course/Worksheets/Week 3 - done.pdf")
+    - remarkable_export(folder="/Classes/Lunar Theory/Worksheets", tags=["Graded"],
+        save_to="/Users/me/Projects/Course/Graded worksheets")
     </examples>
     """
+    if folder is not None or tags is not None:
+        return await _remarkable_export_many(
+            document, output_format, pdf_mode, include_ocr, pages, save_to, overwrite, folder, tags
+        )
+    if not isinstance(document, str) or not document.strip():
+        return make_error(
+            error_type="invalid_export_options",
+            message="Give document, or folder and/or tags to export several.",
+            suggestion="Example: remarkable_export('Meeting Notes').",
+        )
     if output_format == "markdown" and pdf_mode != "merged":
         return make_error(
             error_type="invalid_export_options",

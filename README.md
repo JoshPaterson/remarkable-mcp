@@ -426,7 +426,7 @@ Or copy the `SKILL.md` from this repository into your `~/.openclaw/skills/remark
 | `remarkable_recent` | Get recently modified documents |
 | `remarkable_status` | Check connection status and the per-transport capability matrix |
 | `remarkable_image` | Get PNG/SVG images of pages with optional OCR |
-| `remarkable_export` | Export one document as a temporary PDF or Markdown resource, or save it into a folder allowed by `REMARKABLE_EXPORT_DIRS` |
+| `remarkable_export` | Export one document as a temporary PDF or Markdown resource, or save it, or a whole folder or tag, into a folder allowed by `REMARKABLE_EXPORT_DIRS` |
 
 The read/search/render tools are read-only. `remarkable_export` never changes the
 tablet, but it writes a bounded temporary file on the MCP server host and therefore
