@@ -65,6 +65,73 @@ def test_cloud_document_tags_are_read_from_content_blob():
     assert doc.page_tags == ["test-page"]
 
 
+def test_ssh_document_tags_are_read_from_content_file():
+    """SSH listing reads .metadata and .content in one batched command."""
+    from remarkable_mcp.ssh import SSHClient
+
+    content = json.dumps(
+        {
+            "fileType": "pdf",
+            "tags": [{"name": "test-doc", "timestamp": 1}],
+            "pageTags": [{"name": "test-page", "pageId": "p3", "timestamp": 2}],
+        },
+        indent=4,
+    )
+    output = (
+        "\n===FILE===doc-1\n"
+        '{"visibleName": "Tagged", "type": "DocumentType", "parent": ""}\n'
+        "===CONTENT===\n"
+        f"{content}\n"
+        "\n===FILE===folder-1\n"
+        '{"visibleName": "Folder", "type": "CollectionType", "parent": ""}\n'
+        "===CONTENT===\n"
+        "\n===FILE===doc-2\n"
+        '{"visibleName": "Plain", "type": "DocumentType", "parent": "",'
+        ' "tags": ["meta-tag"]}\n'
+        "===CONTENT===\n"
+        '{"fileType": "notebook"}\n'
+    )
+    commands = []
+
+    def fake_command(command, timeout=30):
+        commands.append(command)
+        return output
+
+    client = SSHClient()
+    client._ssh_command = fake_command
+    try:
+        docs = {doc.ID: doc for doc in client.get_meta_items()}
+
+        assert docs["doc-1"].tags == ["test-doc"]
+        assert docs["doc-1"].page_tags == ["test-page"]
+        assert docs["folder-1"].tags == []
+        assert docs["doc-2"].tags == ["meta-tag"]
+        assert docs["doc-2"].page_tags == []
+        # The same listing fills the file-type cache without another command.
+        assert client.get_all_file_types() == {"doc-1": "pdf", "doc-2": "notebook"}
+        assert len(commands) == 1
+        assert ".content" in commands[0]
+    finally:
+        client.close()
+
+
+def test_ssh_limited_listing_does_not_fill_file_type_cache():
+    from remarkable_mcp.ssh import SSHClient
+
+    client = SSHClient()
+    client._ssh_command = lambda command, timeout=30: (
+        "===FILE===doc-1\n"
+        '{"visibleName": "One", "type": "DocumentType"}\n'
+        "===CONTENT===\n"
+        '{"fileType": "pdf"}\n'
+    )
+    try:
+        assert [doc.ID for doc in client.get_meta_items(limit=1)] == ["doc-1"]
+        assert client._file_type_cache is None
+    finally:
+        client.close()
+
+
 def _item(name, item_id, parent, *, folder=False, tags=None, page_tags=None):
     item = Mock()
     item.VissibleName = name

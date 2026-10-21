@@ -37,6 +37,7 @@ from remarkable_mcp.ssh_reliability import (
     _uncancel_current_task,
     classify_pre_execution_failure,
 )
+from remarkable_mcp.tags import document_tag_names, page_tag_names
 
 logger = logging.getLogger(__name__)
 T = TypeVar("T")
@@ -125,6 +126,51 @@ class Document:
 
 # Alias for compatibility
 Folder = Document
+
+_CONTENT_MARKER = "===CONTENT==="
+
+
+def _split_metadata_output(output: str) -> List[tuple]:
+    """Split the batched listing into ``(doc_id, metadata, content)`` texts.
+
+    Each document starts with ``===FILE===<id>`` followed by its ``.metadata``
+    JSON and, optionally, a ``===CONTENT===`` line and its ``.content`` JSON.
+    """
+    entries = []
+    current_id = None
+    metadata_lines: List[str] = []
+    content_lines: List[str] = []
+    in_content = False
+
+    def flush() -> None:
+        if current_id and any(line.strip() for line in metadata_lines):
+            entries.append((current_id, "\n".join(metadata_lines), "\n".join(content_lines)))
+
+    for line in output.split("\n"):
+        if line.startswith("===FILE==="):
+            flush()
+            current_id = line[len("===FILE===") :].strip()
+            metadata_lines, content_lines = [], []
+            in_content = False
+        elif line.strip() == _CONTENT_MARKER and not in_content:
+            in_content = True
+        elif in_content:
+            content_lines.append(line)
+        else:
+            metadata_lines.append(line)
+    flush()
+    return entries
+
+
+def _parse_content(text: str) -> Optional[dict]:
+    """Parse ``.content`` JSON text, or None when empty or invalid."""
+    if not text.strip():
+        return None
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        return None
+    return data if isinstance(data, dict) else None
 
 
 class SSHClient:
@@ -714,38 +760,29 @@ class SSHClient:
             if limit is not None and len(self._documents) >= limit:
                 return self._documents[:limit]
             generation = self._metadata_generation
+        with self._file_type_lock:
+            file_type_generation = self._file_type_generation
         try:
             output = self._ssh_command(
                 f"for f in {XOCHITL_PATH}/*.metadata; do "
-                f'echo; echo "===FILE===$(basename $f .metadata)"; cat "$f" 2>/dev/null; '
+                f'id=$(basename "$f" .metadata); '
+                f'echo; echo "===FILE===$id"; cat "$f" 2>/dev/null; '
+                f'echo; echo "{_CONTENT_MARKER}"; cat "{XOCHITL_PATH}/$id.content" 2>/dev/null; '
                 f"done",
                 timeout=60,
             )
         except Exception as e:
             raise RuntimeError(f"Failed to read metadata: {e}") from e
 
-        documents = []
-        current_id = None
-        current_content = []
-
-        for line in output.split("\n"):
-            if line.startswith("===FILE==="):
-                if current_id and current_content:
-                    self._parse_and_add_document(
-                        current_id, "\n".join(current_content), documents, limit
-                    )
-                    if limit is not None and len(documents) >= limit:
-                        break
-                current_id = line.replace("===FILE===", "").strip()
-                current_content = []
-            else:
-                current_content.append(line)
-
-        if current_id and current_content:
-            if limit is None or len(documents) < limit:
-                self._parse_and_add_document(
-                    current_id, "\n".join(current_content), documents, limit
-                )
+        documents: List[Document] = []
+        file_types: dict[str, Optional[str]] = {}
+        for doc_id, metadata_text, content_text in _split_metadata_output(output):
+            content = _parse_content(content_text)
+            if content_text.strip():
+                file_types[doc_id] = content.get("fileType") if content else None
+            if limit is not None and len(documents) >= limit:
+                break
+            self._parse_and_add_document(doc_id, metadata_text, content, documents, limit)
 
         with self._metadata_lock:
             if generation == self._metadata_generation:
@@ -753,22 +790,37 @@ class SSHClient:
                 self._documents_by_id = {d.id: d for d in documents}
                 self._metadata_loaded_all = limit is None
 
+        if limit is None:
+            # The listing read every .content file, so it doubles as the
+            # file-type preload.
+            with self._file_type_lock:
+                if (
+                    self._file_type_cache is None
+                    and file_type_generation == self._file_type_generation
+                ):
+                    self._file_type_cache = file_types
+
         logger.info(f"Loaded {len(documents)} documents via SSH")
         return documents
 
     def _parse_and_add_document(
         self,
         doc_id: str,
-        content: str,
+        metadata_text: str,
+        content: Optional[dict],
         documents: List[Document],
         limit: Optional[int],
     ) -> None:
-        """Parse metadata JSON and add document to list."""
+        """Parse metadata JSON and add document to list.
+
+        ``content`` is the parsed ``.content`` file (or None); document and
+        page tags are read from it.
+        """
         if limit is not None and len(documents) >= limit:
             return
 
         try:
-            metadata = json.loads(content.strip())
+            metadata = json.loads(metadata_text.strip())
 
             # Skip deleted documents
             if metadata.get("deleted", False):
@@ -794,7 +846,8 @@ class SSHClient:
                 synced=metadata.get("synced", True),
                 last_modified=last_modified,
                 size=0,
-                tags=metadata.get("tags", []),
+                tags=document_tag_names(metadata, content),
+                page_tags=page_tag_names(content),
                 local_path=f"{XOCHITL_PATH}/{doc_id}",
             )
 
