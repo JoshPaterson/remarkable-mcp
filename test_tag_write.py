@@ -365,6 +365,8 @@ async def test_tag_tool_not_registered_over_usb(monkeypatch):
 
     monkeypatch.delenv("REMARKABLE_USE_SSH", raising=False)
     monkeypatch.setenv("REMARKABLE_USE_USB_WEB", "1")
+    for name in WRITE_TOOLS:
+        mcp._tool_manager._tools.pop(name, None)
     register_write_tools()
     try:
         names = {t.name for t in await mcp.list_tools()}
