@@ -32,7 +32,7 @@ import time
 import uuid
 from contextlib import contextmanager, nullcontext
 from datetime import datetime
-from typing import Annotated, Optional
+from typing import Annotated, Dict, List, Optional, Union
 
 from mcp.server.mcpserver import Context, Elicit, ElicitationResult, Resolve
 from mcp.types import ToolAnnotations
@@ -1059,6 +1059,263 @@ def _cloud_delete(document: str) -> str:
     )
 
 
+def _describe_documents(document) -> str:
+    """``'Name'``, or ``3 items ('A', 'B', 'C')`` for a list."""
+    if isinstance(document, str):
+        return f"'{document}'"
+    names = [str(name) for name in document or []]
+    shown = ", ".join(f"'{name}'" for name in names[:10])
+    more = f" and {len(names) - 10} more" if len(names) > 10 else ""
+    return f"{len(names)} items ({shown}{more})"
+
+
+def _invalid_document_list() -> str:
+    return make_error(
+        error_type="invalid_parameter",
+        message="document must be a name or a non-empty list of names.",
+        suggestion='Example: document=["Week 1 worksheet", "Week 2 worksheet"]',
+    )
+
+
+def _invalid_rename() -> str:
+    return make_error(
+        error_type="invalid_parameter",
+        message="Give document and new_name, or renames (not both).",
+        suggestion='Example: renames={"Week 1": "Week 1 - graded"}',
+    )
+
+
+def _run_batch(operation: str, run) -> str:
+    """``run(client, cloud)`` with the transport's client, turning failures
+    into an error response."""
+    cloud = _is_cloud_mode()
+    try:
+        client = get_rmapi() if cloud else _get_ssh_client()
+        return run(client, cloud)
+    except SSHReliabilityError:
+        raise
+    except Exception as e:
+        return make_error(
+            error_type=f"{operation}_failed",
+            message=f"Failed to {operation}: {e}",
+            suggestion="Check the connection and try again.",
+        )
+
+
+def _document_names(document) -> Optional[List[str]]:
+    """``document`` as a list of names, or None if it is not a name or a
+    non-empty list of names."""
+    names = [document] if isinstance(document, str) else document
+    if not isinstance(names, list) or not names:
+        return None
+    if not all(isinstance(name, str) and name.strip() for name in names):
+        return None
+    return names
+
+
+def _resolve_targets(names: List[str], collection, items_by_id) -> tuple:
+    """``(targets, None)`` for every name, de-duplicated, or ``(None, error)``
+    naming the first that cannot be found; nothing has been changed then."""
+    targets: list = []
+    for name in names:
+        target = _resolve_document(name, collection, items_by_id)
+        if not target:
+            from remarkable_mcp.extract import find_similar_documents
+
+            similar = find_similar_documents(name, collection)
+            return None, make_error(
+                error_type="document_not_found",
+                message=f"Document not found: '{name}'",
+                suggestion="Use remarkable_browse() to find the correct name. Nothing was changed.",
+                did_you_mean=similar if similar else None,
+            )
+        if all(t.ID != target.ID for t in targets):
+            targets.append(target)
+    return targets, None
+
+
+def _move_cycle_error(target, dest_id: str, items_by_id) -> Optional[str]:
+    """An error if ``target`` is a folder and ``dest_id`` is it or inside it."""
+    if not target.is_folder:
+        return None
+    check_id = dest_id
+    while check_id:
+        if check_id == target.ID:
+            return make_error(
+                error_type="invalid_move",
+                message=f"Cannot move folder '{target.VissibleName}' into itself or its subfolders",
+                suggestion="Choose a destination outside that folder. Nothing was changed.",
+            )
+        item = items_by_id.get(check_id)
+        check_id = getattr(item, "Parent", "") if item is not None else ""
+    return None
+
+
+def _ssh_update_metadata(ssh_client, changes: list, defer_restart: bool) -> bool:
+    """Apply ``[(target, apply)]`` to each target's ``.metadata`` over SSH:
+    every file is read and changed before any is written, then xochitl
+    restarts once (unless deferred). Returns whether it restarted."""
+    updated = []
+    for target, apply in changes:
+        raw = ssh_client._scp_download(f"{XOCHITL_PATH}/{target.ID}.metadata")
+        metadata = json.loads(raw.decode("utf-8"))
+        apply(metadata)
+        metadata["lastModified"] = str(int(time.time() * 1000))
+        metadata["metadatamodified"] = True
+        updated.append((target, metadata))
+    for target, metadata in updated:
+        _write_metadata(ssh_client, target.ID, metadata)
+    return _maybe_restart_xochitl(ssh_client, defer_restart)
+
+
+def _trash_metadata(metadata: dict) -> None:
+    metadata["parent"] = "trash"
+    metadata["deleted"] = False
+    try:
+        metadata["version"] = int(metadata.get("version", 0)) + 1
+    except (TypeError, ValueError):
+        metadata["version"] = 1
+
+
+def _move_many(client, names: List[str], dest_folder: str, cloud: bool, defer_restart: bool):
+    """Move several documents or folders into one folder in one write."""
+    collection = client.get_meta_items()
+    items_by_id = get_items_by_id(collection)
+    targets, error = _resolve_targets(names, collection, items_by_id)
+    if error:
+        return error
+    dest_id = _resolve_parent_id(dest_folder, items_by_id, collection)
+    if dest_id is None:
+        return make_error(
+            error_type="folder_not_found",
+            message=f"Destination folder not found: '{dest_folder}'",
+            suggestion="Use remarkable_browse('/') to see available folders. Nothing was changed.",
+        )
+    for target in targets:
+        error = _move_cycle_error(target, dest_id, items_by_id)
+        if error:
+            return error
+    moved = [{"name": t.VissibleName, "from": get_item_path(t, items_by_id)} for t in targets]
+
+    def apply(metadata: dict) -> None:
+        metadata["parent"] = dest_id
+
+    data = {"moved": moved, "to": dest_folder, "count": len(targets)}
+    if cloud:
+        client.update_documents_metadata({t.ID: apply for t in targets})
+        _invalidate_client_cache(client)
+        return make_response(
+            dict(data, transport="cloud"),
+            f"Moved {len(targets)} items in the reMarkable cloud in one change.",
+        )
+    restarted = _ssh_update_metadata(client, [(t, apply) for t in targets], defer_restart)
+    for target in targets:
+        target.parent = dest_id
+        target.last_modified = datetime.now()
+        _update_deferred_ssh_cache(client, restarted, document=target)
+    return make_response(
+        dict(data, refresh_pending=not restarted),
+        _write_result_message(restarted, f"Moved {len(targets)} items."),
+    )
+
+
+def _rename_many(client, renames: Dict[str, str], cloud: bool, defer_restart: bool):
+    """Rename several documents or folders in one write."""
+    collection = client.get_meta_items()
+    items_by_id = get_items_by_id(collection)
+    targets, error = _resolve_targets(list(renames), collection, items_by_id)
+    if error:
+        return error
+    new_names: dict = {}
+    for name, new_name in renames.items():
+        target = _resolve_document(name, collection, items_by_id)
+        if target.ID in new_names and new_names[target.ID] != new_name:
+            return make_error(
+                error_type="invalid_parameter",
+                message=f"'{target.VissibleName}' is given two new names.",
+                suggestion="Give each document one new name. Nothing was changed.",
+            )
+        new_names[target.ID] = new_name
+    renamed = [{"old_name": t.VissibleName, "new_name": new_names[t.ID]} for t in targets]
+
+    def apply_for(target):
+        def apply(metadata: dict) -> None:
+            metadata["visibleName"] = new_names[target.ID]
+
+        return apply
+
+    data = {"renamed": renamed, "count": len(targets)}
+    if cloud:
+        client.update_documents_metadata({t.ID: apply_for(t) for t in targets})
+        _invalidate_client_cache(client)
+        return make_response(
+            dict(data, transport="cloud"),
+            f"Renamed {len(targets)} items in the reMarkable cloud in one change.",
+        )
+    restarted = _ssh_update_metadata(client, [(t, apply_for(t)) for t in targets], defer_restart)
+    for target in targets:
+        target.name = new_names[target.ID]
+        target.last_modified = datetime.now()
+        _update_deferred_ssh_cache(client, restarted, document=target)
+    return make_response(
+        dict(data, refresh_pending=not restarted),
+        _write_result_message(restarted, f"Renamed {len(targets)} items."),
+    )
+
+
+def _delete_many(client, names: List[str], cloud: bool, permanent: bool, defer_restart: bool):
+    """Move several documents or folders to the trash (or, over SSH with
+    ``permanent``, remove them) in one write."""
+    collection = client.get_meta_items()
+    items_by_id = get_items_by_id(collection)
+    targets, error = _resolve_targets(names, collection, items_by_id)
+    if error:
+        return error
+    deleted = [
+        {
+            "name": t.VissibleName,
+            "path": get_item_path(t, items_by_id),
+            "type": "folder" if t.is_folder else "document",
+        }
+        for t in targets
+    ]
+    data = {"deleted": deleted, "count": len(targets)}
+    if cloud:
+        client.update_documents_metadata({t.ID: _trash_metadata for t in targets})
+        _invalidate_client_cache(client)
+        return make_response(
+            dict(data, transport="cloud"),
+            f"Moved {len(targets)} items to the trash on your reMarkable "
+            "(recoverable from the device's Trash).",
+        )
+    if permanent:
+        for target in targets:
+            if target.is_folder and any(item.Parent == target.ID for item in collection):
+                return make_error(
+                    error_type="folder_not_empty",
+                    message=f"Cannot permanently delete non-empty folder '{target.VissibleName}'.",
+                    suggestion=(
+                        "Permanently delete its contents first, or omit permanent=True "
+                        "to move it to Trash. Nothing was changed."
+                    ),
+                )
+        for target in targets:
+            _permanently_delete_ssh_entry(client, target.ID)
+        restarted = _maybe_restart_xochitl(client, defer_restart)
+    else:
+        restarted = _ssh_update_metadata(
+            client, [(t, _trash_metadata) for t in targets], defer_restart
+        )
+    for target in targets:
+        _update_deferred_ssh_cache(client, restarted, remove_id=target.ID)
+        _clear_document_extraction_cache(target.ID)
+    done = "permanently deleted" if permanent else "moved to Trash"
+    return make_response(
+        dict(data, permanent=permanent, refresh_pending=not restarted),
+        _write_result_message(restarted, f"{len(targets)} items {done}."),
+    )
+
+
 class _DeleteConfirmation(BaseModel):
     """Schema for confirming a destructive delete via elicitation."""
 
@@ -1076,7 +1333,7 @@ def _delete_confirmation_available(ctx: Context) -> bool:
 
 
 def _resolve_delete_confirmation(
-    document: str,
+    document: Union[str, List[str]],
     permanent: bool,
     confirmation_available: Annotated[bool, Resolve(_delete_confirmation_available)],
 ) -> _DeleteConfirmation | Elicit[_DeleteConfirmation]:
@@ -1090,13 +1347,14 @@ def _resolve_delete_confirmation(
         return _DeleteConfirmation(confirm=True)
     if not confirmation_available:
         return _DeleteConfirmation(confirm=False)
+    what = _describe_documents(document)
     if permanent:
         message = (
-            f"Permanently delete '{document}' from your reMarkable? "
+            f"Permanently delete {what} from your reMarkable? "
             "This is irreversible and cannot be recovered from Trash."
         )
     else:
-        message = f"Delete '{document}' from your reMarkable? This moves it to the trash."
+        message = f"Delete {what} from your reMarkable? This moves it to the trash."
     return Elicit(
         message,
         _DeleteConfirmation,
@@ -1994,7 +2252,7 @@ def register_write_tools():
 
         @mcp.tool(annotations=MOVE_ANNOTATIONS)
         async def remarkable_move(
-            document: str,
+            document: Union[str, List[str]],
             dest_folder: str,
             defer_restart: bool = False,
         ) -> str:
@@ -2002,13 +2260,15 @@ def register_write_tools():
             <usecase>Move a document or folder to a different location.</usecase>
             <instructions>
             Moves a document or folder by updating its parent reference in the metadata.
-            Find the document name with remarkable_browse() first.
+            Find the document name with remarkable_browse() first. Give a list to
+            move several into the same folder in one write: every name is checked
+            first, and if any cannot be found nothing is moved.
 
             Works in cloud and SSH modes (default; --read-only disables). Not available over the
             USB web interface.
             </instructions>
             <parameters>
-            - document: Name or path of the document/folder to move
+            - document: Name or path of the document/folder to move, or a list
             - dest_folder: Destination folder path (use "/" for root)
             - defer_restart: SSH only. Skip the xochitl restart so a batch of
               writes can refresh once via remarkable_refresh() instead of once
@@ -2017,14 +2277,25 @@ def register_write_tools():
             <examples>
             - remarkable_move("Meeting Notes", "/Archive")
             - remarkable_move("Old Project", "/Archive/2023")
+            - remarkable_move(["Week 1 worksheet", "Week 2 worksheet"], "/Archive")
             </examples>
             """
+            names = _document_names(document)
+            if names is None:
+                return _invalid_document_list()
 
             def _impl() -> str:
                 error = _require_managed_write_mode()
                 if error:
                     return error
 
+                if not isinstance(document, str):
+                    return _run_batch(
+                        "move",
+                        lambda client, cloud: _move_many(
+                            client, names, dest_folder, cloud, defer_restart
+                        ),
+                    )
                 if _is_cloud_mode():
                     return _cloud_move(document, dest_folder)
 
@@ -2130,15 +2401,18 @@ def register_write_tools():
 
         @mcp.tool(annotations=RENAME_ANNOTATIONS)
         async def remarkable_rename(
-            document: str,
-            new_name: str,
+            document: Optional[str] = None,
+            new_name: Optional[str] = None,
+            renames: Optional[Dict[str, str]] = None,
             defer_restart: bool = False,
         ) -> str:
             """
             <usecase>Rename a document or folder on the reMarkable tablet.</usecase>
             <instructions>
             Changes the display name of a document or folder by updating its metadata.
-            Find the document name with remarkable_browse() first.
+            Find the document name with remarkable_browse() first. To rename several
+            in one write, give renames instead: every name is checked first, and if
+            any cannot be found nothing is renamed.
 
             Works in cloud and SSH modes (default; --read-only disables). Not available over the
             USB web interface.
@@ -2146,6 +2420,8 @@ def register_write_tools():
             <parameters>
             - document: Current name or path of the document/folder
             - new_name: New display name
+            - renames: Instead of document and new_name, a mapping of current
+              names or paths to new names
             - defer_restart: SSH only. Skip the xochitl restart so a batch of
               writes can refresh once via remarkable_refresh() instead of once
               per write. Sets "refresh_pending": true. Ignored in cloud mode.
@@ -2153,14 +2429,32 @@ def register_write_tools():
             <examples>
             - remarkable_rename("Untitled", "Meeting Notes 2024-01-15")
             - remarkable_rename("/Work/Draft", "Final Report")
+            - remarkable_rename(renames={"Week 1": "Week 1 - graded",
+                                         "Week 2": "Week 2 - graded"})
             </examples>
             """
+            if renames is not None:
+                if document is not None or new_name is not None:
+                    return _invalid_rename()
+                valid = isinstance(renames, dict) and renames
+                if not valid or not all(
+                    isinstance(k, str) and k.strip() and isinstance(v, str) and v.strip()
+                    for k, v in renames.items()
+                ):
+                    return _invalid_rename()
+            elif not (isinstance(document, str) and isinstance(new_name, str)):
+                return _invalid_rename()
 
             def _impl() -> str:
                 error = _require_managed_write_mode()
                 if error:
                     return error
 
+                if renames is not None:
+                    return _run_batch(
+                        "rename",
+                        lambda client, cloud: _rename_many(client, renames, cloud, defer_restart),
+                    )
                 if _is_cloud_mode():
                     return _cloud_rename(document, new_name)
 
@@ -2233,7 +2527,7 @@ def register_write_tools():
 
         @mcp.tool(annotations=DELETE_ANNOTATIONS)
         async def remarkable_delete(
-            document: str,
+            document: Union[str, List[str]],
             defer_restart: bool = False,
             permanent: bool = False,
             *,
@@ -2249,7 +2543,9 @@ def register_write_tools():
             DESTRUCTIVE operation. By default the item is moved to the tablet's
             Trash and remains recoverable. In SSH mode only, permanent=True removes
             the resolved UUID and all sidecar files instead; use that only when the
-            user explicitly asked for permanent deletion.
+            user explicitly asked for permanent deletion. Give a list to delete
+            several in one write, with one confirmation for all of them; every name
+            is checked first, and if any cannot be found nothing is deleted.
 
             Works in cloud and SSH modes (default; --read-only disables). Not available over the
             USB web interface.
@@ -2260,7 +2556,7 @@ def register_write_tools():
             automation).
             </instructions>
             <parameters>
-            - document: Name or path of the document/folder to delete
+            - document: Name or path of the document/folder to delete, or a list
             - defer_restart: SSH only. Skip the xochitl restart so a batch of
               deletes can refresh once via remarkable_refresh() instead of once
               per delete. Sets "refresh_pending": true. Ignored in cloud mode.
@@ -2270,15 +2566,47 @@ def register_write_tools():
             <examples>
             - remarkable_delete("Old Notes")
             - remarkable_delete("/Books/Archive/Old Draft")
+            - remarkable_delete(["Draft 1", "Draft 2"])
             </examples>
             """
             error = _require_managed_write_mode()
             if error:
                 return error
+            names = _document_names(document)
+            if names is None:
+                return _invalid_document_list()
 
-            abort = _delete_confirmation_abort(confirmation, confirmation_available, document)
+            abort = _delete_confirmation_abort(
+                confirmation, confirmation_available, _describe_documents(document)
+            )
             if abort:
                 return abort
+
+            if not isinstance(document, str):
+                if _is_cloud_mode() and permanent:
+                    return make_error(
+                        error_type="permanent_delete_unsupported",
+                        message="Permanent deletion is not supported in cloud mode.",
+                        suggestion=(
+                            "Delete normally to move the items to Trash, then empty "
+                            "Trash from a reMarkable app or tablet."
+                        ),
+                    )
+
+                def _batch() -> str:
+                    return _run_batch(
+                        "delete",
+                        lambda client, cloud: _delete_many(
+                            client, names, cloud, permanent, defer_restart
+                        ),
+                    )
+
+                ssh_client = None if _is_cloud_mode() else _get_ssh_client()
+                if isinstance(ssh_client, SSHClient):
+                    return await _run_ssh_tool_operation(
+                        ssh_client, "delete", _batch, defer_restart=defer_restart
+                    )
+                return await asyncio.to_thread(_batch)
 
             if _is_cloud_mode():
                 if permanent:

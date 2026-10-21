@@ -669,9 +669,9 @@ Or set the environment variable:
 | `remarkable_upload(file_path, parent_folder, document_name, defer_restart)` | Upload a PDF or EPUB file (cloud, SSH, and USB web; USB web preserves the name but ignores `parent_folder`) |
 | `remarkable_markdown_to_pdf(markdown, document_name, parent_folder, defer_restart)` | Render Markdown as a paginated PDF and upload it (cloud, SSH, and USB web) |
 | `remarkable_mkdir(folder_name, parent, defer_restart)` | Create a new folder (cloud and SSH) |
-| `remarkable_move(document, dest_folder, defer_restart)` | Move a document or folder (cloud and SSH) |
-| `remarkable_rename(document, new_name, defer_restart)` | Rename a document or folder (cloud and SSH) |
-| `remarkable_delete(document, defer_restart, permanent)` | Move a document/folder to Trash; SSH can permanently remove it with `permanent=True` |
+| `remarkable_move(document, dest_folder, defer_restart)` | Move a document or folder, or a list of them in one write (cloud and SSH) |
+| `remarkable_rename(document, new_name, renames, defer_restart)` | Rename a document or folder, or several with `renames={old: new}` in one write (cloud and SSH) |
+| `remarkable_delete(document, defer_restart, permanent)` | Move a document/folder (or a list, with one confirmation) to Trash; SSH can permanently remove it with `permanent=True` |
 | `remarkable_refresh()` | Safely restart `xochitl` once to apply pending writes made with `defer_restart=True`; no-op after this process has confirmed a clean state — **SSH only** |
 | `remarkable_author(method, ..., defer_restart)` | Author native ink and notebooks — `draw` (append strokes), `add_page` (append a blank notebook page), `create_document` (new notebook) — **SSH only** |
 
