@@ -158,12 +158,15 @@ the region after the text:
   • [pink] Estimate the remainder for a Taylor series   region [0.177, 0.206, 0.479, 0.219]
 ```
 
-Highlight text comes from the PDF's text layer and often misses mathematical
-symbols and equations. When the exact highlighted content matters, render the
-highlight's `region` with `remarkable_image`.
+Highlight text can be wrong: it often misses mathematical symbols and
+equations, or comes back short, garbled or with gaps. The region is reliable.
+When the exact highlighted content matters, render the highlight's `region`
+with `remarkable_image` (e.g. at `dpi=300`).
 
-Highlighter strokes that did not snap to text (freehand highlighter ink) are
-summarized per page, e.g. `Page 2: 2 highlighter strokes (pink, yellow)`, and
+Highlighter strokes that did not snap to text (freehand highlighter ink, often
+over a display equation) are summarized per page, e.g. `Page 2: 2 highlighter
+strokes (pink, yellow)`, listed as `~ [pink] highlighter stroke, region [...]`,
+and
 returned as `highlighter_strokes` with `page`, the same color fields, and the
 stroke's extent including the pen width, as `[left, top, right, bottom]` from
 the page's top-left corner: `bbox_mm` in millimetres and `region` as fractions
@@ -191,10 +194,19 @@ The same data is returned as `layers: [{"page": 3, "layers": [...]}]`.
 Images pasted onto a page with the tablet's capture feature are listed per
 page, e.g. `Page 4: handwritten notes, 1 pasted image` followed by
 `+ pasted image, region [left, top, right, bottom]`, and returned as `images`
-with `page`, `file`, `layer`, `bbox_mm` and `region`. `remarkable_image` draws
-them in the tablet's stacking order: within a layer, items are drawn in the
-order they were placed, so ink written over an image covers it and an image
-that is moved comes to the top.
+with `page`, `file`, `layer`, `bbox_mm` and `region`. Ink and highlights
+copied inside a capture are part of the image, so they are not in the stroke
+or highlight lists; read them from the render. `remarkable_image` draws
+captures where they were placed (moved, resized and rotated ones included) and
+in the tablet's stacking order: within a layer, items are drawn in the order
+they were placed, so ink written over an image covers it, a later capture
+covers an earlier one, and an image that is moved comes to the top. Captures
+are opaque and hide what is beneath them; captures on hidden layers follow the
+`layers` selection like ink.
+
+The annotation list is a summary: handwriting is reported per page but not
+transcribed without OCR. When reviewing the user's work, render each page with
+`remarkable_image` as well.
 
 ### Page templates
 
@@ -206,7 +218,11 @@ them: notebook pages render on a plain background.
 
 ### Typed text
 
-Typed text on notebook pages is drawn in Noto Sans. The tablet uses its own
+Typed text on notebook pages (keyboard or type tool) comes first in
+`content`, before the annotated pages. A highlight on typed text is listed like
+a PDF highlight, with its text and region.
+
+Typed text is drawn in Noto Sans. The tablet uses its own
 font, reMarkable Sans, which cannot be included; Noto Sans has nearly the same
 letter widths, so words land within about 2% of where the tablet puts them.
 Where typed text is highlighted, the line is moved sideways (and squeezed if
@@ -227,6 +243,10 @@ region. Regions are page fractions, as for `remarkable_image`'s `region`. A
 mark with a cover layer adds `[cover 'Mark cover': hidden on tablet]` to its
 line and `"cover": {"layer", "state"}` to its entry; the state is `hidden on
 tablet`, `shown on tablet` or `cover erased on tablet`.
+
+Marks are the agent's, not the user's ink. Erasable marks and covers are
+written as tablet ink, so the per-page lines also count them as strokes or
+highlights.
 
 A PDF with an outline (table of contents) also returns `outline: [{"level",
 "title", "page"}]` with tablet page numbers (`page` is null for an entry that
@@ -336,6 +356,10 @@ remarkable_browse("/Work", tags=["project", "active"])
 
 - **Auto-redirect**: If `path` points to a document instead of a folder, automatically returns the document content (like calling `remarkable_read`)
 - **Case-insensitive**: Paths and searches are case-insensitive
+
+`modified` is the last edit time recorded by the tablet or app that made the
+change, not the time of the last sync. In cloud mode the tablet can upload page
+content later without changing it.
 
 ---
 
@@ -598,6 +622,13 @@ used when configured; otherwise OCR runs locally with Tesseract.
 ### Notes
 
 - Native notebooks retain their existing stroke and blank-page rendering.
+  Notebook templates are not drawn (see Page templates under remarkable_read).
+- Pasted images (captures) are drawn as placed, in the tablet's stacking order
+  (see remarkable_read).
+- Regions from `remarkable_read` line up with the render on PDF-backed pages
+  and notebooks.
+- Ink uses the colors the desktop app draws; pen strokes use their stored
+  widths.
 - PDF-backed PNG pages merge the source page and annotations by default. Explicit
   `render_merged=False` preserves annotation-only access, including user-added
   PDF pages that have no underlay.

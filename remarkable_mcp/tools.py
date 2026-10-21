@@ -389,11 +389,46 @@ async def remarkable_read(
     - "raw": Original PDF/EPUB text only (no annotations). Works in every
       transport, as long as the source file is present (very large PDFs/EPUBs
       may not be synced to the cloud).
-    - "annotations": Only annotations, highlights, and handwritten notes
+    - "annotations": Only the annotations listed below
 
-    Highlight text comes from the PDF's text layer and often misses mathematical
-    symbols and equations. When the exact highlighted content matters, render the
-    highlight's region with remarkable_image(document, page, region=...).
+    Annotations ("text" adds them after the document text):
+    - Notebook typed text (keyboard or type tool) comes first.
+    - "--- Annotated pages ---": one line per annotated page, e.g. "Page 3:
+      handwritten notes, 2 highlights, 1 highlighter stroke (yellow), 1 pasted
+      image; page tags: Review", then one line per item:
+      - highlight: "[color] text   region [...]". JSON "highlights": page,
+        text, color, color_id, color_hex, layer, rects_mm (one box per line
+        or piece), bbox_mm and region. A highlight on notebook typed text
+        carries that text too.
+      - highlighter stroke that did not snap to text (e.g. drawn over a
+        display equation): "~ [color] highlighter stroke, region [...]". JSON
+        "highlighter_strokes": page, color, color_id, color_hex, layer,
+        bbox_mm and region. It has no text.
+      - pasted image (a capture): "+ pasted image, region [...]". JSON
+        "images": page, file, layer, bbox_mm and region. Ink and highlights
+        copied inside a capture are part of the image, not listed.
+      - a page with several layers or a hidden one also gets a line per layer
+        (name, [hidden], counts), and each item names its layer. JSON
+        "layers": [{page, layers: [{name, visible, pen_strokes, pen_colors,
+        highlights, highlighter_strokes, images}]}].
+    - "--- Page templates ---": non-blank notebook templates, e.g. "Page 2:
+      P Dots S" or "Pages 3-5: P Lines medium". JSON "page_templates":
+      [{page, template}].
+    - "--- Handwritten (OCR) ---": with include_ocr.
+    - "--- Marks (added with remarkable_mark_pdf) ---": PDFs only; JSON
+      "marks". These are the agent's marks, not the user's ink. Erasable
+      marks and covers are tablet ink, so the page lines count them too.
+    bbox_mm is millimetres and region page fractions, both [left, top, right,
+    bottom] from the page's top-left; region can be passed to remarkable_image.
+
+    The list summarizes; handwriting is reported but not transcribed without
+    OCR. When reviewing the user's work, render each page with remarkable_image
+    as well.
+
+    Highlight text can be wrong (it often misses mathematical symbols and
+    equations, or is short, garbled or has gaps); the region is reliable. When
+    the exact highlighted content matters, render the highlight's region with
+    remarkable_image(document, page, region=..., dpi=300).
 
     Long text comes in parts (about 8000 characters each; one OCR'd page
     each for handwritten notebooks):
@@ -1034,6 +1069,8 @@ async def remarkable_browse(
        - Works in both browse and search modes
 
     Results include document names, types, modification dates, and tags.
+    "modified" is the last edit time recorded by the tablet or app that made
+    the change, not the time of the last sync.
 
     Note: If REMARKABLE_ROOT_PATH is configured, only documents within that
     folder are accessible. Paths are relative to the root path.
@@ -2054,6 +2091,21 @@ async def remarkable_image(
     PNG pages backed by an imported PDF automatically composite the PDF page with
     its reMarkable annotations. Set render_merged=False for an annotation-only
     render, or True to explicitly request compositing. SVG remains annotation-only.
+
+    ## What the Render Shows
+
+    - Pasted images (captures) are drawn where they were placed, including
+      moved, resized and rotated ones, in the tablet's stacking order: a later
+      capture covers an earlier one, and ink drawn after pasting is on top.
+      Captures are opaque, so they hide what is beneath them. Captures on
+      hidden layers follow the layers selection like ink.
+    - Notebook page templates (dots, lines, grids) are not drawn: notebook
+      pages render on a plain background. A dot grid inside a capture is part
+      of the capture. remarkable_read lists each page's template.
+    - Positions match remarkable_read: its regions line up with the render on
+      PDF-backed pages and notebooks.
+    - Ink uses the colors the desktop app draws, and pen strokes their stored
+      widths.
 
     ## Response Formats
 

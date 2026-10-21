@@ -186,16 +186,19 @@ Paths are relative to the configured root folder, if any.
    parts (`part=2` continues; `more` and `next_part` say whether there is more)
 4. `remarkable_read("Document", grep="pattern")` finds every match in one
    document, with the tablet page of each
-5. `remarkable_recent()` lists what was modified recently
+5. `remarkable_recent()` lists what was modified recently. `modified` is the
+   last edit time recorded by the tablet or app, not the time of the last sync
 
 ### Reading Annotations
 `remarkable_read("Document", content_type="annotations")` lists each annotated
 page with:
 - highlights with their color, e.g. `[pink] passage text`
 - freehand highlighter strokes with color and `region` (page fractions)
+- pasted images (captures) with their `region`
 - page tags, and the page's layers when it has several or a hidden one
-The response also returns `highlights`, `highlighter_strokes`, `page_tags` and
-`layers` as structured data.
+The response also returns `highlights`, `highlighter_strokes`, `images`,
+`page_tags` and `layers` as structured data. The list is a summary; when
+reviewing the user's work, render each page with `remarkable_image` too.
 
 ### Getting Page Images
 Use `remarkable_image` when you need visual context: hand-drawn diagrams,
@@ -294,6 +297,20 @@ delete need SSH or cloud mode.
 
 Connected via the reMarkable Cloud API. Every read feature works, including
 `content_type="raw"`; SSH mode (`uvx remarkable-mcp --ssh`) is faster.
+
+This mode reads the cloud, not the tablet, so it sees only what the tablet has
+synced. Each call reads the current cloud state (cached blobs are immutable
+content, so they never go stale). If results disagree with what the user sees
+at my.remarkable.com or in the desktop app, say so rather than relying on them.
+
+Known tablet sync problem (firmware; seen on the reMarkable 2, not yet tested
+on the Paper Pro): after a capture is pasted into a document, the tablet may
+stop syncing that document until it is restarted, while its own sync check
+reports no problem. Signs: pages blank or missing recent marks, few annotations
+on a document the user says is finished, a tag the user added is missing.
+Fix: restart the tablet (hold the power button, choose restart), then open and
+close the document and watch for the sync progress bar. Restarting keeps
+unsynced work; signing out, unpairing or resetting does not.
 """
         if write_mode:
             instructions += """
