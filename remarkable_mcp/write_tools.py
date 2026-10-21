@@ -1573,19 +1573,18 @@ def _outline_editor(outline, build: bool):
             new = pdf_marks.check_outline(outline, page_map)
         changed = outline is not None and new != current
         entries = new if new is not None else pdf_marks.pdf_outline(base)
-        first_lines: dict = {}
+        opening = _page_openings(
+            base, {e["pdf_page"] for e in entries if e["pdf_page"] is not None}
+        )
         listed = []
         for entry in entries:
             index = entry["pdf_page"]
-            if index is not None and index not in first_lines:
-                lines = pdf_marks.text_lines(base, index)
-                first_lines[index] = lines[0]["text"] if lines else ""
             listed.append(
                 {
                     "level": entry["level"],
                     "title": entry["title"],
                     "page": (pdf_marks.tablet_page(index, page_map) if index is not None else None),
-                    "first_line": first_lines.get(index, ""),
+                    "first_lines": opening.get(index, []),
                 }
             )
         return {
@@ -1596,6 +1595,48 @@ def _outline_editor(outline, build: bool):
         }
 
     return edit
+
+
+OUTLINE_OPENING_LINES = 3
+
+
+# Running headers and footers sit in these top and bottom bands of the page.
+MARGIN_BAND = 0.08
+
+
+def _page_openings(pdf: bytes, pages) -> dict:
+    """The first lines of text on each PDF page in ``pages``, by page index,
+    for checking outline targets. Left out: running headers and footers (a
+    line in the top or bottom band that, ignoring digits, is on over half of
+    these pages), page numbers and lines without letters or digits."""
+    import re
+
+    from remarkable_mcp.pdf_marks import text_lines
+
+    def key(text: str) -> str:
+        return re.sub(r"\d+", "#", text.strip().lower())
+
+    def in_margin(line: dict) -> bool:
+        top, bottom = line["region"][1], line["region"][3]
+        return bottom < MARGIN_BAND or top > 1 - MARGIN_BAND
+
+    lines = {index: text_lines(pdf, index) for index in pages}
+    seen: dict = {}
+    for page_lines in lines.values():
+        for k in {key(line["text"]) for line in page_lines if in_margin(line)}:
+            seen[k] = seen.get(k, 0) + 1
+    repeated = {k for k, n in seen.items() if len(lines) >= 3 and n > len(lines) / 2}
+    out = {}
+    for index, page_lines in lines.items():
+        kept = [
+            line["text"]
+            for line in page_lines
+            if not (in_margin(line) and key(line["text"]) in repeated)
+            and re.search(r"[^\W_]", line["text"])
+            and not line["text"].strip().isdigit()
+        ]
+        out[index] = kept[:OUTLINE_OPENING_LINES]
+    return out
 
 
 def _outline_response(target, result: dict, dry_run: bool) -> str:
@@ -3407,8 +3448,9 @@ def register_write_tools():
                 that has none.</usecase>
                 <instructions>
                 With no outline, lists the document's current outline. Each entry
-                gives its level, title, tablet page and the first line of text on
-                that page, so it can be checked against the page it points to.
+                gives its level, title, tablet page and the first lines of text on
+                that page (running headers and page numbers left out), so it can
+                be checked against the page it points to.
 
                 outline replaces the whole outline: a list of entries
                 {"title": ..., "page": <tablet page, 1-based>, "level": <1 for
@@ -3420,7 +3462,7 @@ def register_write_tools():
                 To build one for a book, find the chapter headings with
                 remarkable_read (its grep option finds lines such as "Chapter"),
                 then set every entry in one call. Use dry_run=True to check the
-                entries, with each page's first line, before writing.
+                entries, with each page's first lines, before writing.
 
                 The PDF's pages, the user's ink and marks added with
                 remarkable_mark_pdf are not changed; the tablet shows the new

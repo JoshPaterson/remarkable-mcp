@@ -84,7 +84,7 @@ async def test_lists_the_pdfs_own_outline(cloud):
 
     assert data["source"] == "the PDF's own" and not data["changed"]
     assert data["outline"] == [
-        {"level": 1, "title": "Own entry", "page": 2, "first_line": "Chapter 2"}
+        {"level": 1, "title": "Own entry", "page": 2, "first_lines": ["Chapter 2"]}
     ]
     assert cloud.commits == 0
 
@@ -98,7 +98,11 @@ async def test_set_replace_remove_and_restore(cloud):
     ]
     data = await _outline_tool(document="Worksheet", outline=entries, dry_run=True)
     assert data["changed"] and data["dry_run"] and cloud.commits == 0
-    assert [e["first_line"] for e in data["outline"]] == ["Chapter 1", "Chapter 2", "Chapter 3"]
+    assert [e["first_lines"] for e in data["outline"]] == [
+        ["Chapter 1"],
+        ["Chapter 2"],
+        ["Chapter 3"],
+    ]
 
     data = await _outline_tool(document="Worksheet", outline=entries)
     assert cloud.commits == 1
@@ -170,3 +174,20 @@ def test_read_maps_outline_pages_to_tablet_pages():
         {"level": 1, "title": "Two", "page": 3},
         {"level": 1, "title": "Gone", "page": None},
     ]
+
+
+def test_page_openings_skip_running_headers_and_page_numbers():
+    from remarkable_mcp.write_tools import _page_openings
+
+    doc = pymupdf.open()
+    for number in range(1, 5):
+        page = doc.new_page(width=A4[0], height=A4[1])
+        page.insert_text((72, 40), f"Erewhon {number * 10}", fontsize=9)
+        page.insert_text((72, 90), f"CHAPTER {number}", fontsize=18)
+        page.insert_text((72, 120), f"Title {number}", fontsize=12)
+        page.insert_text((72, 150), "First sentence.", fontsize=11)
+        page.insert_text((72, 180), "Second sentence.", fontsize=11)
+        page.insert_text((300, 800), str(number), fontsize=9)
+    openings = _page_openings(doc.tobytes(), range(4))
+
+    assert openings[2] == ["CHAPTER 3", "Title 3", "First sentence."]
