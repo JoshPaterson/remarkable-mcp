@@ -6158,6 +6158,44 @@ class TestSSHKeyAuth:
             client.close()
         assert captured["kwargs"]["stdin"] == ssh_mod.subprocess.DEVNULL
 
+    @pytest.mark.parametrize("password", [None, "secret"])
+    def test_password_is_passed_in_env_not_argv(self, monkeypatch, password):
+        import remarkable_mcp.ssh as ssh_mod
+        from remarkable_mcp.ssh import SSHClient
+
+        captured = {}
+
+        class Process:
+            returncode = 0
+
+            def communicate(self, timeout=None):
+                return b"ok", b""
+
+            def poll(self):
+                return self.returncode
+
+        def popen(args, **kwargs):
+            captured["args"] = args
+            captured["kwargs"] = kwargs
+            return Process()
+
+        monkeypatch.setattr(ssh_mod.subprocess, "Popen", popen)
+        client = SSHClient(password=password)
+        try:
+            client._ssh_command("echo ok")
+            client._scp_download("/home/root/file.pdf")
+        finally:
+            client.close()
+        env = captured["kwargs"]["env"]
+        if password:
+            assert captured["args"][:2] == ["sshpass", "-e"]
+            assert password not in captured["args"]
+            assert env["SSHPASS"] == password
+            assert env["PATH"] == os.environ["PATH"]
+        else:
+            assert "sshpass" not in captured["args"]
+            assert env is None
+
     def test_fresh_probe_disables_ssh_multiplexing(self, monkeypatch):
         from remarkable_mcp.ssh import SSHClient
 
@@ -6196,7 +6234,8 @@ class TestSSHKeyAuth:
         client._ssh_command("echo ok")
 
         argv = captured["args"]
-        assert argv[:3] == ["sshpass", "-p", "secret"]
+        assert argv[:2] == ["sshpass", "-e"]
+        assert "secret" not in argv
         # Password auth must not force BatchMode (it would block the password).
         assert "BatchMode=yes" not in argv
         assert "IdentitiesOnly=yes" not in argv
@@ -6259,7 +6298,8 @@ class TestSSHKeyAuth:
         _upload_file_bytes(client, str(local), "/home/root/remote.rm")
 
         argv = captured["args"]
-        assert argv[:3] == ["sshpass", "-p", "secret"]
+        assert argv[:2] == ["sshpass", "-e"]
+        assert "secret" not in argv
         # Password auth must not force BatchMode (it would block the password).
         assert "BatchMode=yes" not in argv
         assert "IdentitiesOnly=yes" not in argv

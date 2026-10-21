@@ -56,7 +56,7 @@ import tempfile
 import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Optional
 
 from mcp import Client, StdioServerParameters
 
@@ -308,7 +308,9 @@ async def existing_stdio_streams(read, write):
     yield read, write
 
 
-def _run_diagnostic_command(args: list[str], timeout: int = 10) -> dict[str, Any]:
+def _run_diagnostic_command(
+    args: list[str], timeout: int = 10, env: Optional[dict[str, str]] = None
+) -> dict[str, Any]:
     try:
         result = subprocess.run(
             args,
@@ -316,6 +318,7 @@ def _run_diagnostic_command(args: list[str], timeout: int = 10) -> dict[str, Any
             text=True,
             errors="replace",
             timeout=timeout,
+            env=env,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         return {"error": f"{type(exc).__name__}: {exc}"}
@@ -399,11 +402,14 @@ def _tablet_diagnostics() -> dict[str, Any]:
         ]
     )
     password = os.environ.get("REMARKABLE_SSH_PASSWORD")
+    env = None
     if password:
-        args = ["sshpass", "-p", password, *args]
+        # sshpass -e reads SSHPASS, keeping the password out of the process list.
+        args = ["sshpass", "-e", *args]
+        env = {**os.environ, "SSHPASS": password}
     else:
         args[1:1] = ["-o", "BatchMode=yes"]
-    return _run_diagnostic_command(args, timeout=15)
+    return _run_diagnostic_command(args, timeout=15, env=env)
 
 
 def _cloud_token_present() -> bool:

@@ -464,7 +464,7 @@ class SSHClient:
 
         # Use sshpass for password authentication
         if self.password:
-            ssh_args = ["sshpass", "-p", self.password] + ssh_args
+            ssh_args = ["sshpass", "-e"] + ssh_args
 
         try:
             returncode, stdout, stderr = self._run_process(
@@ -507,7 +507,7 @@ class SSHClient:
 
         # Use sshpass for password authentication
         if self.password:
-            ssh_args = ["sshpass", "-p", self.password] + ssh_args
+            ssh_args = ["sshpass", "-e"] + ssh_args
 
         try:
             returncode, stdout, stderr = self._run_process(
@@ -546,7 +546,7 @@ class SSHClient:
             (f"printf '{_REMOTE_EXECUTION_MARKER.decode()}\\n' >&2; cat > '{remote_path}'"),
         ]
         if self.password:
-            ssh_args = ["sshpass", "-p", self.password] + ssh_args
+            ssh_args = ["sshpass", "-e"] + ssh_args
 
         try:
             with open(local_path, "rb") as source:
@@ -561,6 +561,17 @@ class SSHClient:
                 raise self._command_failure("Upload", returncode, stdout, stderr)
         finally:
             self._trace_finish(trace, operation, returncode, output_bytes)
+
+    def _process_env(self) -> Optional[Dict[str, str]]:
+        """Environment for ssh subprocesses.
+
+        With password auth, ``sshpass -e`` reads the password from ``SSHPASS``
+        so it never appears in the process list; otherwise the parent
+        environment is inherited unchanged (None).
+        """
+        if not self.password:
+            return None
+        return {**os.environ, "SSHPASS": self.password}
 
     def _run_process(
         self,
@@ -593,6 +604,7 @@ class SSHClient:
                     stdin=subprocess.DEVNULL if stdin is None else stdin,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
+                    env=self._process_env(),
                 )
             except FileNotFoundError as exc:
                 if self.password and "sshpass" in str(exc):
