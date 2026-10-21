@@ -30,6 +30,26 @@ def isolate_blob_cache(monkeypatch):
         yield
 
 
+@pytest.fixture(autouse=True)
+def restore_tool_registry():
+    """Restore the server's registered tools after every test.
+
+    Tests register write tools in different transport modes and remove them
+    again; without restoring the registry, a later test can find a tool
+    missing or registered for another mode, and pass or fail depending on the
+    order the tests run in.
+    """
+    from remarkable_mcp.server import mcp
+
+    tools = mcp._tool_manager._tools
+    saved = dict(tools)
+    try:
+        yield
+    finally:
+        tools.clear()
+        tools.update(saved)
+
+
 def pytest_addoption(parser):
     parser.addoption(
         "--run-integration",
