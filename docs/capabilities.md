@@ -22,7 +22,6 @@ from mcp.server.mcpserver import Context
 from remarkable_mcp.capabilities import (
     client_supports_elicitation,
     get_client_capabilities,
-    get_client_info,
 )
 
 
@@ -32,7 +31,6 @@ async def my_tool(ctx: Context) -> str:
         ...
 
     capabilities = get_client_capabilities(ctx)
-    client = get_client_info(ctx)
     return "result"
 ```
 
@@ -40,10 +38,6 @@ async def my_tool(ctx: Context) -> str:
 |----------|-------------|
 | `get_client_capabilities(ctx)` | Return the request's `ClientCapabilities` |
 | `client_supports_elicitation(ctx)` | Check for form/user elicitation |
-| `client_supports_roots(ctx)` | Check for filesystem roots |
-| `client_supports_experimental(ctx, feature)` | Check an experimental capability |
-| `get_client_info(ctx)` | Return client name, version, and protocol when supplied |
-| `get_protocol_version(ctx)` | Return the negotiated protocol revision |
 | `get_client_extensions(ctx)` | Return protocol extensions such as MCP Apps |
 | `client_supports_apps(ctx)` | Check for the MCP Apps UI extension |
 

@@ -372,12 +372,6 @@ class Document:
         return self.last_modified
 
 
-# Alias for backward compatibility with rmapy-style code
-# In our sync module, both Document and Folder are the same class,
-# distinguished by the is_folder property
-Folder = Document
-
-
 class RemarkableClient:
     """Client for reMarkable Cloud sync API."""
 

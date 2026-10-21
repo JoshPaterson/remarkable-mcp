@@ -45,8 +45,6 @@ REMARKABLE_DISABLE_CLOUD_FALLBACK = os.environ.get(
     "yes",
 )
 REMARKABLE_CONFIG_DIR = Path.home() / ".remarkable"
-REMARKABLE_TOKEN_FILE = REMARKABLE_CONFIG_DIR / "token"
-CACHE_DIR = REMARKABLE_CONFIG_DIR / "cache"
 
 # Process-level cloud client cache. The cloud client exchanges its long-lived
 # device token for a short-lived user token on first use; caching the client
@@ -273,12 +271,6 @@ def get_active_transport() -> str:
     if REMARKABLE_USE_SSH:
         return "ssh"
     return "cloud"
-
-
-def ensure_config_dir():
-    """Ensure configuration directory exists."""
-    REMARKABLE_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def register_and_get_token(one_time_code: str) -> str:

@@ -45,7 +45,6 @@ GET_408_BACKOFF_SECONDS = 0.25
 DOCUMENTS_URL = "/documents/"
 DOWNLOAD_URL = "/download/{guid}/rmdoc"
 DOWNLOAD_PDF_URL = "/download/{guid}/pdf"
-THUMBNAIL_URL = "/thumbnail/{guid}"
 
 
 @dataclass
@@ -101,10 +100,6 @@ class Document:
     def ModifiedClient(self) -> Optional[datetime]:
         """Compatibility with cloud client naming."""
         return self.last_modified
-
-
-# Alias for compatibility
-Folder = Document
 
 
 class USBWebClient:

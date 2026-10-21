@@ -7,11 +7,7 @@ An MCP server that provides access to reMarkable tablet data through the reMarka
 # Capability checking utilities
 from remarkable_mcp.capabilities import (
     client_supports_elicitation,
-    client_supports_experimental,
-    client_supports_roots,
     get_client_capabilities,
-    get_client_info,
-    get_protocol_version,
 )
 
 __version__ = "0.1.0"
@@ -30,8 +26,4 @@ __all__ = [
     # Capability checking
     "get_client_capabilities",
     "client_supports_elicitation",
-    "client_supports_roots",
-    "client_supports_experimental",
-    "get_client_info",
-    "get_protocol_version",
 ]

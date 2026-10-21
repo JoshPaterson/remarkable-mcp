@@ -2168,22 +2168,6 @@ def render_page_full_page_from_extracted_document(
     return png, (paper_w, paper_h)
 
 
-def document_zip_has_pdf_underlay(zip_path: Path) -> bool:
-    """Check if a reMarkable document zip contains a PDF underlay.
-
-    Args:
-        zip_path: Path to the document zip file
-
-    Returns:
-        True if the zip contains a .pdf file
-    """
-    try:
-        with zipfile.ZipFile(zip_path, "r") as zf:
-            return any(name.endswith(".pdf") for name in zf.namelist())
-    except Exception:
-        return False
-
-
 def _read_cpages_entries(tmpdir_path: Path) -> List[Dict[str, Any]]:
     """Read cPages.pages entries from the .content metadata file.
 

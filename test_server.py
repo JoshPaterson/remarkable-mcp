@@ -1788,119 +1788,13 @@ class TestCapabilityChecking:
 
         assert client_supports_elicitation(mock_ctx) is False
 
-    def test_client_supports_roots(self):
-        """Test client_supports_roots."""
-        from mcp.types import ClientCapabilities, RootsCapability
-
-        from remarkable_mcp.capabilities import client_supports_roots
-
-        # Test with roots enabled
-        mock_caps = ClientCapabilities(roots=RootsCapability())
-
-        mock_ctx = Mock()
-        mock_ctx.client_capabilities = mock_caps
-
-        assert client_supports_roots(mock_ctx) is True
-
-        # Test with roots disabled
-        mock_caps = ClientCapabilities(roots=None)
-        mock_ctx.client_capabilities = mock_caps
-
-        assert client_supports_roots(mock_ctx) is False
-
-    def test_client_supports_experimental(self):
-        """Test client_supports_experimental."""
-        from mcp.types import ClientCapabilities
-
-        from remarkable_mcp.capabilities import client_supports_experimental
-
-        # Test with experimental feature present
-        mock_caps = ClientCapabilities(experimental={"my_feature": {}})
-
-        mock_ctx = Mock()
-        mock_ctx.client_capabilities = mock_caps
-
-        assert client_supports_experimental(mock_ctx, "my_feature") is True
-        assert client_supports_experimental(mock_ctx, "other_feature") is False
-
-        # Test with no experimental features
-        mock_caps = ClientCapabilities(experimental=None)
-        mock_ctx.client_capabilities = mock_caps
-
-        assert client_supports_experimental(mock_ctx, "my_feature") is False
-
-    def test_get_client_info(self):
-        """Test get_client_info."""
-        from remarkable_mcp.capabilities import get_client_info
-
-        mock_ctx = Mock()
-        mock_ctx.session = Mock()
-        mock_ctx.session.client_params = Mock()
-        mock_ctx.session.client_params.client_info = Mock()
-        mock_ctx.session.client_params.client_info.name = "Test Client"
-        mock_ctx.session.client_params.client_info.version = "1.0.0"
-        mock_ctx.protocol_version = "2024-11-05"
-
-        result = get_client_info(mock_ctx)
-        assert result is not None
-        assert result["name"] == "Test Client"
-        assert result["version"] == "1.0.0"
-        assert result["protocol_version"] == "2024-11-05"
-
-    def test_get_client_info_without_client_info(self):
-        """Test get_client_info when clientInfo is None."""
-        from remarkable_mcp.capabilities import get_client_info
-
-        mock_ctx = Mock()
-        mock_ctx.session = Mock()
-        mock_ctx.session.client_params = Mock()
-        mock_ctx.session.client_params.client_info = None
-        mock_ctx.protocol_version = "2024-11-05"
-
-        result = get_client_info(mock_ctx)
-        assert result is not None
-        assert result["name"] is None
-        assert result["version"] is None
-        assert result["protocol_version"] == "2024-11-05"
-
-    def test_get_protocol_version(self):
-        """Test get_protocol_version."""
-        from remarkable_mcp.capabilities import get_protocol_version
-
-        mock_ctx = Mock()
-        mock_ctx.protocol_version = "2024-11-05"
-
-        result = get_protocol_version(mock_ctx)
-        assert result == "2024-11-05"
-
-    def test_get_protocol_version_without_context(self):
-        """Test get_protocol_version returns None without valid context."""
-        from remarkable_mcp.capabilities import get_protocol_version
-
-        mock_ctx = Mock()
-        mock_ctx.protocol_version = None
-
-        result = get_protocol_version(mock_ctx)
-        assert result is None
-
     def test_capability_imports_from_package(self):
         """Test that capability utilities can be imported from main package."""
-        from remarkable_mcp import (
-            client_supports_elicitation,
-            client_supports_experimental,
-            client_supports_roots,
-            get_client_capabilities,
-            get_client_info,
-            get_protocol_version,
-        )
+        from remarkable_mcp import client_supports_elicitation, get_client_capabilities
 
         # Verify all functions are callable
         assert callable(get_client_capabilities)
         assert callable(client_supports_elicitation)
-        assert callable(client_supports_roots)
-        assert callable(client_supports_experimental)
-        assert callable(get_client_info)
-        assert callable(get_protocol_version)
 
 
 # =============================================================================

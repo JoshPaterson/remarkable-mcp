@@ -124,9 +124,6 @@ class Document:
         return self.last_modified
 
 
-# Alias for compatibility
-Folder = Document
-
 _CONTENT_MARKER = "===CONTENT==="
 
 
