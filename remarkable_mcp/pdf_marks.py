@@ -471,7 +471,7 @@ def _point(value: Any, what: str) -> List[float]:
     return [_fraction(value[0], f"{what} x"), _fraction(value[1], f"{what} y")]
 
 
-def _region(value: Any) -> List[float]:
+def parse_region(value: Any) -> List[float]:
     if not isinstance(value, (list, tuple)) or len(value) != 4:
         raise MarkError("region must be [left, top, right, bottom] page fractions.")
     x0, y0, x1, y1 = (_fraction(v, "region") for v in value)
@@ -480,7 +480,7 @@ def _region(value: Any) -> List[float]:
     return [x0, y0, x1, y1]
 
 
-def _positive(value: Any, what: str, default: float) -> float:
+def parse_positive(value: Any, what: str, default: float) -> float:
     if value is None:
         return default
     if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
@@ -694,7 +694,7 @@ def _render_text(request: dict, color: List[float], page: _Page) -> Dict[str, An
     text = request["text"]
     if not isinstance(text, str) or not text.strip():
         raise MarkError("text must be non-empty.")
-    size = _positive(request.get("size"), "size", DEFAULT_TEXT_SIZE)
+    size = parse_positive(request.get("size"), "size", DEFAULT_TEXT_SIZE)
     bold = bool(request.get("bold", False))
     italic = bool(request.get("italic", False))
     underline = bool(request.get("underline", False))
@@ -707,7 +707,7 @@ def _render_text(request: dict, color: List[float], page: _Page) -> Dict[str, An
     )
 
     if "region" in request:
-        region = _region(request["region"])
+        region = parse_region(request["region"])
         x0, y0 = page.pt(region[0], region[1])
         x1, y1 = page.pt(region[2], region[3])
         fits = []
@@ -786,7 +786,7 @@ def _draw_path(
     if "region" in request:
         if "size" in request:
             raise MarkError("size applies only with at; the region sets the size.")
-        region = _region(request["region"])
+        region = parse_region(request["region"])
         x0, y0 = page.pt(region[0], region[1])
         x1, y1 = page.pt(region[2], region[3])
         room_w, room_h = x1 - x0 - 2 * pad, y1 - y0 - 2 * pad
@@ -803,7 +803,7 @@ def _draw_path(
         top = y0 + (y1 - y0 - out_h) / 2
         box = page.box(left, top, left + out_w, top + out_h)
     else:
-        size = _positive(request.get("size"), "size", DEFAULT_SYMBOL_SIZE)
+        size = parse_positive(request.get("size"), "size", DEFAULT_SYMBOL_SIZE)
         sx = sy = size / max(bw, bh)
         out_w, out_h = bw * sx + 2 * pad, bh * sy + 2 * pad
         box = _place(request, out_w, out_h, page, "center")
@@ -852,7 +852,7 @@ def _render_shape(request: dict, color: List[float], page: _Page) -> Dict[str, A
     if shape == "highlight":
         if "at" in request:
             raise MarkError("A highlight needs a region.")
-        region = _region(request.get("region"))
+        region = parse_region(request.get("region"))
         opacity = _opacity(request.get("opacity"), 1.0)
         x0, y0 = page.pt(region[0], region[1])
         x1, y1 = page.pt(region[2], region[3])
@@ -866,14 +866,16 @@ def _render_shape(request: dict, color: List[float], page: _Page) -> Dict[str, A
             request,
             page,
             stroke=color,
-            width=_positive(request.get("width"), "width", preset.get("width", DEFAULT_LINE_WIDTH)),
+            width=parse_positive(
+                request.get("width"), "width", preset.get("width", DEFAULT_LINE_WIDTH)
+            ),
             fill=None,
             opacity=_opacity(request.get("opacity"), 1.0),
             stretch=preset.get("stretch", False),
         )
         return dict(out, box=box, pdf=pdf)
 
-    width = _positive(request.get("width"), "width", DEFAULT_LINE_WIDTH)
+    width = parse_positive(request.get("width"), "width", DEFAULT_LINE_WIDTH)
     start, end = _point(request.get("from"), "from"), _point(request.get("to"), "to")
     via = request.get("via", [])
     if not isinstance(via, list):
@@ -921,7 +923,7 @@ def _render_latex(request: dict, color: List[float], page: _Page) -> Dict[str, A
     source = request["latex"]
     if not isinstance(source, str) or not source.strip():
         raise MarkError("latex must be non-empty.")
-    size = _positive(request.get("size"), "size", DEFAULT_LATEX_SIZE)
+    size = parse_positive(request.get("size"), "size", DEFAULT_LATEX_SIZE)
     if ("at" in request) == ("region" in request):
         raise MarkError("A latex mark needs either at [x, y] or region (to scale into).")
     # SVG 1.1 output writes glyphs as plain paths; MuPDF misplaces the
@@ -937,7 +939,7 @@ def _render_latex(request: dict, color: List[float], page: _Page) -> Dict[str, A
         width, height = doc[0].rect.width, doc[0].rect.height
     out: Dict[str, Any] = {"latex": source, "size": size, "pdf": pdf}
     if "region" in request:
-        return dict(out, box=_fit(_region(request["region"]), width, height, page))
+        return dict(out, box=_fit(parse_region(request["region"]), width, height, page))
     return dict(out, box=_place(request, width, height, page, "top-left"))
 
 
@@ -972,7 +974,7 @@ def _render_path(request: dict, color: List[float], page: _Page) -> Dict[str, An
         request,
         page,
         stroke=color,
-        width=_positive(request.get("width"), "width", DEFAULT_LINE_WIDTH),
+        width=parse_positive(request.get("width"), "width", DEFAULT_LINE_WIDTH),
         fill=parse_color(request["fill"]) if request.get("fill") else None,
         opacity=_opacity(request.get("opacity"), 1.0),
         stretch=bool(request.get("stretch", False)),
@@ -1048,7 +1050,7 @@ def _render_graphic(request: dict, page: _Page) -> Dict[str, Any]:
         raise MarkError(f"The graphic could not be read: {e}") from None
     with pymupdf.open("pdf", pdf) as doc:
         width, height = doc[0].rect.width, doc[0].rect.height
-    box = _fit(_region(request.get("region")), width, height, page)
+    box = _fit(parse_region(request.get("region")), width, height, page)
     return {"format": fmt, "box": box, "pdf": pdf}
 
 

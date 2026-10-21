@@ -1368,7 +1368,7 @@ def _mark_editor(
     def edit(pdf: bytes, content: dict, read_ink=None) -> dict:
         """``read_ink(page_id)`` returns a page's ink file (or None); it is
         needed to write marks' covers and report their state."""
-        from remarkable_mcp import cover_layers, ink_marks, text_highlights
+        from remarkable_mcp import cover_layers, ink_marks, rm_ink, text_highlights
         from remarkable_mcp.pages import content_page_ids
 
         base, marks = pdf_marks.load_state(pdf)
@@ -1412,9 +1412,9 @@ def _mark_editor(
                     page_map=page_map,
                     sizes=pdf_marks.page_sizes(base),
                     read_ink=read_ink,
-                    author=cover_layers.author_uuid(),
+                    author=rm_ink.author_uuid(),
                 )
-            except cover_layers.CoverError as e:
+            except rm_ink.InkError as e:
                 raise pdf_marks.MarkError(str(e)) from None
         inks = [m.get("highlight") for m in marks + result["marks"]]
         if build and result["changed"] and any(isinstance(h, dict) for h in inks):
@@ -1432,10 +1432,10 @@ def _mark_editor(
                         page_map=page_map,
                         sizes=pdf_marks.page_sizes(base),
                         read_ink=lambda page_id: covered.get(page_id) or read_ink(page_id),
-                        author=cover_layers.author_uuid(),
+                        author=rm_ink.author_uuid(),
                     ),
                 )
-            except text_highlights.HighlightError as e:
+            except rm_ink.InkError as e:
                 raise pdf_marks.MarkError(str(e)) from None
         inks = [m.get("ink") for m in marks + result["marks"]]
         if build and result["changed"] and any(isinstance(i, dict) for i in inks):
@@ -1453,10 +1453,10 @@ def _mark_editor(
                         page_map=page_map,
                         sizes=pdf_marks.page_sizes(base),
                         read_ink=lambda page_id: written_so_far.get(page_id) or read_ink(page_id),
-                        author=cover_layers.author_uuid(),
+                        author=rm_ink.author_uuid(),
                     ),
                 )
-            except ink_marks.InkError as e:
+            except rm_ink.InkError as e:
                 raise pdf_marks.MarkError(str(e)) from None
         result["cover_states"], cover_notes = {}, []
         if read_ink is not None:
@@ -1592,9 +1592,7 @@ def _page_layer_list(client, files: list, page: int) -> list:
     """A tablet page's layers, bottom first: ``{"name", "visible",
     "selected"}``; empty when the page has no ink yet (Layer 1 is made with
     the first ink)."""
-    from rmscene.scene_stream import SceneInfo
-
-    from remarkable_mcp import cover_layers
+    from remarkable_mcp import rm_ink
     from remarkable_mcp.pages import content_page_ids
 
     content_file = next((f for f in files if f["id"].endswith(".content")), None)
@@ -1608,12 +1606,9 @@ def _page_layer_list(client, files: list, page: int) -> list:
     if rm is None:
         return []
     data = client._get_file(rm["hash"], rm["id"])
-    selected = None
-    for block in cover_layers._parse(data):
-        if isinstance(block, SceneInfo) and block.current_layer is not None:
-            selected = cover_layers._key(block.current_layer.value)
-    layers = cover_layers.page_layers(data)
-    if selected not in {layer["id"] for layer in layers} and layers:
+    layers = rm_ink.page_layers(data)
+    selected = rm_ink.selected_layer(data)
+    if selected is None and layers:
         selected = layers[0]["id"]
     return [
         {"name": layer["name"], "visible": layer["visible"], "selected": layer["id"] == selected}
@@ -1874,7 +1869,7 @@ def _pages_editor(inserts: list, build: bool):
 
     import pymupdf
 
-    from remarkable_mcp import cover_layers, pdf_marks
+    from remarkable_mcp import pdf_marks, rm_ink
     from remarkable_mcp.pages import content_page_ids, insert_pdf_pages, pdf_page_map
 
     def edit(pdf: bytes, content: dict, pagedata) -> dict:
@@ -1895,7 +1890,7 @@ def _pages_editor(inserts: list, build: bool):
                     f"Page {after} does not exist; the document has {page_count}."
                 )
         doc = pymupdf.open(stream=base, filetype="pdf")
-        author = str(cover_layers.author_uuid())
+        author = str(rm_ink.author_uuid())
         new_ids: list = []
         marks = [dict(m) for m in marks]
         for entry in sorted(inserts, key=lambda e: e["after"], reverse=True):

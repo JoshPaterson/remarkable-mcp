@@ -43,7 +43,7 @@ import io
 import logging
 from typing import Iterable, Optional
 
-from rmscene import HEADER_V6, read_blocks, write_blocks
+from rmscene import read_blocks
 from rmscene.scene_items import Line, Pen, PenColor, Point
 from rmscene.scene_stream import (
     CrdtSequenceItem,
@@ -53,6 +53,8 @@ from rmscene.scene_stream import (
     TreeNodeBlock,
 )
 from rmscene.tagged_block_common import CrdtId
+
+from remarkable_mcp import rm_ink
 
 logger = logging.getLogger(__name__)
 
@@ -190,28 +192,6 @@ def get_paper_size(blocks: Iterable[object]) -> tuple[int, int]:
     return DEFAULT_PAPER_SIZE
 
 
-def _iter_crdt_ids(blocks: Iterable[object]):
-    """Yield every CrdtId referenced by a block list (best effort)."""
-    for b in blocks:
-        for attr in ("tree_id", "node_id", "parent_id", "block_id"):
-            v = getattr(b, attr, None)
-            if isinstance(v, CrdtId):
-                yield v
-        item = getattr(b, "item", None)
-        if item is not None:
-            iid = getattr(item, "item_id", None)
-            if isinstance(iid, CrdtId):
-                yield iid
-            val = getattr(item, "value", None)
-            if isinstance(val, CrdtId):
-                yield val
-        group = getattr(b, "group", None)
-        if group is not None:
-            gid = getattr(group, "node_id", None)
-            if isinstance(gid, CrdtId):
-                yield gid
-
-
 def find_target_layer(blocks: list) -> CrdtId:
     """Find the layer node that new strokes should hang off, dynamically.
 
@@ -254,7 +234,7 @@ def allocate_ids(blocks: list, count: int) -> list[CrdtId]:
     the new sequence items never collide with existing content.
     """
     max_id = CrdtId(0, 0)
-    for cid in _iter_crdt_ids(blocks):
+    for cid in rm_ink.iter_crdt_ids(blocks):
         if (cid.part1, cid.part2) > (max_id.part1, max_id.part2):
             max_id = cid
     part1 = max_id.part1 if max_id.part1 else 0
@@ -333,16 +313,6 @@ def build_line_block(
     )
 
 
-def serialize_new_blocks(blocks: list) -> bytes:
-    """Serialize blocks with write_blocks and strip the HEADER_V6 prefix."""
-    buf = io.BytesIO()
-    write_blocks(buf, blocks, options={"version": WRITE_VERSION})
-    data = buf.getvalue()
-    if data.startswith(HEADER_V6):
-        return data[len(HEADER_V6) :]
-    return data
-
-
 def append_strokes(original_bytes: bytes, strokes: list[dict]) -> bytes:
     """Append ``strokes`` to an existing page, returning new raw ``.rm`` bytes.
 
@@ -360,7 +330,7 @@ def append_strokes(original_bytes: bytes, strokes: list[dict]) -> bytes:
         build_line_block(layer_id, ids[i], stroke, paper_w, paper_h)
         for i, stroke in enumerate(strokes)
     ]
-    appended = serialize_new_blocks(new_blocks)
+    appended = rm_ink.encode(new_blocks)
     return original_bytes + appended
 
 

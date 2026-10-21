@@ -27,7 +27,7 @@ import pytest
 from rmscene import HEADER_V6, read_blocks, write_blocks
 
 from remarkable_mcp import cover_layers as cl
-from remarkable_mcp import ink_marks
+from remarkable_mcp import ink_marks, rm_ink
 from remarkable_mcp import text_highlights as th
 
 FIXTURES = Path(__file__).parent / "fixtures" / "tablet" / "ink_writes"
@@ -87,7 +87,7 @@ def _rows():
 def _writes():
     """``{golden name: bytes}`` for each writer on fixed inputs."""
     tablet = _read("tablet_highlight_page.rm")
-    first = cl.first_page_rm(AUTHOR)
+    first = rm_ink.first_page_rm(AUTHOR)
     cover, (placed,) = cl.edit_page(
         tablet, AUTHOR, A4, add=[{"layer": "Mark cover", "rows": _rows(), "shown": False}]
     )
@@ -99,7 +99,7 @@ def _writes():
         ink_marks._dot((210, 300), 3.2),
     ]
     ink, ids = ink_marks.add_strokes(tablet, AUTHOR, A4, strokes, "fineliner", "red")
-    erased = cl._tombstone(ink, ids[:1])
+    erased = rm_ink.tombstone(ink, ids[:1])
     marker, _ = ink_marks.add_strokes(tablet, AUTHOR, A4, strokes[:1], "highlighter", "orange")
     return {
         "first_page.rm": first,
@@ -143,14 +143,14 @@ def test_first_ink_file_has_the_accepted_structure():
     assert 0x07 not in types
     blocks = list(read_blocks(io.BytesIO(ours)))
     info = next(b for b in blocks if type(b).__name__ == "SceneInfo")
-    assert (info.current_layer.value.part1, info.current_layer.value.part2) == cl.LAYER_1
+    assert (info.current_layer.value.part1, info.current_layer.value.part2) == rm_ink.LAYER_1
 
 
 def test_cover_layer_sits_at_the_bottom_as_accepted():
     accepted = _read("accepted_cover_on_tablet_page.rm")
     for data in (accepted, _writes()["cover_on_tablet_page.rm"]):
-        layers = cl.page_layers(data)
-        assert layers[0]["id"][0] == cl.author_number(data, AUTHOR)
+        layers = rm_ink.page_layers(data)
+        assert layers[0]["id"][0] == rm_ink.author_number(data, AUTHOR)
         assert layers[-1]["name"] == "Layer 1"
 
 
@@ -158,8 +158,8 @@ def test_tablet_keeps_the_mcp_author_and_tombstones():
     """After the tablet synced, the MCP's author and layer survive, and an
     erased MCP stroke is a tombstone, not removed bytes."""
     synced = _read("tablet_page_with_cover.rm")
-    assert cl.author_number(synced, AUTHOR) is not None
-    assert [layer["name"] for layer in cl.page_layers(synced)][0] == "Mark cover"
+    assert rm_ink.author_number(synced, AUTHOR) is not None
+    assert [layer["name"] for layer in rm_ink.page_layers(synced)][0] == "Mark cover"
     erased = _read("tablet_after_erase.rm")
     blocks = [
         b for b in read_blocks(io.BytesIO(erased)) if type(b).__name__ == "SceneLineItemBlock"

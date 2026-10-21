@@ -3,7 +3,7 @@
 The tablet stores a text highlight (PDF text selected with the highlighter)
 as a glyph-range item in the page's ink file, on a layer, one item per line:
 the line's text, its offset in the page's text, a color and a rectangle. The
-MCP writes the same items under its own author id (see ``cover_layers``), so
+MCP writes the same items under its own author id (see ``rm_ink``), so
 they look and behave like the user's own: they are listed with the user's
 highlights, can be erased, and match the tablet's rectangles. See
 docs/native-ink.md for the format and how it was calibrated.
@@ -15,7 +15,7 @@ import re
 import uuid
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
-from remarkable_mcp import cover_layers as cl
+from remarkable_mcp import rm_ink
 
 GLYPH_BLOCK = 0x03
 # Rectangle padding beyond PyMuPDF's loose character boxes, as a share of
@@ -35,7 +35,7 @@ COLORS: Dict[str, Tuple[int, Tuple[int, int, int, int]]] = {
 DEFAULT_COLOR = "yellow"
 
 
-class HighlightError(ValueError):
+class HighlightError(rm_ink.InkError):
     """Text to highlight cannot be found or the request is invalid."""
 
 
@@ -100,30 +100,6 @@ def find_text(page, query: str, occurrence: int = 1) -> List[Dict[str, Any]]:
     return parts
 
 
-def _layer_for(data: bytes, author: uuid.UUID, name: Optional[str]) -> Tuple[bytes, Tuple]:
-    """The layer to put highlights on: the layer named ``name`` (made on top
-    if the page has none), else the selected layer, else the first layer."""
-    from rmscene.scene_stream import SceneInfo
-
-    layers = cl.page_layers(data)
-    if name is not None:
-        for layer in layers:
-            if layer["name"] == name:
-                return data, layer["id"]
-        return cl._add_layer(data, author, name, True, top=True)
-    live = {layer["id"] for layer in layers}
-    for block in cl._parse(data):
-        if isinstance(block, SceneInfo) and block.current_layer is not None:
-            current = cl._key(block.current_layer.value)
-            if current in live:
-                return data, current
-    number = cl.author_number(data, author)
-    own = [layer["id"] for layer in layers if layer["id"][0] != number]
-    if not own:
-        raise HighlightError("The page has no layer to highlight on.")
-    return data, own[0]
-
-
 def add_highlights(
     data: Optional[bytes],
     author: uuid.UUID,
@@ -134,64 +110,20 @@ def add_highlights(
 ) -> Tuple[bytes, List[List[int]]]:
     """``data`` (a page's ink file, None for none) with a highlight item for
     each of ``parts`` (see ``find_text``); returns the file and item ids."""
-    from rmscene.scene_items import GlyphRange, PenColor, Rectangle
-    from rmscene.scene_stream import CrdtSequenceItem, SceneGlyphItemBlock
-    from rmscene.tagged_block_common import CrdtId
-
-    from remarkable_mcp.extract import _points_per_unit, _v6_paper_size
-
     color_id, rgba = COLORS[color]
-    if data is None:
-        data = cl.first_page_rm(author)
-    data, layer_id = _layer_for(data, author, layer)
-    data, number = cl._with_author(data, author)
-    blocks = cl._parse(data)
-    counter = cl._next_counter(blocks)
-    ppu = _points_per_unit(_v6_paper_size(blocks))
-    width = size[0]
-    new, ids = [], []
-    for part in parts:
-        x0, y0, x1, y1 = part["rect"]
-        glyph = GlyphRange(
-            start=part["start"],
-            length=part["length"],
-            text=part["text"],
-            color=PenColor(color_id),
-            color_rgba=rgba,
-            rectangles=[
-                Rectangle((x0 - width / 2) / ppu, y0 / ppu, (x1 - x0) / ppu, (y1 - y0) / ppu)
-            ],
-        )
-        item = CrdtSequenceItem(
-            item_id=CrdtId(number, counter),
-            left_id=CrdtId(0, 0),
-            right_id=CrdtId(0, 0),
-            deleted_length=0,
-            value=glyph,
-        )
-        new.append(SceneGlyphItemBlock(parent_id=cl._crdt(layer_id), item=item))
-        ids.append([number, counter])
-        counter += 1
-    return data + cl._encode(*new), ids
+    page = rm_ink.PageWriter(data, author)
+    ids = page.add_glyphs(page.ink_layer(layer), parts, size, color_id, rgba)
+    return page.data, ids
 
 
 def highlight_status(data: Optional[bytes], item_ids: Iterable[Sequence[int]]) -> str:
     """ "on tablet", "erased on tablet" (all items erased), "partly erased on
     tablet" or "missing"."""
-    from rmscene.scene_stream import SceneGlyphItemBlock
-
-    wanted = {tuple(int(v) for v in i) for i in item_ids}
-    if data is None or not wanted:
+    states = rm_ink.item_states(data, item_ids)
+    if not states:
         return "missing"
-    live = erased = 0
-    for block in cl._parse(data):
-        if isinstance(block, SceneGlyphItemBlock) and cl._key(block.item.item_id) in wanted:
-            if block.item.value is None:
-                erased += 1
-            else:
-                live += 1
-    if not live and not erased:
-        return "missing"
+    live = sum(1 for _, alive in states.values() if alive)
+    erased = len(states) - live
     if not live:
         return "erased on tablet"
     return "partly erased on tablet" if erased else "on tablet"
@@ -233,10 +165,10 @@ def write_mark_highlights(
             continue
         page_id = page_ids[page - 1]
         data = read_ink(page_id)
-        if data is not None and b"version=6" not in data[:43]:
+        if data is not None and not rm_ink.is_v6(data):
             raise HighlightError(f"Page {page}'s ink is in an older format.")
         if data is not None and job["remove"]:
-            data = cl._tombstone(data, job["remove"])
+            data = rm_ink.tombstone(data, job["remove"])
         for mark in job["add"]:
             ink = mark["highlight"]
             data, ids = add_highlights(

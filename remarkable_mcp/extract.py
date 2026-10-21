@@ -2821,7 +2821,7 @@ def page_ink_regions(tmpdir_path: Path, page: int) -> List[List[float]]:
     wrote (covers, erasable marks) are left out. Empty when the page has no
     ink.
     """
-    from remarkable_mcp.cover_layers import known_author_uuid
+    from remarkable_mcp.rm_ink import known_author_uuid
 
     rm_file = _select_rm_file_for_page(tmpdir_path, _get_ordered_rm_files(tmpdir_path), page)
     if rm_file is None:

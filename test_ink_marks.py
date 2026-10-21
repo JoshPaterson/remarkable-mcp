@@ -8,8 +8,7 @@ import pytest
 from rmscene import read_blocks
 from rmscene.scene_stream import SceneLineItemBlock
 
-from remarkable_mcp import cover_layers as cl
-from remarkable_mcp import ink_marks, pdf_marks
+from remarkable_mcp import ink_marks, pdf_marks, rm_ink
 from test_mark_pdf import A4, CONTENT, FakeCloud, _mark_tool  # noqa: F401
 
 AUTHOR = uuid.UUID("8efeea22-0545-4297-a2c6-c5b0e5e17c43")
@@ -18,7 +17,7 @@ AUTHOR = uuid.UUID("8efeea22-0545-4297-a2c6-c5b0e5e17c43")
 @pytest.fixture(autouse=True)
 def config_dir(tmp_path, monkeypatch):
     monkeypatch.setattr("remarkable_mcp.api.REMARKABLE_CONFIG_DIR", tmp_path)
-    (tmp_path / cl.AUTHOR_FILE_NAME).write_text(f"{AUTHOR}\n")
+    (tmp_path / rm_ink.AUTHOR_FILE_NAME).write_text(f"{AUTHOR}\n")
 
 
 def _lines(data):
@@ -145,7 +144,7 @@ async def test_erasable_marks_are_ink_not_pdf(cloud):
     ink = cloud.stored("page-a.rm")
     lines = _lines(ink)
     assert {int(b.item.value.color) for b in lines} == {7, 3}  # red pen, yellow highlighter
-    assert [layer["name"] for layer in cl.page_layers(ink)] == ["Layer 1", "Claude marks"]
+    assert [layer["name"] for layer in rm_ink.page_layers(ink)] == ["Layer 1", "Claude marks"]
 
     note_items = next(
         m["ink"]["items"] for m in pdf_marks.stored_marks(cloud.stored(".pdf")) if m["id"] == "n"
