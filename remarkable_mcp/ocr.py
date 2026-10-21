@@ -49,7 +49,7 @@ OcrLine = tuple
 Word = tuple
 
 
-class OcrError(Exception):
+class OcrError(ValueError):
     """OCR cannot be run (no backend) or failed."""
 
 

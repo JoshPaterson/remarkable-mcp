@@ -19,6 +19,7 @@ page index, which stays stable when pages are added or moved on the tablet.
 
 import base64
 import binascii
+import dataclasses
 import json
 import math
 import re
@@ -28,7 +29,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import pymupdf
 
-from remarkable_mcp import svg_path
+from remarkable_mcp import colors, svg_path
 
 BASE_FILE = "remarkable-mcp-original.pdf"
 MARKS_FILE = "remarkable-mcp-marks.json"
@@ -64,74 +65,17 @@ def _rgb(hex_color: str) -> Tuple[float, float, float]:
     return tuple(int(hex_color[i : i + 2], 16) / 255 for i in (1, 3, 5))
 
 
-# Pen colors as the Paper Pro shows them. Its screen draws the pure colors
-# below without dithering, matching its own pen strokes; the softer values
-# its PDF export uses for pens are dithered on the screen and look different.
-COLORS = {
-    name: _rgb(value)
-    for name, value in {
-        "black": "#000000",
-        "gray": "#909090",
-        "white": "#FFFFFF",
-        "blue": "#0000FF",
-        "red": "#FF0000",
-        "green": "#00FF00",
-        "yellow": "#FFFF00",
-        "cyan": "#00FFFF",
-        "magenta": "#FF00FF",
-    }.items()
-}
-# Highlighter colors, drawn with the Darken blend: on white paper they show
-# their color, and text under them stays dark. Blue, orange and gray are the
-# tablet's PDF export values, which the tablet also shows as its own
-# highlighters. Yellow, pink and green were measured on a Paper Pro, whose
-# own highlighter colors differ from its export: drawing its highlighter
-# across swatches that vary one channel (the others 00) shows, per channel,
-# the last swatch the stroke goes under, which is the highlighter's value.
-HIGHLIGHT_COLORS = {
-    name: _rgb(value)
-    for name, value in {
-        "yellow": "#FFED75",
-        "blue": "#BEEAFE",
-        "pink": "#F29EFF",
-        "orange": "#FFC38C",
-        "green": "#ACFF85",
-        "gray": "#000000",
-    }.items()
-}
-# The same named colors as the reMarkable desktop and browser apps (and the
-# tablet's PDF export) draw them. Exports re-draw named-color marks with
-# these, so exported files match those apps; on the tablet's own screen the
-# values above match instead.
-DESKTOP_COLORS = {
-    name: _rgb(value)
-    for name, value in {
-        "black": "#000000",
-        "gray": "#909090",
-        "white": "#FFFFFF",
-        "blue": "#304AE0",
-        "red": "#C23132",
-        "green": "#91DA71",
-        "yellow": "#FAE719",
-        "cyan": "#74D2E8",
-        "magenta": "#C07FD2",
-    }.items()
-}
-DESKTOP_HIGHLIGHT_COLORS = {
-    name: _rgb(value)
-    for name, value in {
-        "yellow": "#FEFD60",
-        "blue": "#BEEAFE",
-        "pink": "#FF55CF",
-        "orange": "#FFC38C",
-        "green": "#A9FA5C",
-        "gray": "#000000",
-    }.items()
-}
-# Highlighter colors drawn translucent, as the export draws them: gray is
-# black at 25% opacity, which is #BFBFBF on white paper and darkens colors
-# under it by a quarter.
-HIGHLIGHT_OPACITY = {"gray": 0.2509804}
+# Named colors (see ``colors``). Marks drawn into the PDF use the colors as
+# the Paper Pro's screen shows them; highlights are drawn with the Darken
+# blend, so on white paper they show their color and text under them stays
+# dark. Exports re-draw named-color marks with the desktop colors, so
+# exported files match the desktop and browser apps.
+COLORS = {c.name: _rgb(c.screen) for c in colors.PENS}
+HIGHLIGHT_COLORS = {c.name: _rgb(c.screen) for c in colors.HIGHLIGHTERS}
+DESKTOP_COLORS = {c.name: _rgb(c.desktop) for c in colors.PENS}
+DESKTOP_HIGHLIGHT_COLORS = {c.name: _rgb(c.desktop) for c in colors.HIGHLIGHTERS}
+# Highlighter colors drawn translucent, as the export draws them.
+HIGHLIGHT_OPACITY = {c.name: c.opacity for c in colors.HIGHLIGHTERS if c.opacity is not None}
 DEFAULT_TEXT_SIZE = 11.0
 DEFAULT_LATEX_SIZE = 12.0
 DEFAULT_SYMBOL_SIZE = 12.0
@@ -184,52 +128,72 @@ class MarkError(ValueError):
 # --- Reading and writing the marked state ---------------------------------
 
 
-def load_state(pdf_bytes: bytes) -> Tuple[bytes, List[Dict[str, Any]]]:
-    """``(original_pdf, marks)`` for a document's current PDF.
-
-    A PDF without the embedded files is its own original, with no marks.
-    """
+def _embedded(pdf_bytes: bytes) -> Tuple[bytes, bool, Optional[bytes]]:
+    """``(base, has_base, state)`` of a PDF: its embedded original (or the PDF
+    itself without an embedded OCR record), whether an original is embedded,
+    and the embedded mark state's JSON (None when absent)."""
     with pymupdf.open(stream=pdf_bytes, filetype="pdf") as doc:
         names = doc.embfile_names()
-        if BASE_FILE not in names or MARKS_FILE not in names:
-            return pdf_bytes, []
-        base = doc.embfile_get(BASE_FILE)
-        data = json.loads(doc.embfile_get(MARKS_FILE).decode("utf-8"))
-    marks = data.get("marks") if isinstance(data, dict) else None
-    if not isinstance(marks, list):
-        raise MarkError("The PDF's mark list is unreadable.")
-    if data.get("format") != MARKS_FORMAT:
-        raise MarkError(
-            "The PDF's marks were made by an older version of this tool; "
-            "clear them (clear=True) and add them again."
+        state = doc.embfile_get(MARKS_FILE) if MARKS_FILE in names else None
+        if BASE_FILE in names:
+            return doc.embfile_get(BASE_FILE), True, state
+        if state is None:
+            return pdf_bytes, False, None
+        # An OCR record without an original (see record_ocr): the PDF is its
+        # own original once the record is taken out.
+        doc.embfile_del(MARKS_FILE)
+        return doc.tobytes(garbage=3, deflate=True, no_new_id=True), False, state
+
+
+@dataclasses.dataclass
+class MarkedPdf:
+    """A document's PDF as the original, the marks on it, the outline set
+    with ``remarkable_pdf_outline`` (None keeps the PDF's own) and the record
+    of OCR written by ``remarkable_pdf_ocr`` (``{"backend", "pdf_pages"}``;
+    its text is part of the original)."""
+
+    base: bytes
+    marks: List[Dict[str, Any]]
+    outline: Optional[List[Dict[str, Any]]] = None
+    ocr: Optional[Dict[str, Any]] = None
+
+    @classmethod
+    def load(cls, pdf_bytes: bytes) -> "MarkedPdf":
+        """The state of a document's current PDF. A PDF without the embedded
+        files is its own original, with no marks."""
+        base, has_base, raw = _embedded(pdf_bytes)
+        try:
+            state = json.loads(raw.decode("utf-8")) if raw is not None else {}
+        except ValueError:
+            state = None
+        if not has_base or raw is None:
+            ocr = state.get("ocr") if isinstance(state, dict) else None
+            return cls(base, [], None, ocr if isinstance(ocr, dict) else None)
+        marks = state.get("marks") if isinstance(state, dict) else None
+        if not isinstance(marks, list):
+            raise MarkError("The PDF's mark list is unreadable.")
+        if state.get("format") != MARKS_FORMAT:
+            raise MarkError(
+                "The PDF's marks were made by an older version of this tool; "
+                "clear them (clear=True) and add them again."
+            )
+        outline, ocr = state.get("outline"), state.get("ocr")
+        return cls(
+            base,
+            marks,
+            outline if isinstance(outline, list) else None,
+            ocr if isinstance(ocr, dict) else None,
         )
-    return base, marks
 
-
-def _state(pdf_bytes: bytes) -> Dict[str, Any]:
-    """The embedded mark state (marks, outline, OCR record), or {}."""
-    try:
-        with pymupdf.open(stream=pdf_bytes, filetype="pdf") as doc:
-            if MARKS_FILE not in doc.embfile_names():
-                return {}
-            data = json.loads(doc.embfile_get(MARKS_FILE).decode("utf-8"))
-    except Exception:
-        return {}
-    return data if isinstance(data, dict) else {}
-
-
-def load_outline(pdf_bytes: bytes) -> Optional[List[Dict[str, Any]]]:
-    """The outline set with ``remarkable_pdf_outline``, or None when the PDF
-    keeps its own: ``[{"level", "title", "pdf_page"}]``."""
-    outline = _state(pdf_bytes).get("outline")
-    return outline if isinstance(outline, list) else None
-
-
-def load_ocr(pdf_bytes: bytes) -> Optional[Dict[str, Any]]:
-    """The record of OCR written by ``remarkable_pdf_ocr`` (``{"backend",
-    "pdf_pages"}``; its text is part of the original PDF), or None."""
-    ocr = _state(pdf_bytes).get("ocr")
-    return ocr if isinstance(ocr, dict) else None
+    def pdf(self) -> bytes:
+        """The PDF to write: the marks placed on the original with the state
+        embedded, the original with only the OCR record when there are no
+        marks or outline, or the original itself."""
+        if self.marks or self.outline is not None:
+            return build(self.base, self.marks, outline=self.outline, ocr=self.ocr)
+        if self.ocr:
+            return record_ocr(self.base, self.ocr)
+        return self.base
 
 
 def record_ocr(pdf_bytes: bytes, ocr: Dict[str, Any]) -> bytes:
@@ -309,10 +273,10 @@ def for_export(pdf_bytes: bytes) -> bytes:
     and mark list are left out. A PDF without marks is returned unchanged.
     """
     try:
-        base, marks = load_state(pdf_bytes)
+        state = MarkedPdf.load(pdf_bytes)
     except Exception:
         return pdf_bytes
-    outline = load_outline(pdf_bytes)
+    base, marks, outline = state.base, state.marks, state.outline
     if not marks and outline is None:
         return base
     sizes = page_sizes(base)
@@ -343,20 +307,18 @@ def for_export(pdf_bytes: bytes) -> bytes:
 
 
 def original_pdf(pdf_bytes: bytes) -> bytes:
-    """The PDF before any marks: ``pdf_bytes`` itself when it has none."""
+    """The PDF before any marks: ``pdf_bytes`` itself (without an OCR record)
+    when it has none."""
     try:
-        with pymupdf.open(stream=pdf_bytes, filetype="pdf") as doc:
-            if BASE_FILE in doc.embfile_names():
-                return doc.embfile_get(BASE_FILE)
+        return _embedded(pdf_bytes)[0]
     except Exception:
-        pass
-    return pdf_bytes
+        return pdf_bytes
 
 
 def stored_marks(pdf_bytes: bytes) -> List[Dict[str, Any]]:
     """The marks recorded in a PDF; empty when it has none or is unreadable."""
     try:
-        return load_state(pdf_bytes)[1]
+        return MarkedPdf.load(pdf_bytes).marks
     except Exception:
         return []
 
@@ -408,7 +370,7 @@ def build(
     ``outline`` (see ``check_outline``) replaces the PDF's own outline; None
     keeps it. With ``embed`` (the default) the original PDF, the mark list and
     the outline are embedded, so they can be changed later; exports pass
-    False. ``ocr`` records OCR text already in ``base`` (see ``load_ocr``).
+    False. ``ocr`` records OCR text already in ``base`` (see ``MarkedPdf``).
     Raises MarkError if placing would change the page count or a page size,
     which would move the tablet's ink relative to the page.
     """
@@ -471,7 +433,7 @@ def _point(value: Any, what: str) -> List[float]:
     return [_fraction(value[0], f"{what} x"), _fraction(value[1], f"{what} y")]
 
 
-def _region(value: Any) -> List[float]:
+def parse_region(value: Any) -> List[float]:
     if not isinstance(value, (list, tuple)) or len(value) != 4:
         raise MarkError("region must be [left, top, right, bottom] page fractions.")
     x0, y0, x1, y1 = (_fraction(v, "region") for v in value)
@@ -480,7 +442,7 @@ def _region(value: Any) -> List[float]:
     return [x0, y0, x1, y1]
 
 
-def _positive(value: Any, what: str, default: float) -> float:
+def parse_positive(value: Any, what: str, default: float) -> float:
     if value is None:
         return default
     if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
@@ -694,7 +656,7 @@ def _render_text(request: dict, color: List[float], page: _Page) -> Dict[str, An
     text = request["text"]
     if not isinstance(text, str) or not text.strip():
         raise MarkError("text must be non-empty.")
-    size = _positive(request.get("size"), "size", DEFAULT_TEXT_SIZE)
+    size = parse_positive(request.get("size"), "size", DEFAULT_TEXT_SIZE)
     bold = bool(request.get("bold", False))
     italic = bool(request.get("italic", False))
     underline = bool(request.get("underline", False))
@@ -707,7 +669,7 @@ def _render_text(request: dict, color: List[float], page: _Page) -> Dict[str, An
     )
 
     if "region" in request:
-        region = _region(request["region"])
+        region = parse_region(request["region"])
         x0, y0 = page.pt(region[0], region[1])
         x1, y1 = page.pt(region[2], region[3])
         fits = []
@@ -786,7 +748,7 @@ def _draw_path(
     if "region" in request:
         if "size" in request:
             raise MarkError("size applies only with at; the region sets the size.")
-        region = _region(request["region"])
+        region = parse_region(request["region"])
         x0, y0 = page.pt(region[0], region[1])
         x1, y1 = page.pt(region[2], region[3])
         room_w, room_h = x1 - x0 - 2 * pad, y1 - y0 - 2 * pad
@@ -803,7 +765,7 @@ def _draw_path(
         top = y0 + (y1 - y0 - out_h) / 2
         box = page.box(left, top, left + out_w, top + out_h)
     else:
-        size = _positive(request.get("size"), "size", DEFAULT_SYMBOL_SIZE)
+        size = parse_positive(request.get("size"), "size", DEFAULT_SYMBOL_SIZE)
         sx = sy = size / max(bw, bh)
         out_w, out_h = bw * sx + 2 * pad, bh * sy + 2 * pad
         box = _place(request, out_w, out_h, page, "center")
@@ -852,7 +814,7 @@ def _render_shape(request: dict, color: List[float], page: _Page) -> Dict[str, A
     if shape == "highlight":
         if "at" in request:
             raise MarkError("A highlight needs a region.")
-        region = _region(request.get("region"))
+        region = parse_region(request.get("region"))
         opacity = _opacity(request.get("opacity"), 1.0)
         x0, y0 = page.pt(region[0], region[1])
         x1, y1 = page.pt(region[2], region[3])
@@ -866,14 +828,16 @@ def _render_shape(request: dict, color: List[float], page: _Page) -> Dict[str, A
             request,
             page,
             stroke=color,
-            width=_positive(request.get("width"), "width", preset.get("width", DEFAULT_LINE_WIDTH)),
+            width=parse_positive(
+                request.get("width"), "width", preset.get("width", DEFAULT_LINE_WIDTH)
+            ),
             fill=None,
             opacity=_opacity(request.get("opacity"), 1.0),
             stretch=preset.get("stretch", False),
         )
         return dict(out, box=box, pdf=pdf)
 
-    width = _positive(request.get("width"), "width", DEFAULT_LINE_WIDTH)
+    width = parse_positive(request.get("width"), "width", DEFAULT_LINE_WIDTH)
     start, end = _point(request.get("from"), "from"), _point(request.get("to"), "to")
     via = request.get("via", [])
     if not isinstance(via, list):
@@ -921,7 +885,7 @@ def _render_latex(request: dict, color: List[float], page: _Page) -> Dict[str, A
     source = request["latex"]
     if not isinstance(source, str) or not source.strip():
         raise MarkError("latex must be non-empty.")
-    size = _positive(request.get("size"), "size", DEFAULT_LATEX_SIZE)
+    size = parse_positive(request.get("size"), "size", DEFAULT_LATEX_SIZE)
     if ("at" in request) == ("region" in request):
         raise MarkError("A latex mark needs either at [x, y] or region (to scale into).")
     # SVG 1.1 output writes glyphs as plain paths; MuPDF misplaces the
@@ -937,7 +901,7 @@ def _render_latex(request: dict, color: List[float], page: _Page) -> Dict[str, A
         width, height = doc[0].rect.width, doc[0].rect.height
     out: Dict[str, Any] = {"latex": source, "size": size, "pdf": pdf}
     if "region" in request:
-        return dict(out, box=_fit(_region(request["region"]), width, height, page))
+        return dict(out, box=_fit(parse_region(request["region"]), width, height, page))
     return dict(out, box=_place(request, width, height, page, "top-left"))
 
 
@@ -972,7 +936,7 @@ def _render_path(request: dict, color: List[float], page: _Page) -> Dict[str, An
         request,
         page,
         stroke=color,
-        width=_positive(request.get("width"), "width", DEFAULT_LINE_WIDTH),
+        width=parse_positive(request.get("width"), "width", DEFAULT_LINE_WIDTH),
         fill=parse_color(request["fill"]) if request.get("fill") else None,
         opacity=_opacity(request.get("opacity"), 1.0),
         stretch=bool(request.get("stretch", False)),
@@ -1048,7 +1012,7 @@ def _render_graphic(request: dict, page: _Page) -> Dict[str, Any]:
         raise MarkError(f"The graphic could not be read: {e}") from None
     with pymupdf.open("pdf", pdf) as doc:
         width, height = doc[0].rect.width, doc[0].rect.height
-    box = _fit(_region(request.get("region")), width, height, page)
+    box = _fit(parse_region(request.get("region")), width, height, page)
     return {"format": fmt, "box": box, "pdf": pdf}
 
 
@@ -1147,20 +1111,19 @@ def render_mark(
         stored = _render_graphic(request, page)
     else:
         palette = _palette(request.get("shape"))
-        name = request.get("color") or color or ""
-        if (
-            request.get("shape") == "highlight"
-            and "opacity" not in request
-            and isinstance(name, str)
-            and name.strip().lower() in HIGHLIGHT_OPACITY
-        ):
-            request = dict(request, opacity=HIGHLIGHT_OPACITY[name.strip().lower()])
         source = request["color"] if "color" in request else color
         if source:
             rgb = parse_color(source, palette)
+            name = source.strip().lower() if isinstance(source, str) else None
         else:
             rgb = default_color(request.get("shape"))
-            source = "yellow" if request.get("shape") == "highlight" else "black"
+            name = "yellow" if request.get("shape") == "highlight" else "black"
+        if (
+            request.get("shape") == "highlight"
+            and "opacity" not in request
+            and name in HIGHLIGHT_OPACITY
+        ):
+            request = dict(request, opacity=HIGHLIGHT_OPACITY[name])
         render = {
             "text": _render_text,
             "shape": _render_shape,
@@ -1178,8 +1141,8 @@ def render_mark(
         # The request is kept for listing a mark's style and re-drawing it;
         # named colors can be re-drawn in another palette (see for_export).
         stored["request"] = {k: v for k, v in request.items() if k != "color"}
-        if isinstance(source, str) and source.strip().lower() in palette:
-            stored["color_name"] = source.strip().lower()
+        if name in palette:
+            stored["color_name"] = name
     if len(stored["pdf"]) > MAX_SNIPPET_BYTES:
         raise MarkError(f"The rendered mark is larger than {MAX_SNIPPET_BYTES} bytes.")
     stored["pdf"] = base64.b64encode(stored["pdf"]).decode("ascii")
@@ -1719,7 +1682,8 @@ def edit_marks(
 def _text_highlight(options, size, pdf_page: int, color: Optional[str], locate) -> Dict[str, Any]:
     """A text highlight mark from ``{"text_highlight": text, "occurrence",
     "color", "layer"}``: the matched lines, to be written as tablet ink."""
-    from remarkable_mcp.text_highlights import COLORS, DEFAULT_COLOR, HighlightError
+    from remarkable_mcp.rm_ink import InkError
+    from remarkable_mcp.text_highlights import COLORS, DEFAULT_COLOR
 
     unknown = set(options) - {"text_highlight", "occurrence", "color", "layer"}
     if unknown:
@@ -1730,7 +1694,10 @@ def _text_highlight(options, size, pdf_page: int, color: Optional[str], locate) 
     occurrence = options.get("occurrence", 1)
     if isinstance(occurrence, bool) or not isinstance(occurrence, int) or occurrence < 1:
         raise MarkError("occurrence must be 1 or more.")
-    name = options.get("color", color if color in COLORS else DEFAULT_COLOR)
+    name = options.get("color")
+    if name is None:
+        name = color if isinstance(color, str) and color.strip().lower() in COLORS else None
+    name = str(name or DEFAULT_COLOR).strip().lower()
     if name not in COLORS:
         raise MarkError(f"A text highlight's color is one of: {', '.join(COLORS)}.")
     layer = options.get("layer")
@@ -1740,7 +1707,7 @@ def _text_highlight(options, size, pdf_page: int, color: Optional[str], locate) 
         raise MarkError("text_highlight is not available here.")
     try:
         parts = locate(pdf_page, query, occurrence)
-    except HighlightError as e:
+    except InkError as e:
         raise MarkError(str(e)) from None
     width, height = size
     box = [
@@ -1763,11 +1730,12 @@ def _text_highlight(options, size, pdf_page: int, color: Optional[str], locate) 
 def _cover(request: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """The cover a mark asks for: ``{"layer", "shown", "pending"}`` until its
     strokes are written (see ``cover_layers``), or None."""
-    from remarkable_mcp.cover_layers import CoverError, layer_name
+    from remarkable_mcp.cover_layers import layer_name
+    from remarkable_mcp.rm_ink import InkError
 
     try:
         name = layer_name(request.get("cover"))
-    except CoverError as e:
+    except InkError as e:
         raise MarkError(str(e)) from None
     covered = request.get("covered", False)
     if not isinstance(covered, bool):
@@ -1779,11 +1747,3 @@ def _cover(request: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     if request.get("shape") == "highlight":
         raise MarkError("Highlights cannot have a cover: it would hide the text under them.")
     return {"layer": name, "shown": covered, "pending": True}
-
-
-def tablet_page(pdf_page: int, page_map: Sequence[Optional[int]]) -> Optional[int]:
-    """The 1-based tablet page showing ``pdf_page``, if it is still shown."""
-    for position, index in enumerate(page_map, start=1):
-        if index == pdf_page:
-            return position
-    return None

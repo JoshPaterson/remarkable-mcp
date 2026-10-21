@@ -30,14 +30,16 @@ another tablet. Probe PDFs come from `scripts/color_probes.py`.
 | cyan | `#00FFFF` | | |
 | magenta | `#FF00FF` | | |
 
-Mark colors live in `remarkable_mcp/pdf_marks.py` (`COLORS`,
-`HIGHLIGHT_COLORS`, `HIGHLIGHT_OPACITY`). They are tuned for the tablet, which
-is where marks are meant to look right. The desktop and browser apps draw
-named colors with the export palette (`DESKTOP_COLORS`,
-`DESKTOP_HIGHLIGHT_COLORS`): marks record the color name they were drawn with,
-and `remarkable_export` PDFs re-draw named-color marks in that palette. The
-renderer (`remarkable_mcp/colors.py`, `RENDER_COLORS`) also keeps the export
-palette, so `remarkable_image` shows ink as the desktop app does.
+Named colors live in one table in `remarkable_mcp/colors.py` (`PENS`,
+`HIGHLIGHTERS`): each has its tablet color id, the `color_rgba` stored with it,
+its screen color and its desktop color. Marks drawn into the PDF use the screen
+colors (`pdf_marks.COLORS`, `HIGHLIGHT_COLORS`, `HIGHLIGHT_OPACITY`), tuned for
+the tablet, which is where marks are meant to look right. The desktop and
+browser apps draw named colors with the export palette (the desktop colors,
+`pdf_marks.DESKTOP_COLORS`, `DESKTOP_HIGHLIGHT_COLORS`): marks record the color
+name they were drawn with, and `remarkable_export` PDFs re-draw named-color
+marks in that palette. The renderer (`colors.RENDER_COLORS`) also keeps the
+export palette, so `remarkable_image` shows ink as the desktop app does.
 
 ## Procedure
 
@@ -80,7 +82,7 @@ tablet's dithering or its screen palette.
    Rows are `CHANNEL:START:STEP[:COUNT]` (hex start, 17 swatches by default).
    Add a page for a highlighter of known value (blue, `#BEEAFE`) as a control.
 
-4. **Verify.** Put the colors in `pdf_marks.py` and compare on the tablet:
+4. **Verify.** Put the colors in `colors.py` and compare on the tablet:
    - Swatches beside the reference strokes: a copy of "Color samples" with
      `line` marks per pen color and `highlight` marks per highlighter color.
      Expect an exact match, smooth or speckled alike.

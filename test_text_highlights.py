@@ -8,8 +8,7 @@ import pytest
 from rmscene import read_blocks
 from rmscene.scene_stream import SceneGlyphItemBlock
 
-from remarkable_mcp import cover_layers as cl
-from remarkable_mcp import pdf_marks
+from remarkable_mcp import ink_marks, pdf_marks, rm_ink
 from remarkable_mcp import text_highlights as th
 from test_mark_pdf import A4, CONTENT, FakeCloud, _mark_tool  # noqa: F401
 
@@ -19,7 +18,7 @@ AUTHOR = uuid.UUID("8efeea22-0545-4297-a2c6-c5b0e5e17c43")
 @pytest.fixture(autouse=True)
 def config_dir(tmp_path, monkeypatch):
     monkeypatch.setattr("remarkable_mcp.api.REMARKABLE_CONFIG_DIR", tmp_path)
-    (tmp_path / cl.AUTHOR_FILE_NAME).write_text(f"{AUTHOR}\n")
+    (tmp_path / rm_ink.AUTHOR_FILE_NAME).write_text(f"{AUTHOR}\n")
 
 
 def _page():
@@ -53,7 +52,7 @@ def test_find_text_splits_lines_and_picks_occurrences():
     assert parts[1]["start"] > parts[0]["start"] + parts[0]["length"]
     (second,) = th.find_text(page, "fox", occurrence=2)
     assert second["start"] > parts[1]["start"]
-    with pytest.raises(th.HighlightError, match="only 2 times"):
+    with pytest.raises(rm_ink.InkError, match="only 2 times"):
         th.find_text(page, "fox", occurrence=3)
 
 
@@ -68,15 +67,15 @@ def test_highlights_go_on_the_selected_layer_or_a_named_one():
         234,
         254,
     )
-    assert th.highlight_status(data, ids) == "on tablet"
+    assert ink_marks.ink_status(data, ids) == "on tablet"
 
     data, more = th.add_highlights(data, AUTHOR, A4, parts, "yellow", layer="Claude highlights")
-    names = [layer["name"] for layer in cl.page_layers(data)]
+    names = [layer["name"] for layer in rm_ink.page_layers(data)]
     assert names == ["Layer 1", "Claude highlights"]
 
-    data = cl._tombstone(data, ids)
-    assert th.highlight_status(data, ids) == "erased on tablet"
-    assert th.highlight_status(data, more) == "on tablet"
+    data = rm_ink.tombstone(data, ids)
+    assert ink_marks.ink_status(data, ids) == "erased on tablet"
+    assert ink_marks.ink_status(data, more) == "on tablet"
 
 
 @pytest.fixture

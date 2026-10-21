@@ -45,6 +45,8 @@ the desktop apps too, become worth the extra write path.
 
 ## Writing ink (all verified on the tablet)
 
+`rm_ink.py` implements these steps (`PageWriter`).
+
 1. **Author.** One random UUID per installation, stored in the config. In each
    file, reuse its author number if listed, else take the lowest free number
    and replace only the `AuthorIdsBlock` with one that adds it (rmscene

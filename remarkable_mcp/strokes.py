@@ -12,15 +12,16 @@ of the ``SceneInfo`` block and silently drops a few bytes, which can corrupt the
 page. Instead we:
 
 1. Parse the original bytes only to *discover* the target layer, paper size and
-   the highest CRDT id already in use (read-only).
-2. Serialize *only the new* ``SceneLineItemBlock``s with ``write_blocks``.
-3. Strip the 43-byte ``HEADER_V6`` prefix from that fresh serialization.
-4. Concatenate the headerless new-block bytes onto the *untouched* original
-   bytes.
+   the highest CRDT counter already in use (read-only).
+2. Add the MCP's author to the page's author table (the only block rewritten;
+   rmscene re-encodes it byte for byte), as ``rm_ink`` does for all its ink.
+3. Serialize *only the new* ``SceneLineItemBlock``s with ``write_blocks``, under
+   the MCP's author and the next counters, without the ``HEADER_V6`` prefix.
+4. Append them to the original blocks.
 
-The original bytes are preserved exactly as a prefix, so nothing the device
-wrote is ever rewritten. See ``test_server.py`` for the regression guard that
-asserts this property (and that a naive round-trip does *not* byte-match).
+Every other block the device wrote is kept byte for byte. See
+``test_server.py`` for the regression guard that asserts this property (and
+that a naive round-trip does *not* byte-match).
 
 Coordinate model
 ----------------
@@ -39,11 +40,12 @@ authored on a Paper Pro maps correctly even when edited from another device.
 
 from __future__ import annotations
 
+import dataclasses
 import io
 import logging
 from typing import Iterable, Optional
 
-from rmscene import HEADER_V6, read_blocks, write_blocks
+from rmscene import read_blocks
 from rmscene.scene_items import Line, Pen, PenColor, Point
 from rmscene.scene_stream import (
     CrdtSequenceItem,
@@ -53,6 +55,8 @@ from rmscene.scene_stream import (
     TreeNodeBlock,
 )
 from rmscene.tagged_block_common import CrdtId
+
+from remarkable_mcp import colors, rm_ink
 
 logger = logging.getLogger(__name__)
 
@@ -111,7 +115,10 @@ def _color_aliases() -> dict[str, int]:
 
 
 PEN_IDS = _pen_aliases()
+# rmscene's color names; named colors resolve per tool first (see
+# resolve_ink_color).
 COLOR_IDS = _color_aliases()
+HIGHLIGHTER_IDS = {int(Pen.HIGHLIGHTER_1.value), int(Pen.HIGHLIGHTER_2.value)}
 
 
 # Per-tool brush values measured from real hand-drawn strokes on the device
@@ -156,19 +163,37 @@ def resolve_tool(tool) -> int:
     )
 
 
-def resolve_color(color) -> int:
-    """Resolve a color name or int to a valid PenColor id."""
+def resolve_ink_color(color, tool_id: Optional[int] = None) -> tuple[int, Optional[tuple]]:
+    """Resolve a color name or int to ``(PenColor id, color_rgba or None)``.
+
+    A named color is the color erasable marks get for the same tool: the
+    highlighter's colors for the highlighter (blue and orange are color id 9
+    with their ``color_rgba``), the pen colors for every other tool. Other
+    names are rmscene's color names (``yellow_2``, ``gray_overlap``, ...).
+    """
     if color is None:
-        return COLOR_IDS[DEFAULT_COLOR]
+        color = DEFAULT_COLOR
     if isinstance(color, int):
-        return int(PenColor(color).value)
+        return int(PenColor(color).value), None
     key = str(color).strip().lower().replace(" ", "_").replace("-", "_")
+    highlighter = tool_id is not None and int(tool_id) in HIGHLIGHTER_IDS
+    palette = colors.HIGHLIGHTER_BY_NAME if highlighter else colors.PEN_BY_NAME
+    named = palette.get("gray" if key == "grey" else key)
+    if named is not None:
+        rgba = named.rgba if named.color_id == colors.CUSTOM_COLOR_ID else None
+        return named.color_id, rgba
     if key in COLOR_IDS:
-        return COLOR_IDS[key]
+        return COLOR_IDS[key], None
     raise StrokeError(
-        f"Unknown color {color!r}. Valid names include: black, gray/grey, white, "
-        "yellow, green, pink, blue, red, cyan, magenta, highlight."
+        f"Unknown color {color!r}. Pen colors: {', '.join(colors.PEN_BY_NAME)}; "
+        f"highlighter colors: {', '.join(colors.HIGHLIGHTER_BY_NAME)}."
     )
+
+
+def resolve_color(color, tool_id: Optional[int] = None) -> int:
+    """Resolve a color name or int to a valid PenColor id for a tool (see
+    ``resolve_ink_color``)."""
+    return resolve_ink_color(color, tool_id)[0]
 
 
 def get_paper_size(blocks: Iterable[object]) -> tuple[int, int]:
@@ -188,28 +213,6 @@ def get_paper_size(blocks: Iterable[object]) -> tuple[int, int]:
                 except (TypeError, ValueError):
                     pass
     return DEFAULT_PAPER_SIZE
-
-
-def _iter_crdt_ids(blocks: Iterable[object]):
-    """Yield every CrdtId referenced by a block list (best effort)."""
-    for b in blocks:
-        for attr in ("tree_id", "node_id", "parent_id", "block_id"):
-            v = getattr(b, attr, None)
-            if isinstance(v, CrdtId):
-                yield v
-        item = getattr(b, "item", None)
-        if item is not None:
-            iid = getattr(item, "item_id", None)
-            if isinstance(iid, CrdtId):
-                yield iid
-            val = getattr(item, "value", None)
-            if isinstance(val, CrdtId):
-                yield val
-        group = getattr(b, "group", None)
-        if group is not None:
-            gid = getattr(group, "node_id", None)
-            if isinstance(gid, CrdtId):
-                yield gid
 
 
 def find_target_layer(blocks: list) -> CrdtId:
@@ -247,26 +250,11 @@ def find_target_layer(blocks: list) -> CrdtId:
     )
 
 
-def allocate_ids(blocks: list, count: int) -> list[CrdtId]:
-    """Allocate ``count`` fresh, monotonically-increasing CrdtIds.
-
-    Picks an id strictly greater (by ``part2``) than anything already present so
-    the new sequence items never collide with existing content.
-    """
-    max_id = CrdtId(0, 0)
-    for cid in _iter_crdt_ids(blocks):
-        if (cid.part1, cid.part2) > (max_id.part1, max_id.part2):
-            max_id = cid
-    part1 = max_id.part1 if max_id.part1 else 0
-    base = max_id.part2
-    return [CrdtId(part1, base + 1 + i) for i in range(count)]
-
-
-def _map_point(nx: float, ny: float, pressure, width, paper_w: int, paper_h: int) -> Point:
+def _map_point(nx: float, ny: float, pressure, width, extent_w: float, extent_h: float) -> Point:
     nx = min(1.0, max(0.0, float(nx)))
     ny = min(1.0, max(0.0, float(ny)))
-    rm_x = (nx - 0.5) * paper_w
-    rm_y = ny * paper_h
+    rm_x = (nx - 0.5) * extent_w
+    rm_y = ny * extent_h
     p = DEFAULT_PRESSURE if pressure is None else int(pressure)
     p = min(255, max(0, p))
     w = DEFAULT_WIDTH if width is None else int(width)
@@ -277,10 +265,14 @@ def build_line_block(
     layer_id: CrdtId,
     item_id: CrdtId,
     stroke: dict,
-    paper_w: int,
-    paper_h: int,
+    extent_w: float,
+    extent_h: float,
 ) -> SceneLineItemBlock:
     """Build a single ``SceneLineItemBlock`` from a plain stroke dict.
+
+    ``extent_w`` x ``extent_h`` is the page in stroke units, which the
+    normalized points span: the paper size for canvas strokes, or the PDF
+    page size over the points per unit for marks on a PDF page.
 
     Stroke dict contract::
 
@@ -308,16 +300,19 @@ def build_line_block(
             nx, ny, pressure = rp[0], rp[1], rp[2]
         else:
             nx, ny, pressure = rp[0], rp[1], None
-        pts.append(_map_point(nx, ny, pressure, width, paper_w, paper_h))
+        pts.append(_map_point(nx, ny, pressure, width, extent_w, extent_h))
 
+    color_id, rgba = resolve_ink_color(stroke.get("color"), tool_id)
     line = Line(
-        color=PenColor(resolve_color(stroke.get("color"))),
+        color=PenColor(color_id),
         tool=Pen(tool_id),
         points=pts,
         thickness_scale=float(stroke.get("thickness_scale") or base_scale),
         starting_length=0.0,
         move_id=None,
     )
+    if rgba is not None:
+        line = dataclasses.replace(line, color_rgba=rgba)
     item = CrdtSequenceItem(
         item_id=item_id,
         left_id=CrdtId(0, 0),
@@ -333,35 +328,28 @@ def build_line_block(
     )
 
 
-def serialize_new_blocks(blocks: list) -> bytes:
-    """Serialize blocks with write_blocks and strip the HEADER_V6 prefix."""
-    buf = io.BytesIO()
-    write_blocks(buf, blocks, options={"version": WRITE_VERSION})
-    data = buf.getvalue()
-    if data.startswith(HEADER_V6):
-        return data[len(HEADER_V6) :]
-    return data
-
-
-def append_strokes(original_bytes: bytes, strokes: list[dict]) -> bytes:
+def append_strokes(original_bytes: bytes, strokes: list[dict], author=None) -> bytes:
     """Append ``strokes`` to an existing page, returning new raw ``.rm`` bytes.
 
-    The original bytes are preserved verbatim as a prefix of the result.
+    The strokes are written under ``author`` (default: this installation's
+    author id, see ``rm_ink.author_uuid``) with ids from the page's shared
+    counter. Every block of the original is kept unchanged except the author
+    table, which gains the author.
     """
     if not strokes:
         raise StrokeError("No strokes provided to write.")
 
-    blocks = list(read_blocks(io.BytesIO(original_bytes)))
-    layer_id = find_target_layer(blocks)
-    paper_w, paper_h = get_paper_size(blocks)
-    ids = allocate_ids(blocks, len(strokes))
-
-    new_blocks = [
-        build_line_block(layer_id, ids[i], stroke, paper_w, paper_h)
-        for i, stroke in enumerate(strokes)
-    ]
-    appended = serialize_new_blocks(new_blocks)
-    return original_bytes + appended
+    page = rm_ink.PageWriter(original_bytes, author or rm_ink.author_uuid())
+    layer_id = find_target_layer(page.blocks)
+    paper_w, paper_h = get_paper_size(page.blocks)
+    ids = page.new_ids(len(strokes))
+    page.append(
+        [
+            build_line_block(layer_id, rm_ink.crdt(item_id), stroke, paper_w, paper_h)
+            for item_id, stroke in zip(ids, strokes)
+        ]
+    )
+    return page.data
 
 
 def page_geometry(original_bytes: bytes) -> dict:

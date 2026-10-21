@@ -137,7 +137,7 @@ async def test_insert_keeps_marks_and_outline_on_their_pages(cloud):
     assert texts == ["", "Page 1", "Feedback", "Page 2", "Page 3"]
     (mark,) = pdf_marks.stored_marks(pdf)
     assert mark["pdf_page"] == 4
-    assert pdf_marks.load_outline(pdf) == [{"level": 1, "title": "Third", "pdf_page": 4}]
+    assert pdf_marks.MarkedPdf.load(pdf).outline == [{"level": 1, "title": "Third", "pdf_page": 4}]
     content = json.loads(cloud.stored(".content"))
     assert content["pageCount"] == 5 and content["redirectionPageMap"] == [0, 1, 2, 3, 4]
     assert content["pages"][1] == "a" and content["pages"][3:] == ["b", "c"]

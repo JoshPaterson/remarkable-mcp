@@ -6,7 +6,7 @@ the tablet stays in that list with a ``deleted`` field (e.g.
 page ids in a flat ``pages`` list.
 """
 
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Sequence, Set
 
 
 def _is_deleted(entry: Dict[str, Any]) -> bool:
@@ -76,6 +76,14 @@ def pdf_page_map(content: Any) -> List[Optional[int]]:
     if isinstance(rpm, list) and rpm:
         return [v if isinstance(v, int) and v >= 0 else None for v in rpm]
     return list(range(len(content_page_ids(content))))
+
+
+def tablet_page(pdf_page: int, page_map: Sequence[Optional[int]]) -> Optional[int]:
+    """The 1-based tablet page showing ``pdf_page``, if it is still shown."""
+    for position, index in enumerate(page_map, start=1):
+        if index == pdf_page:
+            return position
+    return None
 
 
 # --- Inserting PDF pages ---------------------------------------------------

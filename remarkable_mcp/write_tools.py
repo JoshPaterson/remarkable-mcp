@@ -22,6 +22,7 @@ no external Go binary required.
 """
 
 import asyncio
+import dataclasses
 import json
 import logging
 import os
@@ -45,7 +46,7 @@ from remarkable_mcp.api import (
     get_rmapi,
 )
 from remarkable_mcp.capabilities import client_supports_elicitation
-from remarkable_mcp.pages import content_page_ids
+from remarkable_mcp.pages import content_page_ids, tablet_page
 from remarkable_mcp.responses import make_error, make_response
 from remarkable_mcp.ssh import XOCHITL_PATH, Document, SSHClient
 from remarkable_mcp.ssh_reliability import (
@@ -1346,7 +1347,7 @@ def _page_obstacles(client, files: list, pdf: bytes):
     user's ink and the PDF's printed text on a page, for placing marks with
     ``near``."""
     from remarkable_mcp.extract import page_ink_regions
-    from remarkable_mcp.pdf_marks import original_pdf, tablet_page, text_lines
+    from remarkable_mcp.pdf_marks import original_pdf, text_lines
 
     base = original_pdf(pdf)
     cache: dict = {}
@@ -1386,12 +1387,14 @@ def _mark_editor(
     def edit(pdf: bytes, content: dict, read_ink=None) -> dict:
         """``read_ink(page_id)`` returns a page's ink file (or None); it is
         needed to write marks' covers and report their state."""
-        from remarkable_mcp import cover_layers, ink_marks, text_highlights
+        from remarkable_mcp import mark_ink, rm_ink, text_highlights
         from remarkable_mcp.pages import content_page_ids
 
-        base, marks = pdf_marks.load_state(pdf)
+        state = pdf_marks.MarkedPdf.load(pdf)
+        base, marks = state.base, state.marks
         page_map = pdf_page_map(content)
         page_ids = content_page_ids(content)
+        sizes = pdf_marks.page_sizes(base)
 
         def locate(pdf_page: int, text: str, occurrence: int):
             import pymupdf
@@ -1405,7 +1408,7 @@ def _mark_editor(
             remove=remove,
             clear=clear,
             page_map=page_map,
-            sizes=pdf_marks.page_sizes(base),
+            sizes=sizes,
             color=color,
             obstacles=(lambda i: obstacles(i, page_map)) if obstacles else None,
             locate=locate,
@@ -1414,121 +1417,47 @@ def _mark_editor(
         touched |= {m["pdf_page"] for m in result["marks"] if m["id"] in result["added"]}
         result["page_map"] = page_map
         result["touched_pages"] = sorted(
-            p for p in (pdf_marks.tablet_page(i, page_map) for i in touched) if p
+            p for p in (tablet_page(i, page_map) for i in touched) if p
         )
         result["ink"] = {}
-        covers = [m.get("cover") for m in marks + result["marks"]]
-        if build and result["changed"] and any(isinstance(c, dict) for c in covers):
+        if build and result["changed"] and mark_ink.has_ink(marks + result["marks"]):
             if read_ink is None:
-                raise pdf_marks.MarkError("Covers cannot be written here.")
+                raise pdf_marks.MarkError(
+                    "Covers, text highlights and erasable marks cannot be written here."
+                )
             try:
-                result["ink"] = cover_layers.write_mark_covers(
+                result["ink"] = mark_ink.write_marks(
                     marks,
                     result["marks"],
                     result["removed"],
                     page_ids=page_ids,
                     page_map=page_map,
-                    sizes=pdf_marks.page_sizes(base),
+                    sizes=sizes,
                     read_ink=read_ink,
-                    author=cover_layers.author_uuid(),
+                    author=rm_ink.author_uuid(),
                 )
-            except cover_layers.CoverError as e:
-                raise pdf_marks.MarkError(str(e)) from None
-        inks = [m.get("highlight") for m in marks + result["marks"]]
-        if build and result["changed"] and any(isinstance(h, dict) for h in inks):
-            if read_ink is None:
-                raise pdf_marks.MarkError("Text highlights cannot be written here.")
-            covered = result["ink"]
-            try:
-                result["ink"] = dict(
-                    covered,
-                    **text_highlights.write_mark_highlights(
-                        marks,
-                        result["marks"],
-                        result["removed"],
-                        page_ids=page_ids,
-                        page_map=page_map,
-                        sizes=pdf_marks.page_sizes(base),
-                        read_ink=lambda page_id: covered.get(page_id) or read_ink(page_id),
-                        author=cover_layers.author_uuid(),
-                    ),
-                )
-            except text_highlights.HighlightError as e:
-                raise pdf_marks.MarkError(str(e)) from None
-        inks = [m.get("ink") for m in marks + result["marks"]]
-        if build and result["changed"] and any(isinstance(i, dict) for i in inks):
-            if read_ink is None:
-                raise pdf_marks.MarkError("Erasable marks cannot be written here.")
-            written_so_far = result["ink"]
-            try:
-                result["ink"] = dict(
-                    written_so_far,
-                    **ink_marks.write_mark_ink(
-                        marks,
-                        result["marks"],
-                        result["removed"],
-                        page_ids=page_ids,
-                        page_map=page_map,
-                        sizes=pdf_marks.page_sizes(base),
-                        read_ink=lambda page_id: written_so_far.get(page_id) or read_ink(page_id),
-                        author=cover_layers.author_uuid(),
-                    ),
-                )
-            except ink_marks.InkError as e:
+            except rm_ink.InkError as e:
                 raise pdf_marks.MarkError(str(e)) from None
         result["cover_states"], cover_notes = {}, []
         if read_ink is not None:
             written = result["ink"]
-            result["cover_states"], cover_notes = cover_layers.mark_cover_states(
+            result["cover_states"], cover_notes = mark_ink.mark_states(
                 result["marks"],
                 page_ids=page_ids,
                 page_map=page_map,
-                read_ink=lambda page_id: written.get(page_id) or read_ink(page_id),
-            )
-            result["cover_states"].update(
-                ink_marks.mark_ink_states(
-                    result["marks"],
-                    page_ids=page_ids,
-                    page_map=page_map,
-                    read_ink=lambda page_id: written.get(page_id) or read_ink(page_id),
-                )
-            )
-            result["cover_states"].update(
-                text_highlights.mark_highlight_states(
-                    result["marks"],
-                    page_ids=page_ids,
-                    page_map=page_map,
-                    read_ink=lambda page_id: written.get(page_id) or read_ink(page_id),
-                )
+                read_ink=lambda page_id: (
+                    written[page_id] if page_id in written else read_ink(page_id)
+                ),
             )
         result["notes"] = result["notes"] + cover_notes
         result["pdf"] = (
-            pdf_marks.build(
-                base,
-                result["marks"],
-                outline=pdf_marks.load_outline(pdf),
-                ocr=pdf_marks.load_ocr(pdf),
-            )
-            if result["changed"]
-            else None
+            dataclasses.replace(state, marks=result["marks"]).pdf() if result["changed"] else None
         )
         if not build:
             result["preview_pdf"], result["pdf"] = result["pdf"], None
         return result
 
     return edit
-
-
-def _ink_reader(client, doc_id: str, files: list):
-    """``read_ink(page_id)``: a page's ``.rm`` file from a document's index
-    ``files``, or None when the page has no ink."""
-    by_id = {entry["id"]: entry for entry in files}
-
-    def read_ink(page_id: str) -> Optional[bytes]:
-        entry = by_id.get(f"{doc_id}/{page_id}.rm")
-        return None if entry is None else client._get_file(entry["hash"], entry["id"])
-
-    return read_ink
 
 
 @contextmanager
@@ -1610,9 +1539,7 @@ def _page_layer_list(client, files: list, page: int) -> list:
     """A tablet page's layers, bottom first: ``{"name", "visible",
     "selected"}``; empty when the page has no ink yet (Layer 1 is made with
     the first ink)."""
-    from rmscene.scene_stream import SceneInfo
-
-    from remarkable_mcp import cover_layers
+    from remarkable_mcp import rm_ink
     from remarkable_mcp.pages import content_page_ids
 
     content_file = next((f for f in files if f["id"].endswith(".content")), None)
@@ -1626,12 +1553,9 @@ def _page_layer_list(client, files: list, page: int) -> list:
     if rm is None:
         return []
     data = client._get_file(rm["hash"], rm["id"])
-    selected = None
-    for block in cover_layers._parse(data):
-        if isinstance(block, SceneInfo) and block.current_layer is not None:
-            selected = cover_layers._key(block.current_layer.value)
-    layers = cover_layers.page_layers(data)
-    if selected not in {layer["id"] for layer in layers} and layers:
+    layers = rm_ink.page_layers(data)
+    selected = rm_ink.selected_layer(data)
+    if selected is None and layers:
         selected = layers[0]["id"]
     return [
         {"name": layer["name"], "visible": layer["visible"], "selected": layer["id"] == selected}
@@ -1640,7 +1564,7 @@ def _page_layer_list(client, files: list, page: int) -> list:
 
 
 def _mark_response(target, result: dict, dry_run: bool) -> str:
-    from remarkable_mcp.pdf_marks import summarize, tablet_page
+    from remarkable_mcp.pdf_marks import summarize
 
     page_map = result["page_map"]
     data = {
@@ -1682,7 +1606,6 @@ MAX_OCR_CHECKS = 100
 
 
 def _tablet_pages(indexes, page_map) -> list:
-    from remarkable_mcp.pdf_marks import tablet_page
 
     return [p for p in (tablet_page(i, page_map) for i in indexes) if p]
 
@@ -1773,7 +1696,7 @@ def _ocr_document(client, target) -> str:
     from remarkable_mcp.pages import pdf_page_map
 
     pdf, content, _ = client.read_document_pdf(target.ID)
-    base, _ = pdf_marks.load_state(pdf)
+    base = pdf_marks.MarkedPdf.load(pdf).base
     found = pdf_ocr.pages_needing_ocr(base)
     page_map = pdf_page_map(content)
     name = target.VissibleName
@@ -1798,23 +1721,15 @@ def _ocr_document(client, target) -> str:
         )
 
     def edit(current: bytes, _content: dict) -> dict:
-        current_base, marks = pdf_marks.load_state(current)
-        if current_base != base:
+        state = pdf_marks.MarkedPdf.load(current)
+        if state.base != base:
             raise pdf_marks.MarkError(
                 f"'{name}' changed while it was being OCR'd; call again to OCR the new version."
             )
         new_base = pdf_ocr.with_text_layers(base, {i: pages[i] for i in found["scanned"]})
-        record = pdf_marks.load_ocr(current) or {"pdf_pages": []}
-        record = {
-            "backend": backend,
-            "pdf_pages": sorted(set(record.get("pdf_pages", [])) | set(found["scanned"])),
-        }
-        outline = pdf_marks.load_outline(current)
-        if marks or outline is not None:
-            new_pdf = pdf_marks.build(new_base, marks, outline=outline, ocr=record)
-        else:
-            new_pdf = pdf_marks.record_ocr(new_base, record)
-        return {"pdf": new_pdf}
+        done = (state.ocr or {}).get("pdf_pages", [])
+        record = {"backend": backend, "pdf_pages": sorted(set(done) | set(found["scanned"]))}
+        return {"pdf": dataclasses.replace(state, base=new_base, ocr=record).pdf()}
 
     client.replace_document_pdf(target.ID, edit)
     _invalidate_client_cache(client)
@@ -1892,15 +1807,12 @@ def _pages_editor(inserts: list, build: bool):
 
     import pymupdf
 
-    from remarkable_mcp import cover_layers, pdf_marks
+    from remarkable_mcp import pdf_marks, rm_ink
     from remarkable_mcp.pages import content_page_ids, insert_pdf_pages, pdf_page_map
 
     def edit(pdf: bytes, content: dict, pagedata) -> dict:
-        base, marks = pdf_marks.load_state(pdf)
-        outline = pdf_marks.load_outline(pdf)
-        ocr = pdf_marks.load_ocr(pdf)
-        with pymupdf.open(stream=pdf, filetype="pdf") as current:
-            embedded = pdf_marks.BASE_FILE in current.embfile_names()
+        state = pdf_marks.MarkedPdf.load(pdf)
+        marks, outline, ocr = state.marks, state.outline, state.ocr
         content = copy.deepcopy(content)
         templates = pagedata.split("\n") if pagedata is not None else None
         page_count = len(pdf_page_map(content))
@@ -1912,8 +1824,8 @@ def _pages_editor(inserts: list, build: bool):
                 raise pdf_marks.MarkError(
                     f"Page {after} does not exist; the document has {page_count}."
                 )
-        doc = pymupdf.open(stream=base, filetype="pdf")
-        author = str(cover_layers.author_uuid())
+        doc = pymupdf.open(stream=state.base, filetype="pdf")
+        author = str(rm_ink.author_uuid())
         new_ids: list = []
         marks = [dict(m) for m in marks]
         for entry in sorted(inserts, key=lambda e: e["after"], reverse=True):
@@ -1947,12 +1859,7 @@ def _pages_editor(inserts: list, build: bool):
             new_ids += ids
         new_base = doc.tobytes(garbage=3, deflate=True)
         doc.close()
-        if marks or outline is not None or embedded:
-            new_pdf = pdf_marks.build(new_base, marks, outline=outline, ocr=ocr)
-        elif ocr:
-            new_pdf = pdf_marks.record_ocr(new_base, ocr)
-        else:
-            new_pdf = new_base
+        new_pdf = pdf_marks.MarkedPdf(new_base, marks, outline, ocr).pdf()
         order = content_page_ids(content)
         inserted = sorted(order.index(i) + 1 for i in new_ids)
         return {
@@ -1973,8 +1880,8 @@ def _outline_editor(outline, build: bool):
     from remarkable_mcp.pages import pdf_page_map
 
     def edit(pdf: bytes, content: dict) -> dict:
-        base, marks = pdf_marks.load_state(pdf)
-        current = pdf_marks.load_outline(pdf)
+        state = pdf_marks.MarkedPdf.load(pdf)
+        base, current = state.base, state.outline
         page_map = pdf_page_map(content)
         if outline is None:
             new = current
@@ -1994,7 +1901,7 @@ def _outline_editor(outline, build: bool):
                 {
                     "level": entry["level"],
                     "title": entry["title"],
-                    "page": (pdf_marks.tablet_page(index, page_map) if index is not None else None),
+                    "page": (tablet_page(index, page_map) if index is not None else None),
                     "first_lines": opening.get(index, []),
                 }
             )
@@ -2002,11 +1909,7 @@ def _outline_editor(outline, build: bool):
             "outline": listed,
             "source": "set with remarkable_pdf_outline" if new is not None else "the PDF's own",
             "changed": changed,
-            "pdf": (
-                pdf_marks.build(base, marks, outline=new, ocr=pdf_marks.load_ocr(pdf))
-                if changed and build
-                else None
-            ),
+            "pdf": dataclasses.replace(state, outline=new).pdf() if changed and build else None,
         }
 
     return edit
@@ -2478,7 +2381,7 @@ def _author_draw(
             ),
         )
 
-    from remarkable_mcp import notebooks as nb
+    from remarkable_mcp import rm_ink
     from remarkable_mcp import strokes as strokes_mod
 
     ssh_client = _get_ssh_client()
@@ -2521,11 +2424,11 @@ def _author_draw(
     rm_path = f"{XOCHITL_PATH}/{doc_uuid}/{page_id}.rm"
     original = _read_remote_bytes(ssh_client, rm_path)
     # A native notebook page that has never been drawn on (or a PDF/EPUB page
-    # with no annotation overlay yet) has no .rm file. Seed a blank drawable
-    # layer so the strokes have somewhere to land.
+    # with no annotation overlay yet) has no .rm file. Seed a first ink file
+    # (Layer 1, selected, no typed-text block) so the strokes have somewhere to land.
     page_existed = original is not None
     if not page_existed:
-        original = nb.blank_page_rm_bytes()
+        original = rm_ink.first_page_rm(rm_ink.author_uuid())
 
     try:
         geom = strokes_mod.page_geometry(original)
@@ -2815,6 +2718,8 @@ def register_write_tools():
              "tool": "fineliner" | "highlighter" | int,
              "color": "black" | "yellow" | ...,
              "width": <optional float>, "thickness_scale": <optional float>}
+            Pen colors: black, gray, white, blue, red, green, yellow, cyan,
+            magenta. Highlighter colors: yellow, blue, pink, orange, green, gray.
         - name: Title of the new notebook (create_document).
         - text: Optional typed text for the first page (create_document). Omit it
             unless the user explicitly requested specific content; never fabricate
@@ -4138,7 +4043,7 @@ def register_write_tools():
                                 _invalidate_client_cache(client)
                             return _mark_response(target, result, dry_run=False)
                         pdf, content, files = client.read_document_pdf(target.ID)
-                        result = edit(pdf, content, _ink_reader(client, target.ID, files))
+                        result = edit(pdf, content, client.ink_reader(target.ID, files))
                         if layout is not None:
                             result["layout"] = _mark_layout(
                                 client, files, pdf, layout, result["page_map"]

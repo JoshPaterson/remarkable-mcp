@@ -19,7 +19,7 @@ import json
 import os
 import time
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 import pymupdf
 
@@ -201,7 +201,3 @@ def run_ocr(
             done[index] = {"zoom": zoom, "words": [list(w) for w in words_fn(png)]}
             save_work(doc_id, base, done, directory)
     return done
-
-
-def summary(pages: Dict[int, Any]) -> int:
-    return sum(len(result["words"]) for result in pages.values())

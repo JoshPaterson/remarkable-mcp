@@ -14,7 +14,7 @@ import pytest
 from PIL import Image
 
 from remarkable_mcp import pdf_marks, tablet_json
-from remarkable_mcp.pages import pdf_page_map
+from remarkable_mcp.pages import pdf_page_map, tablet_page
 from remarkable_mcp.pdf_marks import MarkError
 from remarkable_mcp.server import mcp
 from remarkable_mcp.sync import RemarkableClient, _hash_entries, _serialize_doc_index
@@ -91,7 +91,8 @@ def test_marks_round_trip_and_clear_restores_original(tmp_path):
     assert len(result["added"]) == 10
     marked = pdf_marks.build(original, result["marks"])
 
-    base, marks = pdf_marks.load_state(marked)
+    state = pdf_marks.MarkedPdf.load(marked)
+    base, marks = state.base, state.marks
     assert base == original
     assert [m["id"] for m in marks] == result["added"]
     assert [m["kind"] for m in marks][-4:] == ["graphic"] * 4
@@ -110,7 +111,7 @@ def test_marks_round_trip_and_clear_restores_original(tmp_path):
 def test_rebuild_reuses_stored_snippets():
     original = _pdf()
     first = _edit(add=[{"page": 1, "id": "a", "text": "keep", "at": [0.1, 0.1]}])
-    base, marks = pdf_marks.load_state(pdf_marks.build(original, first["marks"]))
+    marks = pdf_marks.MarkedPdf.load(pdf_marks.build(original, first["marks"])).marks
     second = _edit(
         marks, add=[{"page": 1, "id": "b", "shape": "box", "region": [0.2, 0.2, 0.3, 0.3]}]
     )
@@ -138,7 +139,8 @@ def test_removed_mark_leaves_nothing_behind():
             {"page": 1, "id": "q3-note", "text": "Orange is secondary", "at": [0.45, 0.3]},
         ]
     )
-    base, marks = pdf_marks.load_state(pdf_marks.build(original, first["marks"]))
+    state = pdf_marks.MarkedPdf.load(pdf_marks.build(original, first["marks"]))
+    base, marks = state.base, state.marks
     second = _edit(
         marks,
         remove=["q3", "q3-note"],
@@ -148,7 +150,7 @@ def test_removed_mark_leaves_nothing_behind():
     rebuilt = pdf_marks.build(base, second["marks"])
     with pymupdf.open(stream=rebuilt, filetype="pdf") as doc:
         assert "Orange" not in doc[0].get_text()
-    assert [m["shape"] for m in pdf_marks.load_state(rebuilt)[1]] == ["check"]
+    assert [m["shape"] for m in pdf_marks.MarkedPdf.load(rebuilt).marks] == ["check"]
 
 
 def test_default_colors():
@@ -308,7 +310,7 @@ def test_marks_follow_pdf_pages_not_tablet_positions():
         add=[{"page": 3, "id": "a", "shape": "check", "at": [0.5, 0.5]}], page_map=[0, None, 1]
     )
     assert result["marks"][0]["pdf_page"] == 1
-    assert pdf_marks.tablet_page(1, [1, 0]) == 1
+    assert tablet_page(1, [1, 0]) == 1
     with pytest.raises(MarkError, match="added on the tablet"):
         _edit(add=[{"page": 2, "shape": "check", "at": [0.5, 0.5]}], page_map=[0, None, 1])
 
@@ -397,7 +399,7 @@ def test_svg_internal_and_data_references_are_allowed():
 
 def test_unmarked_pdf_has_no_marks():
     original = _pdf()
-    assert pdf_marks.load_state(original) == (original, [])
+    assert pdf_marks.MarkedPdf.load(original) == pdf_marks.MarkedPdf(original, [])
     assert pdf_marks.stored_marks(b"not a pdf") == []
     assert pdf_marks.original_pdf(b"not a pdf") == b"not a pdf"
 
@@ -409,7 +411,7 @@ def test_older_mark_format_must_be_cleared():
     doc.embfile_add(pdf_marks.MARKS_FILE, json.dumps({"format": 1, "marks": []}).encode())
     old = doc.tobytes()
     with pytest.raises(MarkError, match="older version"):
-        pdf_marks.load_state(old)
+        pdf_marks.MarkedPdf.load(old)
     assert pdf_marks.original_pdf(old) == original
 
 
@@ -808,7 +810,7 @@ def test_export_redraws_named_colors_in_the_desktop_palette():
     assert "#ffed75" not in colors
     assert "#123456" in colors  # hex colors are kept
     # The document itself keeps the tablet's colors and its attachments.
-    assert pdf_marks.load_state(marked)[1][0]["color_name"] == "red"
+    assert pdf_marks.MarkedPdf.load(marked).marks[0]["color_name"] == "red"
     assert pdf_marks.for_export(original) == original
 
 
@@ -942,7 +944,8 @@ def test_leader_line_is_drawn_and_removed_with_its_mark(always_lead):
     marked = pdf_marks.build(original, result["marks"])
     with pymupdf.open(stream=marked, filetype="pdf") as doc:
         assert any(abs(d["width"] - pdf_marks.LEADER_WIDTH) < 0.01 for d in doc[0].get_drawings())
-    base, marks = pdf_marks.load_state(marked)
+    state = pdf_marks.MarkedPdf.load(marked)
+    base, marks = state.base, state.marks
     after = pdf_marks.edit_marks(
         marks, add=[], remove=["n"], clear=False, page_map=[0, 1], sizes=[A4, A4], color=None
     )

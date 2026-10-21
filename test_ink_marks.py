@@ -8,8 +8,7 @@ import pytest
 from rmscene import read_blocks
 from rmscene.scene_stream import SceneLineItemBlock
 
-from remarkable_mcp import cover_layers as cl
-from remarkable_mcp import ink_marks, pdf_marks
+from remarkable_mcp import ink_marks, pdf_marks, rm_ink
 from test_mark_pdf import A4, CONTENT, FakeCloud, _mark_tool  # noqa: F401
 
 AUTHOR = uuid.UUID("8efeea22-0545-4297-a2c6-c5b0e5e17c43")
@@ -18,7 +17,7 @@ AUTHOR = uuid.UUID("8efeea22-0545-4297-a2c6-c5b0e5e17c43")
 @pytest.fixture(autouse=True)
 def config_dir(tmp_path, monkeypatch):
     monkeypatch.setattr("remarkable_mcp.api.REMARKABLE_CONFIG_DIR", tmp_path)
-    (tmp_path / cl.AUTHOR_FILE_NAME).write_text(f"{AUTHOR}\n")
+    (tmp_path / rm_ink.AUTHOR_FILE_NAME).write_text(f"{AUTHOR}\n")
 
 
 def _lines(data):
@@ -145,7 +144,7 @@ async def test_erasable_marks_are_ink_not_pdf(cloud):
     ink = cloud.stored("page-a.rm")
     lines = _lines(ink)
     assert {int(b.item.value.color) for b in lines} == {7, 3}  # red pen, yellow highlighter
-    assert [layer["name"] for layer in cl.page_layers(ink)] == ["Layer 1", "Claude marks"]
+    assert [layer["name"] for layer in rm_ink.page_layers(ink)] == ["Layer 1", "Claude marks"]
 
     note_items = next(
         m["ink"]["items"] for m in pdf_marks.stored_marks(cloud.stored(".pdf")) if m["id"] == "n"
@@ -185,3 +184,63 @@ def test_dots_are_drawn_as_small_filled_circles():
     assert len(dot) == 1
     xs = [p[0] for p in dot[0]["points"]]
     assert max(xs) - min(xs) > 0.5  # a real loop, not a single point
+
+
+def _write(before, after, removed, pages):
+    from remarkable_mcp import mark_ink
+
+    return mark_ink.write_marks(
+        before,
+        after,
+        removed,
+        page_ids=["page-a"],
+        page_map=[0],
+        sizes=[A4],
+        read_ink=pages.get,
+        author=AUTHOR,
+    )
+
+
+def test_removing_ink_from_a_page_without_ink_writes_nothing():
+    gone = {"id": "n", "pdf_page": 0, "ink": {"tool": "fineliner", "items": [[2, 50]]}}
+    hl = {"id": "h", "pdf_page": 0, "highlight": {"items": [[2, 60]]}}
+    assert _write([gone, hl], [], ["n", "h"], {}) == {}
+
+
+def test_every_kind_of_ink_on_a_page_is_written_in_one_pass():
+    strokes = [{"points": [(100, 300), (200, 300)], "width": 1.5}]
+    page, ids = ink_marks.add_strokes(None, AUTHOR, A4, strokes, "fineliner", "red")
+    old = {"id": "old", "pdf_page": 0, "ink": {"tool": "fineliner", "color": "red", "items": ids}}
+    parts = [{"start": 0, "length": 5, "text": "hello", "rect": (100, 200, 140, 212)}]
+    hl = {
+        "id": "hl",
+        "pdf_page": 0,
+        "color_name": "blue",
+        "highlight": {"parts": parts, "layer": None, "pending": True},
+    }
+    box = {"id": "box", "pdf_page": 0, "box": [0.1, 0.5, 0.3, 0.52]}
+    box["ink"] = {"pending": True, "tool": "highlighter", "color": "yellow", "layer": None}
+    changed = _write([old], [hl, box], ["old"], {"page-a": page})
+    data = changed["page-a"]
+    assert ink_marks.ink_status(data, ids) == "erased on tablet"
+    assert ink_marks.ink_status(data, hl["highlight"]["items"]) == "on tablet"
+    assert ink_marks.ink_status(data, box["ink"]["items"]) == "on tablet"
+
+
+def test_canvas_strokes_use_the_mcp_author_and_the_shared_counter():
+    from pathlib import Path
+
+    from remarkable_mcp import strokes as strokes_mod
+
+    fixture = Path(__file__).parent / "fixtures" / "tablet" / "ink_writes"
+    # Two authors: the tablet's and another installation's.
+    page = (fixture / "tablet_page_with_cover.rm").read_bytes()
+    other = uuid.UUID("ffffffff-0000-4000-8000-000000000001")
+    page, _ = rm_ink.with_author(page, other)
+    counter = rm_ink.next_counter(rm_ink.parse(page))
+    stroke = {"points": [[0.1, 0.1], [0.2, 0.2]], "tool": "fineliner", "color": "black"}
+    data = strokes_mod.append_strokes(page, [stroke, stroke])
+    number = rm_ink.author_number(data, rm_ink.author_uuid())
+    assert number is not None and number != rm_ink.author_number(data, other)
+    new = [b.item.item_id for b in _lines(data)][-2:]
+    assert [(i.part1, i.part2) for i in new] == [(number, counter), (number, counter + 1)]

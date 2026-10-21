@@ -68,9 +68,9 @@ class TestCloudArchivedFix:
 
         for doc in synced_false:
             if doc.parent != "trash":
-                assert not doc.is_cloud_archived, (
-                    f"'{doc.name}' has synced=false but is incorrectly hidden"
-                )
+                assert (
+                    not doc.is_cloud_archived
+                ), f"'{doc.name}' has synced=false but is incorrectly hidden"
 
 
 class TestDocumentRendering:

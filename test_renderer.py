@@ -9,14 +9,14 @@ from pathlib import Path
 import pymupdf
 from PIL import Image
 
-from remarkable_mcp import extract, notebooks, strokes
+from remarkable_mcp import extract, rm_ink, strokes
 
 DOC = "doc-1"
 
 
 def _page(*lines) -> bytes:
-    """A blank page with strokes ``(points, color)`` in page fractions."""
-    data = notebooks.blank_page_rm_bytes()
+    """A first ink file with strokes ``(points, color)`` in page fractions."""
+    data = rm_ink.first_page_rm(rm_ink.author_uuid())
     return strokes.append_strokes(
         data, [{"points": points, "color": color, "tool": "fineliner"} for points, color in lines]
     )
