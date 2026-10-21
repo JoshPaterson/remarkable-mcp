@@ -140,6 +140,21 @@ Page 3: handwritten notes
 
 The same data is returned as `layers: [{"page": 3, "layers": [...]}]`.
 
+### Handwriting OCR
+
+With `include_ocr`, handwriting comes back by page, headed `--- Page N ---`
+with the document's page number, one line per line of writing in reading
+order. On pages with several visible layers each line ends with the layers
+that drew it, e.g. `x = 4  [Layer 2]`; hidden layers are not read. The same
+lines are returned as `handwriting: [{"page", "lines": [{"text", "layers",
+"confidence", "low_confidence"}]}]`.
+
+Tesseract reads handwriting poorly. Its lines carry a `confidence` (0-100),
+lines below 80 are marked `(low confidence)`, and the response adds an
+`ocr_note` saying the text is approximate and which pages to view with
+`remarkable_image` before relying on it. Google Vision results carry no such
+note.
+
 ### Smart Features
 
 - **Auto-OCR**: If a notebook has no typed text and `include_ocr=False`, OCR is automatically enabled and you're notified via `_ocr_auto_enabled: true`
