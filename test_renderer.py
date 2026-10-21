@@ -151,3 +151,25 @@ def test_mapped_pdf_page_follows_the_page_map(tmp_path):
 def test_page_count_comes_from_the_content(tmp_path):
     content = {"fileType": "notebook", "cPages": {"pages": [{"id": "a"}, {"id": "b"}]}}
     assert extract.get_document_page_count(_zip(tmp_path, {}, content)) == 2
+
+
+def test_annotations_without_underlay_use_the_pdf_page_frame(tmp_path):
+    """Annotation-only renders of PDF pages line up with merged renders, so
+    page-fraction regions crop the same place in both."""
+    content = {"fileType": "pdf", "cPages": {"pages": [{"id": "a", "redir": {"value": 0}}]}}
+    path = _zip(tmp_path, {"a": _page(([[0.3, 0.6], [0.7, 0.6]], "red"))}, content, pdf=_pdf(1))
+    merged, _ = extract.render_merged_page_from_document_zip(path, 1, "#FFFFFF")
+    plain, _ = extract.render_merged_page_from_document_zip(path, 1, "#FFFFFF", underlay=False)
+    merged, plain = _image(merged), _image(plain)
+    assert merged.size == plain.size
+    w, h = plain.size
+    red = [
+        (x, y)
+        for x in range(0, w, 4)
+        for y in range(0, h, 2)
+        if plain.getpixel((x, y))[0] > 150 and plain.getpixel((x, y))[1] < 100
+    ]
+    assert red and all(merged.getpixel(p)[0] > 150 for p in red[:20])
+    # The PDF page's black block is not drawn.
+    assert not _dark(plain.getpixel((int(w * 150 / 595), int(h * 80 / 842))))
+    assert _dark(merged.getpixel((int(w * 150 / 595), int(h * 80 / 842))))

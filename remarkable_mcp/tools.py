@@ -1992,7 +1992,8 @@ async def _render_png_page(
     """Render a PNG with the same fallbacks used by remarkable_image.
 
     ``full_page`` renders annotation-only pages over the whole page instead of
-    cropping to the ink, so page coordinates (and ``dpi``) apply.
+    cropping to the ink, so page coordinates (and ``dpi``) apply; PDF-backed
+    pages use the PDF page's frame, as merged renders do.
     """
     merged_note = None
     is_merged = False
@@ -2007,15 +2008,17 @@ async def _render_png_page(
         )
         is_merged = png_data is not None and merged_note is None
     elif full_page:
-        full = await run_blocking(
-            render_page_full_page_from_document_zip,
+        # PDF-backed pages are drawn in the PDF page's frame, the frame
+        # regions use; other pages fall back to the full-page render.
+        png_data, _ = await run_blocking(
+            render_merged_page_from_document_zip,
             tmp_path,
             page,
             background_color=background,
             layers=layers,
             dpi=dpi,
+            underlay=False,
         )
-        png_data = full[0] if full is not None else None
     else:
         png_data = await run_blocking(
             render_page_from_document_zip,
