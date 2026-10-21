@@ -21,6 +21,7 @@ import io
 import logging
 import os
 import shutil
+import subprocess
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
@@ -284,6 +285,49 @@ def require_tesseract():
     return pytesseract
 
 
+# Seconds one Tesseract run may take.
+TESSERACT_TIMEOUT = 120
+TSV_NUMBERS = ("block_num", "par_num", "line_num", "left", "top", "width", "height")
+
+
+def _run_tesseract(image, config: str, output: str = "") -> str:
+    """Tesseract's stdout for the PIL ``image``, sent as a PNG on stdin so no
+    temporary file is needed (a sandboxed server may not share its temporary
+    folder with the program). ``output`` names a config such as ``tsv``.
+    Raises OcrError when Tesseract fails."""
+    pytesseract = tesseract_module()
+    command = shutil.which(pytesseract.pytesseract.tesseract_cmd)
+    if command is None:
+        raise OcrError("Tesseract is not installed (brew install tesseract).")
+    buffer = io.BytesIO()
+    image.save(buffer, format="PNG")
+    args = [command, "stdin", "stdout", *config.split()] + ([output] if output else [])
+    try:
+        result = subprocess.run(
+            args, input=buffer.getvalue(), capture_output=True, timeout=TESSERACT_TIMEOUT
+        )
+    except subprocess.TimeoutExpired as e:
+        raise OcrError("Tesseract took too long.") from e
+    if result.returncode != 0:
+        error = result.stderr.decode("utf-8", "replace").strip().splitlines()
+        raise OcrError(f"Tesseract failed: {error[-1] if error else result.returncode}")
+    return result.stdout.decode("utf-8", "replace")
+
+
+def _tesseract_data(image, config: str) -> Dict[str, list]:
+    """Tesseract's TSV output as columns (``text``, ``conf``, boxes and
+    block/paragraph/line numbers)."""
+    rows = [line.split("\t") for line in _run_tesseract(image, config, "tsv").splitlines()]
+    if not rows:
+        return {"text": []}
+    header, body = rows[0], [row for row in rows[1:] if len(row) == len(rows[0])]
+    data = {name: [row[i] for row in body] for i, name in enumerate(header)}
+    for name in TSV_NUMBERS:
+        data[name] = [int(v) for v in data.get(name, [])]
+    data["conf"] = [float(v) for v in data.get("conf", [])]
+    return data
+
+
 def _handwriting_image(png: bytes):
     """``png`` prepared for handwriting OCR: grayscale, more contrast and
     slight sharpening."""
@@ -298,8 +342,7 @@ def tesseract_text(png: bytes) -> Optional[str]:
     """Plain text Tesseract finds in ``png``; None when Tesseract is
     unavailable, fails or finds nothing."""
     try:
-        pytesseract = tesseract_module()
-        text = pytesseract.image_to_string(_handwriting_image(png), config=HANDWRITING_CONFIG)
+        text = _run_tesseract(_handwriting_image(png), HANDWRITING_CONFIG)
     except Exception:
         return None
     return text.strip() or None
@@ -308,10 +351,7 @@ def tesseract_text(png: bytes) -> Optional[str]:
 def tesseract_lines(png: bytes) -> List[OcrLine]:
     """Lines ``(text, pixel box, confidence)`` found by Tesseract, in reading
     order."""
-    pytesseract = tesseract_module()
-    data = pytesseract.image_to_data(
-        _handwriting_image(png), config=HANDWRITING_CONFIG, output_type=pytesseract.Output.DICT
-    )
+    data = _tesseract_data(_handwriting_image(png), HANDWRITING_CONFIG)
     grouped: Dict[tuple, list] = {}
     for i, word in enumerate(data["text"]):
         word = str(word).strip()
@@ -366,10 +406,8 @@ def tesseract_words(png: bytes) -> List[Word]:
     Raises OcrError when Tesseract is unavailable."""
     from PIL import Image
 
-    pytesseract = require_tesseract()
-    data = pytesseract.image_to_data(
-        Image.open(io.BytesIO(png)), config=PRINTED_CONFIG, output_type=pytesseract.Output.DICT
-    )
+    require_tesseract()
+    data = _tesseract_data(Image.open(io.BytesIO(png)), PRINTED_CONFIG)
     words = []
     for i, text in enumerate(data["text"]):
         text = str(text).strip()

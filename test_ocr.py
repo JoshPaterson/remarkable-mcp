@@ -1,6 +1,8 @@
 """OCR backends: the Vision API key travels in a header, and the backend
 reported is the one that produced the text."""
 
+import os
+import shutil
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -154,3 +156,23 @@ def test_pdf_words_use_google_only_with_a_key(monkeypatch):
     monkeypatch.delenv("GOOGLE_VISION_API_KEY")
     monkeypatch.setattr(ocr, "require_tesseract", lambda: None)
     assert ocr.pdf_words_backend() == ("tesseract", ocr.tesseract_words)
+
+
+@pytest.mark.skipif(
+    shutil.which("tesseract") is None
+    and not any(os.path.exists(p) for p in ocr.TESSERACT_LOCATIONS),
+    reason="Tesseract is not installed",
+)
+def test_tesseract_needs_no_temporary_files(monkeypatch, tmp_path):
+    """The image goes to Tesseract on stdin, so a temporary folder the
+    program cannot see does not matter."""
+    import tempfile
+
+    import pymupdf
+
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path / "missing"))
+    doc = pymupdf.open()
+    page = doc.new_page(width=300, height=100)
+    page.insert_text((20, 50), "Plain printed words", fontsize=20)
+    png = page.get_pixmap(dpi=200).tobytes("png")
+    assert "Plain" in " ".join(w[0] for w in ocr.tesseract_words(png))
