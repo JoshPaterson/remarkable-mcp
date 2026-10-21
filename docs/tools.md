@@ -202,6 +202,12 @@ A PDF with an outline (table of contents) also returns `outline: [{"level",
 "title", "page"}]` with tablet page numbers (`page` is null for an entry that
 points nowhere). `remarkable_pdf_outline` lists, sets and removes it.
 
+### Scanned pages
+
+A PDF page that is a scan (mostly image, no text) yields no text. Such pages
+are listed as `pages_without_text` (tablet page numbers), and the hint points
+to `remarkable_pdf_ocr`, which writes OCR text into the PDF.
+
 ### Smart Features
 
 - **Auto-OCR**: If a notebook has no typed text and `include_ocr=False`, OCR is automatically enabled and you're notified via `_ocr_auto_enabled: true`

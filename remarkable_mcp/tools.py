@@ -67,7 +67,14 @@ from remarkable_mcp.extract import (
     render_page_full_page_from_document_zip,
     render_tablet_pdf_page_to_png,
 )
-from remarkable_mcp.pdf_marks import for_export, original_pdf, pdf_outline, stored_marks
+from remarkable_mcp.pdf_marks import (
+    for_export,
+    original_pdf,
+    pdf_outline,
+    stored_marks,
+    tablet_page,
+)
+from remarkable_mcp.pdf_ocr import pages_needing_ocr
 from remarkable_mcp.responses import make_error, make_response
 from remarkable_mcp.server import mcp
 from remarkable_mcp.tags import matches_tags, tag_names
@@ -589,6 +596,7 @@ async def remarkable_read(
         mark_list: list = []
         mark_summaries: list = []
         outline_entries: list = []
+        scanned_pages: list = []
 
         # Get raw PDF/EPUB content if requested or for "text" mode
         if content_type in ("text", "raw") and file_type in ("pdf", "epub"):
@@ -600,6 +608,10 @@ async def remarkable_read(
                 except Exception:
                     outline_entries = []
                 raw_data = original_pdf(raw_data)
+                try:
+                    scanned_pages = pages_needing_ocr(raw_data)["scanned"]
+                except Exception:
+                    scanned_pages = []
             if raw_data:
                 raw_available = True
                 with tempfile.NamedTemporaryFile(suffix=f".{file_type}", delete=False) as tmp:
@@ -1081,6 +1093,13 @@ async def remarkable_read(
             result["marks"] = mark_summaries
         if outline_entries:
             result["outline"] = _outline_summaries(outline_entries, await load_archive())
+        if scanned_pages:
+            page_map = _archive_page_map(await load_archive())
+            result["pages_without_text"] = [
+                p
+                for p in (tablet_page(i, page_map) if page_map else i + 1 for i in scanned_pages)
+                if p
+            ]
         if content_type in ("text", "annotations") and content:
             page_layers = [
                 {"page": ap["page"], "layers": ap["layers"]}
@@ -1120,6 +1139,12 @@ async def remarkable_read(
         if page_count_note:
             result["page_count_note"] = page_count_note
             hint_parts.append(page_count_note)
+        if result.get("pages_without_text"):
+            count = len(result["pages_without_text"])
+            hint_parts.append(
+                f"{count} scanned page{'s have' if count > 1 else ' has'} no text "
+                f"(pages_without_text); remarkable_pdf_ocr('{document}') adds it."
+            )
 
         if content_type == "text" and not raw_available and file_type in ("pdf", "epub"):
             hint_parts.append(

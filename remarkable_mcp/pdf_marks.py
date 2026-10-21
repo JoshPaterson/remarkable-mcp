@@ -206,18 +206,42 @@ def load_state(pdf_bytes: bytes) -> Tuple[bytes, List[Dict[str, Any]]]:
     return base, marks
 
 
-def load_outline(pdf_bytes: bytes) -> Optional[List[Dict[str, Any]]]:
-    """The outline set with ``remarkable_pdf_outline``, or None when the PDF
-    keeps its own: ``[{"level", "title", "pdf_page"}]``."""
+def _state(pdf_bytes: bytes) -> Dict[str, Any]:
+    """The embedded mark state (marks, outline, OCR record), or {}."""
     try:
         with pymupdf.open(stream=pdf_bytes, filetype="pdf") as doc:
             if MARKS_FILE not in doc.embfile_names():
-                return None
+                return {}
             data = json.loads(doc.embfile_get(MARKS_FILE).decode("utf-8"))
     except Exception:
-        return None
-    outline = data.get("outline") if isinstance(data, dict) else None
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def load_outline(pdf_bytes: bytes) -> Optional[List[Dict[str, Any]]]:
+    """The outline set with ``remarkable_pdf_outline``, or None when the PDF
+    keeps its own: ``[{"level", "title", "pdf_page"}]``."""
+    outline = _state(pdf_bytes).get("outline")
     return outline if isinstance(outline, list) else None
+
+
+def load_ocr(pdf_bytes: bytes) -> Optional[Dict[str, Any]]:
+    """The record of OCR written by ``remarkable_pdf_ocr`` (``{"backend",
+    "pdf_pages"}``; its text is part of the original PDF), or None."""
+    ocr = _state(pdf_bytes).get("ocr")
+    return ocr if isinstance(ocr, dict) else None
+
+
+def record_ocr(pdf_bytes: bytes, ocr: Dict[str, Any]) -> bytes:
+    """``pdf_bytes`` (a PDF without marks or a set outline) with ``ocr``
+    recorded in its state; the original is not embedded, as nothing needs to
+    be rebuilt from it."""
+    with pymupdf.open(stream=pdf_bytes, filetype="pdf") as doc:
+        if MARKS_FILE in doc.embfile_names():
+            doc.embfile_del(MARKS_FILE)
+        payload = json.dumps({"format": MARKS_FORMAT, "marks": [], "ocr": ocr}, indent=1)
+        doc.embfile_add(MARKS_FILE, payload.encode("utf-8"), filename=MARKS_FILE, desc="Marks")
+        return doc.tobytes(garbage=3, deflate=True)
 
 
 def pdf_outline(pdf_bytes: bytes) -> List[Dict[str, Any]]:
@@ -290,7 +314,7 @@ def for_export(pdf_bytes: bytes) -> bytes:
         return pdf_bytes
     outline = load_outline(pdf_bytes)
     if not marks and outline is None:
-        return pdf_bytes
+        return base
     sizes = page_sizes(base)
 
     def redraw(part: Dict[str, Any], size) -> Dict[str, Any]:
@@ -374,6 +398,7 @@ def build(
     marks: Sequence[Dict[str, Any]],
     embed: bool = True,
     outline: Optional[Sequence[Dict[str, Any]]] = None,
+    ocr: Optional[Dict[str, Any]] = None,
 ) -> bytes:
     """The PDF with ``marks`` placed on ``base``; ``base`` itself when there
     are no marks and no outline.
@@ -381,10 +406,11 @@ def build(
     ``outline`` (see ``check_outline``) replaces the PDF's own outline; None
     keeps it. With ``embed`` (the default) the original PDF, the mark list and
     the outline are embedded, so they can be changed later; exports pass
-    False. Raises MarkError if placing would change the page count or a page
-    size, which would move the tablet's ink relative to the page.
+    False. ``ocr`` records OCR text already in ``base`` (see ``load_ocr``).
+    Raises MarkError if placing would change the page count or a page size,
+    which would move the tablet's ink relative to the page.
     """
-    if not marks and outline is None:
+    if not marks and outline is None and not (ocr and embed):
         return base
     doc = pymupdf.open(stream=base, filetype="pdf")
     try:
@@ -402,11 +428,16 @@ def build(
                         page.show_pdf_page(_points(page.rect, part["box"]), snippet, 0)
         if outline is not None:
             doc.set_toc([[e["level"], e["title"], e["pdf_page"] + 1] for e in outline])
+        for name in (BASE_FILE, MARKS_FILE):
+            if name in doc.embfile_names():
+                doc.embfile_del(name)
         if embed:
             doc.embfile_add(BASE_FILE, base, filename=BASE_FILE, desc="PDF before marks")
             state: Dict[str, Any] = {"format": MARKS_FORMAT, "marks": list(marks)}
             if outline is not None:
                 state["outline"] = list(outline)
+            if ocr:
+                state["ocr"] = ocr
             payload = json.dumps(state, indent=1)
             doc.embfile_add(MARKS_FILE, payload.encode("utf-8"), filename=MARKS_FILE, desc="Marks")
         result = doc.tobytes(garbage=3, deflate=True)
