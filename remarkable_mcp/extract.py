@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 from xml.sax.saxutils import escape as _xml_escape
 
+from remarkable_mcp import ocr
 from remarkable_mcp.colors import color_info, highlight_opacity, render_color
 from remarkable_mcp.pages import content_page_ids, deleted_page_ids, has_cpages, live_cpages_entries
 from remarkable_mcp.tags import page_tag_entries
@@ -143,31 +144,6 @@ _DEFAULT_BACKGROUND_COLOR = "#FBFBFB"
 def get_background_color() -> str:
     """Get the background color, checking env var for override."""
     return os.environ.get("REMARKABLE_BACKGROUND_COLOR", _DEFAULT_BACKGROUND_COLOR)
-
-
-OCR_BACKENDS = frozenset({"auto", "google", "tesseract"})
-
-
-def get_ocr_backend() -> str:
-    """Return a supported OCR backend, falling back to ``auto`` safely."""
-    backend = os.environ.get("REMARKABLE_OCR_BACKEND", "auto").strip().lower()
-    if backend not in OCR_BACKENDS:
-        supported = ", ".join(sorted(OCR_BACKENDS))
-        if backend == "sampling":
-            logger.warning(
-                "The 'sampling' OCR backend has been removed. "
-                "Falling back to 'auto'. Set REMARKABLE_OCR_BACKEND to one of: %s.",
-                supported,
-            )
-        else:
-            logger.warning(
-                "Unsupported REMARKABLE_OCR_BACKEND value %r. "
-                "Falling back to 'auto'. Supported values are: %s.",
-                backend,
-                supported,
-            )
-        return "auto"
-    return backend
 
 
 # For backwards compatibility, expose as module constant (evaluated at import)
@@ -3336,7 +3312,7 @@ TESSERACT_OCR_SIZE = (2106, 2808)
 LINE_LAYER_SHARE = 0.2
 
 # An OCR line: (text, pixel box), plus Tesseract's confidence (0-100).
-OcrLine = tuple
+OcrLine = ocr.OcrLine
 # Tesseract lines below this confidence are marked low_confidence.
 LOW_CONFIDENCE = 80
 
@@ -3352,30 +3328,20 @@ def extract_handwriting_ocr(
     - "tesseract": pytesseract - basic OCR, rasterized locally with PyMuPDF
     - "auto" (default): Google if API key provided, else Tesseract
 
+    When Google is unavailable or finds nothing, Tesseract is used and
+    reported as the backend.
+
     Returns ``(pages, backend_used)``. ``pages`` has one entry per file in
     ``rm_files`` (None when that page could not be read), each a list of lines
     ``{"text", "layers"}`` in reading order; ``layers`` (the layers that drew
     the line) is present only on pages with several visible layers. ``pages``
     is None when OCR found nothing or is unavailable.
     """
-    backend = get_ocr_backend()
-
-    # Auto-detect best available backend
-    if backend == "auto":
-        # Check for Google Vision API key first (simplest auth method)
-        if os.environ.get("GOOGLE_VISION_API_KEY"):
-            backend = "google"
-        else:
-            backend = "tesseract"
-
-    if backend == "google":
+    if ocr.preferred_backend() == "google":
         result = _ocr_google_vision(rm_files)
         if result:
             return (result, "google")
-        result = _ocr_tesseract(rm_files)
-        return (result, "tesseract")
-    result = _ocr_tesseract(rm_files)
-    return (result, "tesseract")
+    return (_ocr_tesseract(rm_files), "tesseract")
 
 
 def _ocr_image_size(svg: str, size: Tuple[int, int]) -> Tuple[int, int]:
@@ -3491,230 +3457,26 @@ def _ocr_pages(
             images = _ocr_page_images(rm_file, size)
             lines = read_lines(images[0]) if images else None
             pages.append(None if lines is None else _tag_line_layers(lines, images[1]))
-        except _VisionAuthError:
+        except ocr.VisionAuthError:
             raise
         except Exception:
             pages.append(None)
     return pages
 
 
-def _vision_lines(annotation: Dict[str, Any]) -> List[OcrLine]:
-    """Lines ``(text, pixel box)`` from a Vision ``fullTextAnnotation``
-    (REST camelCase or SDK snake_case keys), in reading order."""
-
-    def get(obj: Any, *keys: str) -> Any:
-        for key in keys:
-            if isinstance(obj, dict) and key in obj:
-                return obj[key]
-        return None
-
-    spaces = {"SPACE", "SURE_SPACE", 1, 2}
-    hyphens = {"HYPHEN", 4}
-    line_ends = {"EOL_SURE_SPACE", "LINE_BREAK", 3, 5} | hyphens
-    lines: List[OcrLine] = []
-
-    def finish(text: str, xs: list, ys: list) -> None:
-        if text.strip() and xs:
-            lines.append((text.strip(), (min(xs), min(ys), max(xs), max(ys))))
-
-    for page in get(annotation, "pages") or []:
-        for block in get(page, "blocks") or []:
-            for paragraph in get(block, "paragraphs") or []:
-                text, xs, ys = "", [], []
-                for word in get(paragraph, "words") or []:
-                    for vertex in get(get(word, "boundingBox", "bounding_box"), "vertices") or []:
-                        xs.append(get(vertex, "x") or 0)
-                        ys.append(get(vertex, "y") or 0)
-                    for symbol in get(word, "symbols") or []:
-                        text += get(symbol, "text") or ""
-                        detected = get(get(symbol, "property"), "detectedBreak", "detected_break")
-                        kind = get(detected, "type", "type_")
-                        if kind in spaces:
-                            text += " "
-                        elif kind in line_ends:
-                            if kind in hyphens:
-                                text += "-"
-                            finish(text, xs, ys)
-                            text, xs, ys = "", [], []
-                finish(text, xs, ys)
-    return lines
-
-
 def _ocr_google_vision(rm_files: List[Path]) -> Optional[List[Optional[List[Dict[str, Any]]]]]:
     """
-    OCR using Google Cloud Vision API.
-    Best quality for handwriting recognition.
+    OCR using Google Cloud Vision. Best quality for handwriting recognition.
 
-    Supports two authentication methods:
-    1. GOOGLE_VISION_API_KEY env var (simplest - just an API key)
-    2. GOOGLE_APPLICATION_CREDENTIALS or default credentials (service account)
-    """
-    import os
-
-    api_key = os.environ.get("GOOGLE_VISION_API_KEY")
-
-    if api_key:
-        # Use REST API with API key (simpler, no SDK needed)
-        return _ocr_google_vision_rest(rm_files, api_key)
-    else:
-        # Use SDK with service account credentials
-        return _ocr_google_vision_sdk(rm_files)
-
-
-class _VisionAuthError(Exception):
-    """The Vision API key is invalid or the API is not enabled."""
-
-
-def _ocr_google_vision_rest(
-    rm_files: List[Path], api_key: str
-) -> Optional[List[Optional[List[Dict[str, Any]]]]]:
-    """
-    OCR using Google Cloud Vision REST API with API key.
-    """
-    import base64
-
-    import requests
-
-    def read_lines(png: bytes) -> Optional[List[OcrLine]]:
-        url = f"https://vision.googleapis.com/v1/images:annotate?key={api_key}"
-        payload = {
-            "requests": [
-                {
-                    "image": {"content": base64.b64encode(png).decode("utf-8")},
-                    "features": [{"type": "DOCUMENT_TEXT_DETECTION"}],
-                }
-            ]
-        }
-        response = requests.post(url, json=payload, timeout=60)
-        if response.status_code in (401, 403):
-            raise _VisionAuthError()
-        if response.status_code != 200:
-            return None
-        responses = response.json().get("responses") or [{}]
-        return _vision_lines(responses[0].get("fullTextAnnotation") or {})
-
-    try:
-        pages = _ocr_pages(rm_files, GOOGLE_OCR_SIZE, read_lines)
-    except _VisionAuthError:
-        # API key invalid or API not enabled - fall back to Tesseract
-        return _ocr_tesseract(rm_files)
-    return pages if any(pages) else None
-
-
-def _ocr_google_vision_sdk(rm_files: List[Path]) -> Optional[List[Optional[List[Dict[str, Any]]]]]:
-    """
-    OCR using Google Cloud Vision SDK with service account credentials.
+    Uses GOOGLE_VISION_API_KEY when set, else the SDK with service account
+    credentials. None when Vision is unavailable (key rejected, API not
+    enabled, SDK missing or failing) or found nothing.
     """
     try:
-        from google.cloud import vision
-
-        client = vision.ImageAnnotatorClient()
-
-        def read_lines(png: bytes) -> Optional[List[OcrLine]]:
-            # DOCUMENT_TEXT_DETECTION gives the best handwriting results.
-            response = client.document_text_detection(image=vision.Image(content=png))
-            if response.error.message:
-                return None
-            annotation = response.full_text_annotation
-            return _vision_lines(type(annotation).to_dict(annotation))
-
-        pages = _ocr_pages(rm_files, GOOGLE_OCR_SIZE, read_lines)
-        return pages if any(pages) else None
-
-    except ImportError:
-        # google-cloud-vision not installed, fall back to tesseract
-        return _ocr_tesseract(rm_files)
+        pages = _ocr_pages(rm_files, GOOGLE_OCR_SIZE, ocr.google_line_reader())
     except Exception:
-        # API error, fall back to tesseract
-        return _ocr_tesseract(rm_files)
-
-
-# Where Homebrew and other installers put Tesseract; apps started outside a
-# shell (such as the server under Claude Desktop) often lack these in PATH.
-TESSERACT_LOCATIONS = (
-    "/opt/homebrew/bin/tesseract",
-    "/usr/local/bin/tesseract",
-    "/usr/bin/tesseract",
-)
-
-
-def tesseract_module():
-    """``pytesseract``, pointed at the Tesseract program when it is not on
-    PATH but installed in a usual place. Raises ImportError when pytesseract
-    is missing."""
-    import shutil
-
-    import pytesseract
-
-    if shutil.which(pytesseract.pytesseract.tesseract_cmd) is None:
-        found = next((path for path in TESSERACT_LOCATIONS if os.path.exists(path)), None)
-        if found:
-            pytesseract.pytesseract.tesseract_cmd = found
-    return pytesseract
-
-
-def _tesseract_lines(png: bytes) -> List[OcrLine]:
-    """Lines ``(text, pixel box)`` found by Tesseract, in reading order."""
-    import io
-
-    from PIL import Image, ImageFilter, ImageOps
-
-    pytesseract = tesseract_module()
-    # Grayscale, more contrast and slight sharpening help with handwriting.
-    img = Image.open(io.BytesIO(png)).convert("L")
-    img = ImageOps.autocontrast(img, cutoff=2)
-    img = img.filter(ImageFilter.SHARPEN)
-    # PSM 11 = sparse text: find as much text as possible.
-    data = pytesseract.image_to_data(
-        img, config=r"--psm 11 --oem 3", output_type=pytesseract.Output.DICT
-    )
-    grouped: Dict[tuple, list] = {}
-    for i, word in enumerate(data["text"]):
-        word = str(word).strip()
-        if not word:
-            continue
-        key = (data["block_num"][i], data["par_num"][i], data["line_num"][i])
-        left, top = data["left"][i], data["top"][i]
-        box = (left, top, left + data["width"][i], top + data["height"][i])
-        confidence = max(0.0, float(data["conf"][i]))
-        grouped.setdefault(key, []).append((word, box, confidence))
-    return _rows([word for words in grouped.values() for word in words])
-
-
-def _rows(words: List[OcrLine]) -> List[OcrLine]:
-    """Words joined into lines in reading order: words whose heights overlap
-    by half of the shorter share a row, rows run top to bottom and each row
-    left to right. Tesseract's sparse-text mode finds words but not their
-    order."""
-    rows: List[List[OcrLine]] = []
-    for word in sorted(words, key=lambda w: (w[1][1] + w[1][3]) / 2):
-        _, top, _, bottom = word[1]
-        for row in rows:
-            row_top = min(w[1][1] for w in row)
-            row_bottom = max(w[1][3] for w in row)
-            overlap = min(bottom, row_bottom) - max(top, row_top)
-            if overlap >= 0.5 * min(bottom - top, row_bottom - row_top):
-                row.append(word)
-                break
-        else:
-            rows.append([word])
-    lines: List[OcrLine] = []
-    for row in rows:
-        row.sort(key=lambda w: w[1][0])
-        boxes = [w[1] for w in row]
-        box = (
-            min(b[0] for b in boxes),
-            min(b[1] for b in boxes),
-            max(b[2] for b in boxes),
-            max(b[3] for b in boxes),
-        )
-        line: tuple = (" ".join(w[0] for w in row), box)
-        if all(len(w) > 2 for w in row):
-            # Confidence weighted by word length.
-            chars = sum(len(w[0]) for w in row)
-            line += (round(sum(w[2] * len(w[0]) for w in row) / chars),)
-        lines.append(line)
-    return sorted(lines, key=lambda line: line[1][1])
+        return None
+    return pages if any(pages) else None
 
 
 def _ocr_tesseract(rm_files: List[Path]) -> Optional[List[Optional[List[Dict[str, Any]]]]]:
@@ -3725,11 +3487,11 @@ def _ocr_tesseract(rm_files: List[Path]) -> Optional[List[Optional[List[Dict[str
     Requires: pytesseract and PyMuPDF.
     """
     try:
-        tesseract_module()
+        ocr.tesseract_module()
     except ImportError:
         # OCR dependencies not installed
         return None
-    pages = _ocr_pages(rm_files, TESSERACT_OCR_SIZE, _tesseract_lines)
+    pages = _ocr_pages(rm_files, TESSERACT_OCR_SIZE, ocr.tesseract_lines)
     return pages if any(pages) else None
 
 

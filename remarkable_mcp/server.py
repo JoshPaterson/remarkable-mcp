@@ -14,7 +14,7 @@ from mcp.server import MCPServer
 from mcp.server.mcpserver import Context
 from mcp.server.transport_security import TransportSecuritySettings
 
-from remarkable_mcp.extract import get_ocr_backend
+from remarkable_mcp import ocr
 
 logger = logging.getLogger(__name__)
 
@@ -78,8 +78,6 @@ def _build_instructions() -> str:
         "true",
         "yes",
     ) or bool(os.environ.get("REMARKABLE_LOCAL_DIR"))
-    has_google_vision = bool(os.environ.get("GOOGLE_VISION_API_KEY"))
-    ocr_backend = get_ocr_backend()
 
     read_only_mode = os.environ.get("REMARKABLE_READ_ONLY", "").lower() in (
         "1",
@@ -293,8 +291,7 @@ and sync to all your devices:
 """
 
     # Add OCR instructions based on configuration
-    uses_google_vision = ocr_backend == "google" or (ocr_backend == "auto" and has_google_vision)
-    if uses_google_vision:
+    if ocr.preferred_backend() == "google":
         instructions += """
 ## OCR (Google Vision Selected)
 

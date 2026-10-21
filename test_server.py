@@ -1017,11 +1017,11 @@ class TestRemarkableImage:
 
         with (
             patch(
-                "remarkable_mcp.tools._ocr_png_google_vision",
+                "remarkable_mcp.ocr.google_text",
                 return_value="google text",
             ) as google_ocr,
             patch(
-                "remarkable_mcp.tools._ocr_png_tesseract",
+                "remarkable_mcp.ocr.tesseract_text",
                 return_value="tesseract text",
             ) as tesseract_ocr,
         ):
@@ -1065,11 +1065,11 @@ class TestRemarkableImage:
 
         with (
             patch(
-                "remarkable_mcp.tools._ocr_png_google_vision",
+                "remarkable_mcp.ocr.google_text",
                 return_value=None,
             ) as google_ocr,
             patch(
-                "remarkable_mcp.tools._ocr_png_tesseract",
+                "remarkable_mcp.ocr.tesseract_text",
                 return_value="tesseract fallback",
             ) as tesseract_ocr,
         ):
@@ -1911,27 +1911,27 @@ class TestOCRBackendConfiguration:
 
     def test_get_ocr_backend_default(self, monkeypatch):
         """Test default OCR backend is auto."""
-        from remarkable_mcp.extract import get_ocr_backend
+        from remarkable_mcp.ocr import get_ocr_backend
 
         monkeypatch.delenv("REMARKABLE_OCR_BACKEND", raising=False)
         assert get_ocr_backend() == "auto"
 
     @pytest.mark.parametrize("backend", ["auto", "google", "tesseract"])
     def test_get_ocr_backend_accepts_supported_values(self, monkeypatch, backend):
-        from remarkable_mcp.extract import get_ocr_backend
+        from remarkable_mcp.ocr import get_ocr_backend
 
         monkeypatch.setenv("REMARKABLE_OCR_BACKEND", backend.upper())
         assert get_ocr_backend() == backend
 
     def test_get_ocr_backend_migrates_legacy_value(self, monkeypatch, caplog):
-        from remarkable_mcp.extract import get_ocr_backend
+        from remarkable_mcp.ocr import get_ocr_backend
 
         monkeypatch.setenv("REMARKABLE_OCR_BACKEND", "sampling")
         assert get_ocr_backend() == "auto"
         assert "has been removed" in caplog.text
 
     def test_get_ocr_backend_falls_back_for_unknown_value(self, monkeypatch, caplog):
-        from remarkable_mcp.extract import get_ocr_backend
+        from remarkable_mcp.ocr import get_ocr_backend
 
         monkeypatch.setenv("REMARKABLE_OCR_BACKEND", "unknown")
         assert get_ocr_backend() == "auto"
