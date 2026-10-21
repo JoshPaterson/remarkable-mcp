@@ -142,6 +142,9 @@ def text_as_path(options: Dict[str, Any], page_size: Tuple[float, float]) -> Dic
     width = max(MIN_WIDTH, size * TEXT_WIDTH * (BOLD_WIDTH if bold else 1.0))
     request = {k: v for k, v in options.items() if k in ("at", "anchor", "near", "leader")}
     request.update(path="", width=width)
+    if "at" in options:
+        # Text is placed by its top-left corner, as printed text marks are.
+        request.setdefault("anchor", "top-left")
     if "region" in options:
         region = parse_region(options["region"])
         box_w = (region[2] - region[0]) * page_size[0]

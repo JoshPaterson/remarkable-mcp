@@ -244,3 +244,14 @@ def test_canvas_strokes_use_the_mcp_author_and_the_shared_counter():
     assert number is not None and number != rm_ink.author_number(data, other)
     new = [b.item.item_id for b in _lines(data)][-2:]
     assert [(i.part1, i.part2) for i in new] == [(number, counter), (number, counter + 1)]
+
+
+def test_erasable_text_at_is_placed_like_printed_text():
+    from remarkable_mcp import pdf_marks
+
+    size = (595.0, 842.0)
+    options = {"text": "Note", "at": [0.62, 0.32], "size": 10}
+    render, _ = ink_marks.erasable_request(dict(options, erasable=True), None, size)
+    erasable = pdf_marks.render_mark(render, size, None)["region"]
+    printed = pdf_marks.render_mark(options, size, None)["box"]
+    assert erasable[:2] == pytest.approx(printed[:2], abs=0.01)
