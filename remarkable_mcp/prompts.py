@@ -40,12 +40,11 @@ def find_notes_prompt(topic: str) -> list:
             "content": (
                 f"Search my reMarkable tablet for any notes about '{topic}'. "
                 f"remarkable_browse(query='{topic}') finds documents whose names "
-                "mention it; it does not search their content. Notes about it may "
-                "have other names, so also look through likely folders "
-                "(remarkable_browse('/')) and recent documents (remarkable_recent()), "
-                f"and check a candidate's content with remarkable_read(document, "
-                f"grep='{topic}'). Then use remarkable_read() to extract and "
-                "summarize the content. Please organize the information you find."
+                "mention it; it does not search their content. To search content, "
+                "look at the folders with remarkable_browse('/') and use "
+                f"remarkable_search(folder=<folder>, grep='{topic}') on likely "
+                "ones. Then use remarkable_read() to extract and summarize the "
+                "content. Please organize the information you find."
             ),
         }
     ]

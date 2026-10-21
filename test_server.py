@@ -1108,9 +1108,8 @@ class TestMergedRendering:
         # Check that render_merged parameter exists in the input schema
         assert "render_merged" in image_tool.input_schema.get("properties", {})
         merged_schema = image_tool.input_schema["properties"]["render_merged"]
-        assert merged_schema.get("default") is None
-        assert {"type": "boolean"} in merged_schema.get("anyOf", [])
-        assert {"type": "null"} in merged_schema.get("anyOf", [])
+        assert merged_schema.get("default") is True
+        assert merged_schema.get("type") == "boolean"
 
     @pytest.mark.asyncio
     @patch("remarkable_mcp.tools.get_rmapi")
@@ -1192,9 +1191,8 @@ class TestMergedRendering:
                 )
 
         data = json.loads(result.content[0].text)
-        # SVG should return successfully but merged=False
+        # SVG is always annotation-only
         assert data.get("merged") is False
-        assert "render_merged is only supported with PNG" in data.get("_hint", "")
 
     @pytest.mark.asyncio
     @patch("remarkable_mcp.tools.get_rmapi")

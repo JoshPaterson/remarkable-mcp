@@ -221,11 +221,11 @@ async def test_browse_tag_filter_matches_page_tags():
 async def test_search_results_include_page_tags():
     client = Mock()
     client.get_meta_items.return_value = _library()
-    read = json.dumps({"content": "text", "total_pages": 3})
+    read = ({"content": "text", "total_pages": 3}, "hint")
     with (
         patch("remarkable_mcp.tools.get_rmapi", return_value=client),
         patch("remarkable_mcp.tools._is_cloud_archived", return_value=False),
-        patch("remarkable_mcp.tools.remarkable_read", return_value=read),
+        patch("remarkable_mcp.tools._read_document", return_value=read),
     ):
         data = _result_json(await _call_tool("remarkable_search", {"query": "Layers and tags"}))
 

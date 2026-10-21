@@ -69,7 +69,7 @@ async def test_one_server_serves_modern_and_legacy_catalogs():
             )
             modern_merge_schema = modern_image.input_schema["properties"]["render_merged"]
             assert modern_merge_schema == legacy_image.input_schema["properties"]["render_merged"]
-            assert modern_merge_schema["default"] is None
+            assert modern_merge_schema["default"] is True
             modern_export = next(
                 tool for tool in modern_tools.tools if tool.name == "remarkable_export"
             )

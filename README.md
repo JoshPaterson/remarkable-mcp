@@ -422,7 +422,7 @@ Or copy the `SKILL.md` from this repository into your `~/.openclaw/skills/remark
 |------|-------------|
 | `remarkable_read` | Read and extract text from documents (with pagination and search) |
 | `remarkable_browse` | Navigate folders, search by document name, or filter by tags |
-| `remarkable_search` | Search content across multiple documents (with tag filtering) |
+| `remarkable_search` | Read several documents picked by name, folder or tags, optionally keeping only the lines matching a pattern |
 | `remarkable_recent` | Get recently modified documents |
 | `remarkable_status` | Check connection status and the per-transport capability matrix |
 | `remarkable_image` | Get PNG/SVG images of pages with optional OCR |
@@ -445,8 +445,10 @@ disable them. See [Write Tools](#write-tools-by-transport). Clients that support
 - Empty notebook text can trigger OCR automatically.
 - Search can scan several matching documents.
 - Image tools return visual content that text extraction misses.
-- `remarkable_read.total_pages` is the physical document count; `content_pages`
-  counts extracted-text chunks, and `more` / `next_page` continue those chunks.
+- `remarkable_read.total_pages` is the physical document count; `parts` counts
+  extracted-text parts, and `more` / `next_part` (with `part=N`) continue them.
+  `grep` returns each match with its context and tablet page, for notebooks and
+  PDF/EPUB text alike.
   Raw PDF reads count pages from the already-downloaded PDF. If a raw EPUB's
   separate archive cannot be read, its text still returns with
   `total_pages: null` and `total_pages_known: false`.

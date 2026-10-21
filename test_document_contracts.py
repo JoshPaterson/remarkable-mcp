@@ -539,14 +539,13 @@ class TestReadPageCounts:
 
 class TestPdfRenderingDefault:
     @pytest.mark.asyncio
-    async def test_schema_exposes_nullable_auto_default(self):
+    async def test_schema_exposes_boolean_default(self):
         tools = await mcp.list_tools()
         image_tool = next(tool for tool in tools if tool.name == "remarkable_image")
         schema = image_tool.input_schema["properties"]["render_merged"]
 
-        assert schema["default"] is None
-        assert {"type": "boolean"} in schema["anyOf"]
-        assert {"type": "null"} in schema["anyOf"]
+        assert schema["default"] is True
+        assert schema["type"] == "boolean"
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
@@ -554,6 +553,7 @@ class TestPdfRenderingDefault:
         [
             ("pdf", None, True),
             ("notebook", None, False),
+            ("notebook", True, False),
             ("pdf", False, False),
         ],
     )

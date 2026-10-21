@@ -53,8 +53,8 @@ With this configuration:
 |-----------|------|---------|-------------|
 | `document` | string | *required* | Document name or full path |
 | `content_type` | string | `"text"` | What content to extract |
-| `page` | int | `1` | Extracted-content page number for bounded text pagination |
-| `grep` | string | `None` | Search for keywords in content |
+| `part` | int | `1` | Text part to read (not a tablet page); the old name `page` still works |
+| `grep` | string | `None` | Regex to find in the whole document; returns each match with context and tablet page |
 | `include_ocr` | bool | `False` | Enable OCR for handwritten content |
 
 ### Content Types
@@ -69,10 +69,10 @@ With this configuration:
 # Read first page of a document
 remarkable_read("Meeting Notes")
 
-# Read the third extracted-content chunk
-remarkable_read("Research Paper.pdf", page=3)
+# Read the third text part
+remarkable_read("Research Paper.pdf", part=3)
 
-# Search for keywords
+# Find a keyword: every match with its context and tablet page
 remarkable_read("Project Plan", grep="deadline")
 
 # Get only annotations and highlights
@@ -94,17 +94,42 @@ remarkable_read("/Work/Projects/Q4 Planning")
   "file_type": "notebook",
   "content_type": "text",
   "content": "Extracted text content...",
+  "part": 1,
   "page": 1,
   "total_pages": 5,
   "total_pages_known": true,
+  "parts": 2,
   "content_pages": 2,
   "total_chars": 12500,
   "more": true,
+  "next_part": 2,
   "next_page": 2,
   "modified": "2025-11-28T10:30:00Z",
-  "_hint": "Content page 1/2; document has 5 physical pages. Next: remarkable_read('Meeting Notes', page=2)."
+  "_hint": "Part 1/2; document has 5 physical page(s). Next: remarkable_read('Meeting Notes', part=2)"
 }
 ```
+
+`page`, `content_pages` and `next_page` repeat `part`, `parts` and `next_part`
+for older clients.
+
+With `grep`, `content` holds the matches of this part, each prefixed with its
+tablet page, and the response adds:
+
+```json
+{
+  "grep": "deadline",
+  "grep_matches": 3,
+  "matches": [
+    {"page": 4, "text": "...the deadline for the draft is Friday..."},
+    {"page": 9, "text": "...moved the deadline to..."}
+  ]
+}
+```
+
+`grep` works the same for notebooks (their handwriting with `include_ocr=True`
+or typed text) and for PDF and EPUB text. `page` is the tablet page (PDF page
+numbers are mapped to tablet pages); it is `null` for text without pages, such
+as EPUB text. Matches are split into parts like the text.
 
 ### Highlight colors
 
@@ -238,11 +263,10 @@ to `remarkable_pdf_ocr`, which writes OCR text into the PDF.
 
 - `total_pages` reports physical document pages, matching `remarkable_image`,
   and `total_pages_known` says whether that count was available.
-- `content_pages` reports extracted-text pagination units. PDF/EPUB source text
-  uses ~8000-character chunks; notebook OCR may produce fewer content pages than
-  physical pages when blank pages have no text.
-- `page`, `more`, and `next_page` refer to those content pages. This preserves
-  bounded text responses without overloading the physical page count.
+- `parts` (also `content_pages`) reports text parts. PDF/EPUB source text
+  uses ~8000-character parts; notebook OCR gives one part per OCR'd page, which
+  may be fewer than the tablet pages when blank pages have no text.
+- `part`, `more`, and `next_part` refer to those parts, not to tablet pages.
 - Raw PDF reads count pages from the same source bytes used for text extraction
   and do not fetch the full document archive. A raw EPUB may need that archive
   for its physical page count; if the archive is unavailable, the extracted
@@ -252,7 +276,7 @@ to `remarkable_pdf_ocr`, which writes OCR text into the PDF.
   `content_type="text"` returns source text without annotations, while
   `content_type="annotations"` returns `annotations_not_available`.
 
-When `more: true`, use the `page` parameter to continue reading.
+When `more: true`, use the `part` parameter to continue reading.
 
 ---
 
@@ -317,17 +341,25 @@ remarkable_browse("/Work", tags=["project", "active"])
 
 ## remarkable_search
 
-**Search across multiple documents.**
+**Read several documents in one call, optionally keeping only matching lines.**
+
+It picks documents first, then reads each like `remarkable_read`: candidates
+are documents whose names contain `query`, inside `folder` (and its
+subfolders) and with any of `tags` when given. At least one of `query`,
+`folder` or `tags` is needed; without `query`, every document in the folder or
+with the tags is a candidate, so `grep` searches content regardless of names.
+The first `limit` candidates by path are read.
 
 ### Parameters
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `query` | string | *required* | Search term for document names |
-| `grep` | string | `None` | Pattern to search within content |
-| `limit` | int | `5` | Maximum documents to search (max: 5) |
+| `query` | string | `None` | Text the document names must contain |
+| `grep` | string | `None` | Regex to find in each document's text |
+| `limit` | int | `5` | Documents to read (max: 20) |
 | `include_ocr` | bool | `False` | Enable OCR for handwritten content |
 | `tags` | list[string] | `None` | Match documents carrying any listed tag (case-insensitive) |
+| `folder` | string | `None` | Only documents in this folder and its subfolders |
 
 ### Examples
 
@@ -343,6 +375,9 @@ remarkable_search("journal", grep="project idea", include_ocr=True)
 
 # Search only tagged documents
 remarkable_search("project", tags=["work"])
+
+# Search the content of every document in a folder
+remarkable_search(folder="/Work", grep="budget", limit=20)
 ```
 
 ### Response Format
@@ -352,6 +387,7 @@ remarkable_search("project", tags=["work"])
   "query": "meeting",
   "grep": "action items",
   "count": 3,
+  "candidates": 3,
   "documents": [
     {
       "name": "Team Meeting Nov",
@@ -361,16 +397,18 @@ remarkable_search("project", tags=["work"])
       "total_pages": 2,
       "content_pages": 1,
       "grep_matches": 5,
+      "match_pages": [1, 2],
       "truncated": true
     }
   ],
-  "_hint": "Found 3 document(s) with 12 grep match(es). To read more: remarkable_read('/Work/Team Meeting Nov')."
+  "_hint": "Read 3 document(s); 2 have 12 match(es) for 'action items'. To read more: remarkable_read('/Work/Team Meeting Nov')."
 }
 ```
 
 ### Limits
 
-- Maximum 5 documents per search
+- At most 20 documents per search (5 by default); `candidates` says how many
+  matched, and the hint says when some were not read
 - Content is truncated to ~2000 characters per document
 - Designed for quick discovery, use `remarkable_read` for full content
 
@@ -481,7 +519,7 @@ remarkable_status()
 | `output_format` | string | `"png"` | Output format: `"png"` or `"svg"` |
 | `include_ocr` | bool | `False` | Enable OCR on the image |
 | `compatibility` | bool | `False` | Return resource URI instead of embedded resource |
-| `render_merged` | bool \| null | `None` (auto) | PNG compositing mode: auto-merge PDF-backed pages, `True` to request merging explicitly, or `False` for annotations only |
+| `render_merged` | bool | `True` | PNG: draw PDF-backed pages over their PDF page (`True`), or the annotations alone (`False`) |
 | `layers` | string | `"visible"` | Layers to draw: `"visible"` (what the tablet shows), `"all"` (include hidden layers), or one layer's name, e.g. `"Layer 3"` |
 | `dpi` | int \| null | `None` | PNG resolution (36-600 dots per inch of the physical page). Renders the whole page instead of cropping to the ink; use 300 to read small handwriting |
 | `region` | list[float] \| null | `None` | PNG crop box `[left, top, right, bottom]` as fractions of the page, e.g. `[0, 0.5, 1, 0.75]` |
@@ -563,8 +601,7 @@ used when configured; otherwise OCR runs locally with Tesseract.
 - PDF-backed PNG pages merge the source page and annotations by default. Explicit
   `render_merged=False` preserves annotation-only access, including user-added
   PDF pages that have no underlay.
-- SVG remains annotation-only; explicit `render_merged=True` with SVG returns
-  SVG plus an explanatory note.
+- SVG is always annotation-only.
 - Compatibility responses preserve the same merge choice and expose `merged`.
 - If older USB firmware returns only a native PDF export, PNG still renders via
   that export. SVG and explicit `render_merged=False` require the unavailable

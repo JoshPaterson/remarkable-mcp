@@ -178,12 +178,14 @@ Paths are relative to the configured root folder, if any.
 1. `remarkable_browse(query="keyword")` finds documents and folders by name
    (names only, not content); `remarkable_browse("/Folder", tags=["tag"])`
    finds tagged documents in a folder and its subfolders
-2. `remarkable_search("keyword", grep="pattern")` reads up to 5 documents whose
-   names match and returns the lines matching the pattern
+2. `remarkable_search("keyword", grep="pattern")` reads documents whose names
+   contain the keyword and returns the matches of the pattern;
+   `remarkable_search(folder="/Folder", grep="pattern")` searches the content
+   of every document in a folder whatever its name (up to 20 documents)
 3. `remarkable_read("Document Name")` gets the text; a long document comes in
-   pages of extracted text (`page=2` continues; `more` and `next_page` say
-   whether there is more)
-4. `remarkable_read("Document", grep="pattern")` finds lines in one document
+   parts (`part=2` continues; `more` and `next_part` say whether there is more)
+4. `remarkable_read("Document", grep="pattern")` finds every match in one
+   document, with the tablet page of each
 5. `remarkable_recent()` lists what was modified recently
 
 ### Reading Annotations
