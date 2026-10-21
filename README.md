@@ -939,6 +939,24 @@ The cache is purely a local accelerator: deleting `REMARKABLE_CACHE_DIR` only fo
 
 ---
 
+## Troubleshooting
+
+### Uploads fail with "Operation not permitted" (macOS)
+
+macOS privacy protection keeps processes out of iCloud Drive and other protected folders (Desktop, Documents, Downloads) unless they have Full Disk Access. `remarkable_upload` then returns a `file_not_readable` error. Grant Full Disk Access to the Python interpreter the server runs from, not to a symlink:
+
+1. Find the interpreter. For a checkout run with `uv run`, use `readlink -f <repo>/.venv/bin/python`; otherwise ask the server's Python: `<python> -c 'import os, sys; print(os.path.realpath(sys.executable))'`.
+2. In System Settings > Privacy & Security > Full Disk Access, add that file (in the file dialog, Cmd+Shift+G accepts a path) and check that its entry is enabled.
+3. Quit the MCP client fully and start it again, so the server starts with the new permission.
+
+Reinstalling or upgrading that Python (or recreating the virtual environment with another one) gives it a new path, which needs the grant again; check that `.venv/bin/python` still resolves to the granted file. Until then, copy the file to a folder the server can read, such as the staging folder set with `REMARKABLE_UPLOAD_STAGING_DIR`, and upload it from there; the error names that folder when it is set.
+
+### Deletes are refused
+
+`remarkable_delete` asks the user to confirm through MCP elicitation. A client that cannot show that prompt gets a `confirmation_unavailable` error and nothing is deleted. To allow deletes without a prompt, set `REMARKABLE_SKIP_CONFIRM=1` (or `true`/`yes`) in the server's environment in the client configuration and restart the client. If deletes are refused again later, the variable is no longer set in the environment the server starts with.
+
+---
+
 ## Common Workflows
 
 - Read recent notes and extract action items.

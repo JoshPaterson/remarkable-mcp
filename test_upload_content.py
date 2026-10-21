@@ -399,3 +399,52 @@ async def test_trash_refused_when_staging_folder_unset_later(staging, monkeypatc
 
     assert "REMARKABLE_UPLOAD_STAGING_DIR" in data["_error"]["message"]
     assert staging.trashed == []
+
+
+def _block_reads(monkeypatch, blocked_path):
+    """Make opening ``blocked_path`` fail as macOS privacy protection does."""
+    import builtins
+    import errno
+
+    real_open = builtins.open
+
+    def fake_open(file, *args, **kwargs):
+        if os.fspath(file) == str(blocked_path):
+            raise PermissionError(errno.EPERM, "Operation not permitted", str(file))
+        return real_open(file, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "open", fake_open)
+
+
+async def test_blocked_read_suggests_staging_folder(staging, tmp_path, monkeypatch):
+    protected = tmp_path / "Protected"
+    protected.mkdir()
+    source = protected / "paper.pdf"
+    source.write_bytes(PDF)
+    _block_reads(monkeypatch, source)
+    client = _cloud_client()
+    with patch("remarkable_mcp.write_tools.get_rmapi", return_value=client):
+        data = await _upload(file_path=str(source))
+
+    error = data["_error"]
+    assert error["type"] == "file_not_readable"
+    assert "Full Disk Access" in error["message"]
+    assert "Troubleshooting" in error["message"]
+    assert str(staging.folder) in error["suggestion"]
+    client.upload_document.assert_not_called()
+
+
+async def test_blocked_read_without_staging_folder(monkeypatch, tmp_path):
+    _register(monkeypatch)
+    source = tmp_path / "paper.pdf"
+    source.write_bytes(PDF)
+    _block_reads(monkeypatch, source)
+    client = _cloud_client()
+    with patch("remarkable_mcp.write_tools.get_rmapi", return_value=client):
+        data = await _upload(file_path=str(source))
+
+    error = data["_error"]
+    assert error["type"] == "file_not_readable"
+    assert "staging" not in error["suggestion"]
+    assert "Full Disk Access" in error["suggestion"]
+    client.upload_document.assert_not_called()

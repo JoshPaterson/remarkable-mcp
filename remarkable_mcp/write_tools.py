@@ -857,6 +857,41 @@ def upload_staging_dir() -> Optional[str]:
     return resolved if os.path.isdir(resolved) else None
 
 
+def _blocked_read_error(file_path: str) -> Optional[str]:
+    """An error reply when the OS refuses this process access to ``file_path``.
+
+    macOS privacy protection fails reads in iCloud Drive and other protected
+    folders with EPERM ("Operation not permitted") unless the server's Python
+    has Full Disk Access. Returns None when the file can be opened or fails
+    for another reason (those are reported by the upload itself).
+    """
+    import errno
+
+    try:
+        with open(file_path, "rb") as f:
+            f.read(1)
+        return None
+    except PermissionError as e:
+        if e.errno != errno.EPERM:
+            return None
+    except OSError:
+        return None
+    message = (
+        f"file_path: cannot read '{file_path}': Operation not permitted. This "
+        "server's Python cannot read that folder; it probably lacks Full Disk "
+        "Access (see Troubleshooting in the README)."
+    )
+    staging = upload_staging_dir()
+    if staging and os.path.dirname(os.path.realpath(file_path)) != staging:
+        suggestion = f"Copy the file into the staging folder {staging} and upload it from there."
+    else:
+        suggestion = (
+            "Grant Full Disk Access to the Python interpreter this server runs from "
+            "and restart the MCP client, or copy the file to a folder the server can read."
+        )
+    return make_error("file_not_readable", message, suggestion)
+
+
 def _staged_source(file_path: str) -> str:
     """Resolve an upload source that may be moved to the Trash afterwards.
 
@@ -2803,6 +2838,8 @@ def register_write_tools():
           chooses the destination folder.
 
         The result also reports source ("path" or "content") and size_bytes.
+        A file_path that macOS privacy protection keeps the server from reading
+        (e.g. in iCloud Drive) returns a file_not_readable error saying what to do.
 
         Requires write mode (the default; disabled with --read-only).
         </instructions>
@@ -2884,6 +2921,9 @@ def register_write_tools():
                 )
             return _add_upload_source(response, {"source": "content", "size_bytes": len(data)})
 
+        blocked = await asyncio.to_thread(_blocked_read_error, file_path)
+        if blocked:
+            return blocked
         source = None
         uploaded_sha256 = None
         if trash_source_after_upload:
