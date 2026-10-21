@@ -1419,7 +1419,12 @@ def _mark_editor(
             )
         result["notes"] = result["notes"] + cover_notes
         result["pdf"] = (
-            pdf_marks.build(base, result["marks"], outline=pdf_marks.load_outline(pdf))
+            pdf_marks.build(
+                base,
+                result["marks"],
+                outline=pdf_marks.load_outline(pdf),
+                ocr=pdf_marks.load_ocr(pdf),
+            )
             if result["changed"]
             else None
         )
@@ -1555,6 +1560,161 @@ def _mark_response(target, result: dict, dry_run: bool) -> str:
     return make_response(data, hint)
 
 
+MAX_OCR_CHECKS = 100
+
+
+def _tablet_pages(indexes, page_map) -> list:
+    from remarkable_mcp.pdf_marks import tablet_page
+
+    return [p for p in (tablet_page(i, page_map) for i in indexes) if p]
+
+
+def _ocr_check(client, collection, items_by_id, document, folder, tags) -> str:
+    """Which PDFs (one document, or a folder and/or tags) have scanned pages
+    without text."""
+    from remarkable_mcp import pdf_ocr
+    from remarkable_mcp.pages import pdf_page_map
+    from remarkable_mcp.pdf_marks import original_pdf
+
+    if document is not None:
+        target = _resolve_document(document, collection, items_by_id)
+        if not target or target.is_folder:
+            return make_error(
+                error_type="document_not_found",
+                message=f"PDF document not found: '{document}'",
+                suggestion="Use remarkable_browse() to find the correct name.",
+            )
+        targets = [target]
+    else:
+        base_id = ""
+        if folder not in (None, "", "/"):
+            base = _resolve_document(folder, collection, items_by_id, folders_only=True)
+            if base is None:
+                return make_error(
+                    error_type="folder_not_found",
+                    message=f"Folder not found: '{folder}'",
+                    suggestion="Use remarkable_browse('/') to see the folders.",
+                )
+            base_id = base.ID
+        wanted = {t.lower() for t in tags or []}
+
+        def under(item) -> bool:
+            parent = getattr(item, "Parent", "")
+            while parent:
+                if parent == base_id or parent == "trash":
+                    return parent == base_id
+                parent = getattr(items_by_id.get(parent), "Parent", "")
+            return not base_id
+
+        targets = [
+            item
+            for item in collection
+            if not item.is_folder
+            and getattr(item, "Parent", "") != "trash"
+            and under(item)
+            and (not wanted or wanted & {t.lower() for t in getattr(item, "tags", None) or []})
+        ]
+    if len(targets) > MAX_OCR_CHECKS:
+        return make_error(
+            error_type="invalid_parameter",
+            message=f"{len(targets)} documents match; at most {MAX_OCR_CHECKS} are checked.",
+            suggestion="Narrow the check with a subfolder or tags.",
+        )
+    needing, checked = [], 0
+    for item in targets:
+        try:
+            pdf, content, _ = client.read_document_pdf(item.ID)
+        except Exception:
+            continue  # not a PDF
+        checked += 1
+        found = pdf_ocr.pages_needing_ocr(original_pdf(pdf))
+        page_map = pdf_page_map(content)
+        if found["scanned"] or found["rotated"]:
+            entry = {
+                "document": item.VissibleName,
+                "path": get_item_path(item, items_by_id),
+                "pages_needing_ocr": _tablet_pages(found["scanned"], page_map),
+                "pages": len(page_map),
+            }
+            if found["rotated"]:
+                entry["rotated_pages_not_supported"] = _tablet_pages(found["rotated"], page_map)
+            needing.append(entry)
+    hint = (
+        f"{len(needing)} of {checked} PDFs have scanned pages without text. "
+        "OCR each with remarkable_pdf_ocr(document)."
+        if needing
+        else f"None of the {checked} PDFs checked needs OCR."
+    )
+    return make_response({"needs_ocr": needing, "checked": checked, "transport": "cloud"}, hint)
+
+
+def _ocr_document(client, target) -> str:
+    """OCR a PDF's scanned pages, continuing earlier calls; write the PDF once
+    all are done."""
+    from remarkable_mcp import pdf_marks, pdf_ocr
+    from remarkable_mcp.pages import pdf_page_map
+
+    pdf, content, _ = client.read_document_pdf(target.ID)
+    base, _ = pdf_marks.load_state(pdf)
+    found = pdf_ocr.pages_needing_ocr(base)
+    page_map = pdf_page_map(content)
+    name = target.VissibleName
+    data = {"document": name, "transport": "cloud"}
+    if found["rotated"]:
+        data["rotated_pages_not_supported"] = _tablet_pages(found["rotated"], page_map)
+    if not found["scanned"]:
+        data.update(done=True, changed=False, pages_ocred=[])
+        return make_response(data, f"'{name}' has no scanned pages without text; nothing to do.")
+    backend, words_fn = pdf_ocr.ocr_backend()
+    pages = pdf_ocr.run_ocr(target.ID, base, found["scanned"], words_fn)
+    remaining = [i for i in found["scanned"] if i not in pages]
+    data.update(backend=backend, total=len(found["scanned"]))
+    if remaining:
+        data.update(
+            done=False, finished=len(found["scanned"]) - len(remaining), remaining=len(remaining)
+        )
+        return make_response(
+            data,
+            f"OCR'd {data['finished']} of {data['total']} pages of '{name}'. Nothing is "
+            f"written yet; call remarkable_pdf_ocr('{name}') again to continue.",
+        )
+
+    def edit(current: bytes, _content: dict) -> dict:
+        current_base, marks = pdf_marks.load_state(current)
+        if current_base != base:
+            raise pdf_marks.MarkError(
+                f"'{name}' changed while it was being OCR'd; call again to OCR the new version."
+            )
+        new_base = pdf_ocr.with_text_layers(base, {i: pages[i] for i in found["scanned"]})
+        record = pdf_marks.load_ocr(current) or {"pdf_pages": []}
+        record = {
+            "backend": backend,
+            "pdf_pages": sorted(set(record.get("pdf_pages", [])) | set(found["scanned"])),
+        }
+        outline = pdf_marks.load_outline(current)
+        if marks or outline is not None:
+            new_pdf = pdf_marks.build(new_base, marks, outline=outline, ocr=record)
+        else:
+            new_pdf = pdf_marks.record_ocr(new_base, record)
+        return {"pdf": new_pdf}
+
+    client.replace_document_pdf(target.ID, edit)
+    _invalidate_client_cache(client)
+    pdf_ocr.clear_work(target.ID)
+    words = sum(len(pages[i]["words"]) for i in found["scanned"])
+    data.update(
+        done=True,
+        changed=True,
+        pages_ocred=_tablet_pages(found["scanned"], page_map),
+        words=words,
+    )
+    return make_response(
+        data,
+        f"Wrote OCR text for {len(found['scanned'])} pages ({words} words) into '{name}'. "
+        "The tablet has it after its next sync; remarkable_read now returns the text.",
+    )
+
+
 def _outline_editor(outline, build: bool):
     """``edit(pdf, content)`` for ``replace_document_pdf`` that sets a PDF's
     outline (None lists it, "original" restores the PDF's own)."""
@@ -1591,7 +1751,11 @@ def _outline_editor(outline, build: bool):
             "outline": listed,
             "source": "set with remarkable_pdf_outline" if new is not None else "the PDF's own",
             "changed": changed,
-            "pdf": pdf_marks.build(base, marks, outline=new) if changed and build else None,
+            "pdf": (
+                pdf_marks.build(base, marks, outline=new, ocr=pdf_marks.load_ocr(pdf))
+                if changed and build
+                else None
+            ),
         }
 
     return edit
@@ -3728,6 +3892,104 @@ def register_write_tools():
                         return make_error(
                             error_type="mark_failed",
                             message=f"Failed to change marks: {e}",
+                            suggestion="Check that the document is a PDF and try again.",
+                        )
+
+                return await asyncio.to_thread(_impl)
+
+            @mcp.tool(annotations=WRITE_ANNOTATIONS)
+            async def remarkable_pdf_ocr(
+                document: Optional[str] = None,
+                folder: Optional[str] = None,
+                tags: Optional[List[str]] = None,
+                check: bool = False,
+            ):
+                """
+                <usecase>Make scanned PDF pages readable and searchable: OCR them
+                and write the text into the PDF on the tablet. Or check which
+                PDFs need it.</usecase>
+                <instructions>
+                A scanned page is an image with no text, so remarkable_read gets
+                nothing from it and the tablet cannot search it. This tool OCRs
+                every such page of a PDF and writes the words over the image as
+                invisible text, so the page looks the same but its text can be
+                read, searched and highlighted. The OCR text lives in the
+                document; later reads need no OCR.
+
+                - check=True only reports: for document, or for every PDF in
+                  folder (and its subfolders) and/or with any of tags, the
+                  tablet pages that have no text but are scanned. Nothing
+                  changes.
+                - With document (and check False) it OCRs that PDF: all of its
+                  scanned pages, never part of them. Pages that already have
+                  text are never changed, so a PDF that has text on every page
+                  has nothing to do. A long book takes several minutes: each
+                  call works for about 40 seconds and reports progress (done,
+                  remaining); call again with the same document to continue.
+                  The PDF is written once every page is done.
+
+                Marks, the outline and the user's ink are kept. OCR uses Google
+                Vision when GOOGLE_VISION_API_KEY is set, else Tesseract (good
+                on printed text). Rotated scanned pages are not supported and
+                are listed. Cloud mode only. PDF documents only.
+                </instructions>
+                <parameters>
+                - document: Document name or path
+                - folder: With check, every PDF in this folder and its subfolders
+                - tags: With check, PDFs with any of these tags
+                - check: Only report which pages need OCR
+                </parameters>
+                <examples>
+                - remarkable_pdf_ocr(folder="/Books", check=True)
+                - remarkable_pdf_ocr("Erewhon")  # repeat until it says done
+                </examples>
+                """
+                from remarkable_mcp import pdf_ocr
+                from remarkable_mcp.pdf_marks import MarkError
+
+                def invalid(message: str, suggestion: str) -> str:
+                    return make_error(
+                        error_type="invalid_parameter", message=message, suggestion=suggestion
+                    )
+
+                if not check and (folder is not None or tags is not None):
+                    return invalid(
+                        "folder and tags only work with check=True.",
+                        "OCR one document at a time: remarkable_pdf_ocr(document).",
+                    )
+                if document is None and folder is None and tags is None:
+                    return invalid("Give a document, or folder/tags with check=True.", "")
+                if tags is not None and (
+                    not isinstance(tags, list) or not all(isinstance(t, str) for t in tags)
+                ):
+                    return invalid("tags must be a list of tag names.", 'Example: ["Books"]')
+
+                def _impl():
+                    error = _require_managed_write_mode()
+                    if error:
+                        return error
+                    client = get_rmapi()
+                    try:
+                        collection = client.get_meta_items()
+                        items_by_id = get_items_by_id(collection)
+                        if check:
+                            return _ocr_check(
+                                client, collection, items_by_id, document, folder, tags
+                            )
+                        target = _resolve_document(document, collection, items_by_id)
+                        if not target or target.is_folder:
+                            return make_error(
+                                error_type="document_not_found",
+                                message=f"PDF document not found: '{document}'",
+                                suggestion="Use remarkable_browse() to find the correct name.",
+                            )
+                        return _ocr_document(client, target)
+                    except (MarkError, pdf_ocr.OcrError) as e:
+                        return invalid(str(e), "See the message.")
+                    except Exception as e:
+                        return make_error(
+                            error_type="ocr_failed",
+                            message=f"OCR failed: {e}",
                             suggestion="Check that the document is a PDF and try again.",
                         )
 

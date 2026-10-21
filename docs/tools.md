@@ -217,6 +217,12 @@ lines below 80 are marked `(low confidence)`, and the response adds an
 `remarkable_image` before relying on it. Google Vision results carry no such
 note.
 
+### Scanned pages
+
+A PDF page that is a scan (mostly image, no text) yields no text. Such pages
+are listed as `pages_without_text` (tablet page numbers), and the hint points
+to `remarkable_pdf_ocr`, which writes OCR text into the PDF.
+
 ### Smart Features
 
 - **Auto-OCR**: If a notebook has no typed text and `include_ocr=False`, OCR is automatically enabled and you're notified via `_ocr_auto_enabled: true`
