@@ -76,70 +76,15 @@ from remarkable_mcp.pdf_marks import (
 )
 from remarkable_mcp.pdf_ocr import pages_needing_ocr
 from remarkable_mcp.responses import make_error, make_response
+from remarkable_mcp.roots import get_root as _get_root_path
+from remarkable_mcp.roots import is_under_root as _is_within_root
+from remarkable_mcp.roots import to_library_path as _resolve_root_path
+from remarkable_mcp.roots import to_root_relative as _apply_root_filter
 from remarkable_mcp.server import mcp
 from remarkable_mcp.tags import matches_tags, tag_names
 from remarkable_mcp.templates import group_pages
 
 logger = logging.getLogger(__name__)
-
-
-def _get_root_path() -> str:
-    """Get the configured root path filter, or '/' for full access.
-
-    Handles: empty string, '/', '/Work', '/Work/', 'Work' -> normalized path
-    """
-    root = os.environ.get("REMARKABLE_ROOT_PATH", "").strip()
-    # Empty or "/" means full access
-    if not root or root == "/":
-        return "/"
-    # Normalize: ensure starts with / and no trailing slash
-    if not root.startswith("/"):
-        root = "/" + root
-    if root.endswith("/"):
-        root = root.rstrip("/")
-    return root
-
-
-def _is_within_root(path: str, root: str) -> bool:
-    """Check if a path is within the configured root (case-insensitive)."""
-    if root == "/":
-        return True
-    # Path must equal root or be a child of root (case-insensitive)
-    path_lower = path.lower()
-    root_lower = root.lower()
-    return path_lower == root_lower or path_lower.startswith(root_lower + "/")
-
-
-def _apply_root_filter(path: str) -> str:
-    """Apply root filter to a path for display/API purposes.
-
-    If root is '/Work', then '/Work/Project' becomes '/Project' in output.
-    Case-insensitive matching, preserves original case in output.
-    """
-    root = _get_root_path()
-    if root == "/":
-        return path
-    path_lower = path.lower()
-    root_lower = root.lower()
-    if path_lower == root_lower:
-        return "/"
-    if path_lower.startswith(root_lower + "/"):
-        return path[len(root) :]
-    return path
-
-
-def _resolve_root_path(path: str) -> str:
-    """Resolve a user-provided path to the actual path on device.
-
-    If root is '/Work', then '/Project' becomes '/Work/Project'.
-    """
-    root = _get_root_path()
-    if root == "/":
-        return path
-    if path == "/":
-        return root
-    # Prepend root to the path
-    return root + path
 
 
 def _find_target_document(collection, items_by_id: dict, document: str):
