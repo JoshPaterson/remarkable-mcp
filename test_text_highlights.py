@@ -52,7 +52,7 @@ def test_find_text_splits_lines_and_picks_occurrences():
     assert parts[1]["start"] > parts[0]["start"] + parts[0]["length"]
     (second,) = th.find_text(page, "fox", occurrence=2)
     assert second["start"] > parts[1]["start"]
-    with pytest.raises(th.HighlightError, match="only 2 times"):
+    with pytest.raises(rm_ink.InkError, match="only 2 times"):
         th.find_text(page, "fox", occurrence=3)
 
 

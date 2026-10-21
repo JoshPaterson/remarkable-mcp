@@ -250,11 +250,11 @@ def find_target_layer(blocks: list) -> CrdtId:
     )
 
 
-def _map_point(nx: float, ny: float, pressure, width, paper_w: int, paper_h: int) -> Point:
+def _map_point(nx: float, ny: float, pressure, width, extent_w: float, extent_h: float) -> Point:
     nx = min(1.0, max(0.0, float(nx)))
     ny = min(1.0, max(0.0, float(ny)))
-    rm_x = (nx - 0.5) * paper_w
-    rm_y = ny * paper_h
+    rm_x = (nx - 0.5) * extent_w
+    rm_y = ny * extent_h
     p = DEFAULT_PRESSURE if pressure is None else int(pressure)
     p = min(255, max(0, p))
     w = DEFAULT_WIDTH if width is None else int(width)
@@ -265,10 +265,14 @@ def build_line_block(
     layer_id: CrdtId,
     item_id: CrdtId,
     stroke: dict,
-    paper_w: int,
-    paper_h: int,
+    extent_w: float,
+    extent_h: float,
 ) -> SceneLineItemBlock:
     """Build a single ``SceneLineItemBlock`` from a plain stroke dict.
+
+    ``extent_w`` x ``extent_h`` is the page in stroke units, which the
+    normalized points span: the paper size for canvas strokes, or the PDF
+    page size over the points per unit for marks on a PDF page.
 
     Stroke dict contract::
 
@@ -296,7 +300,7 @@ def build_line_block(
             nx, ny, pressure = rp[0], rp[1], rp[2]
         else:
             nx, ny, pressure = rp[0], rp[1], None
-        pts.append(_map_point(nx, ny, pressure, width, paper_w, paper_h))
+        pts.append(_map_point(nx, ny, pressure, width, extent_w, extent_h))
 
     color_id, rgba = resolve_ink_color(stroke.get("color"), tool_id)
     line = Line(

@@ -67,12 +67,12 @@ from remarkable_mcp.extract import (
     render_page_full_page_from_document_zip,
     render_tablet_pdf_page_to_png,
 )
+from remarkable_mcp.pages import tablet_page
 from remarkable_mcp.pdf_marks import (
     for_export,
     original_pdf,
     pdf_outline,
     stored_marks,
-    tablet_page,
 )
 from remarkable_mcp.pdf_ocr import pages_needing_ocr
 from remarkable_mcp.responses import make_error, make_response
@@ -2665,7 +2665,6 @@ def _archive_page_map(archive: bytes) -> list:
 
 def _outline_summaries(entries: list, archive: bytes) -> list:
     """A PDF's outline entries with the tablet page each points to."""
-    from remarkable_mcp.pdf_marks import tablet_page
 
     page_map = _archive_page_map(archive)
     out = []
@@ -2681,8 +2680,8 @@ def _outline_summaries(entries: list, archive: bytes) -> list:
 
 def _mark_summaries(marks: list, archive: bytes) -> list:
     """Short descriptions of a PDF's marks, with the tablet page of each."""
-    from remarkable_mcp.pages import pdf_page_map
-    from remarkable_mcp.pdf_marks import summarize, tablet_page
+    from remarkable_mcp.pages import pdf_page_map, tablet_page
+    from remarkable_mcp.pdf_marks import summarize
 
     content = None
     if not _is_pdf_payload(archive):

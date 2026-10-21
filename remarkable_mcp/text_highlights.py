@@ -17,7 +17,6 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from remarkable_mcp import colors, rm_ink
 
-GLYPH_BLOCK = 0x03
 # Rectangle padding beyond PyMuPDF's loose character boxes, as a share of
 # the font size, to match the tablet's own highlights.
 LEFT_PAD = 0.16
@@ -28,10 +27,6 @@ COLORS: Dict[str, Tuple[int, Tuple[int, int, int, int]]] = {
     c.name: (c.color_id, c.rgba) for c in colors.HIGHLIGHTERS
 }
 DEFAULT_COLOR = "yellow"
-
-
-class HighlightError(rm_ink.InkError):
-    """Text to highlight cannot be found or the request is invalid."""
 
 
 def _page_chars(page, flags: int = 0) -> Tuple[str, List[Optional[dict]]]:
@@ -58,14 +53,14 @@ def find_text(page, query: str, occurrence: int = 1) -> List[Dict[str, Any]]:
 
     words = query.split()
     if not words:
-        raise HighlightError("The text to highlight is empty.")
+        raise rm_ink.InkError("The text to highlight is empty.")
     text, loose = _page_chars(page)
     _, tight = _page_chars(page, pymupdf.TEXT_ACCURATE_BBOXES)
     pattern = re.compile(r"\s+".join(re.escape(w) for w in words))
     matches = list(pattern.finditer(text))
     if len(matches) < occurrence:
         found = f"only {len(matches)} times" if matches else "not at all"
-        raise HighlightError(f"'{query}' appears {found} on the page.")
+        raise rm_ink.InkError(f"'{query}' appears {found} on the page.")
     match = matches[occurrence - 1]
     parts, start = [], match.start()
     for i in range(match.start(), match.end() + 1):

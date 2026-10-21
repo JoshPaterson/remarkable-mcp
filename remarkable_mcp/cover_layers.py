@@ -34,10 +34,6 @@ WHITE = rm_ink.WHITE
 Id = rm_ink.Id
 
 
-class CoverError(rm_ink.InkError):
-    """Raised when a cover cannot be written."""
-
-
 def layer_name(value: Any) -> Optional[str]:
     """The cover layer a mark's ``cover`` option names, or None for no cover."""
     if value is None or value is False:
@@ -46,7 +42,7 @@ def layer_name(value: Any) -> Optional[str]:
         return DEFAULT_LAYER
     if isinstance(value, str) and value.strip() and len(value.strip()) <= MAX_LAYER_NAME:
         return value.strip()
-    raise CoverError(
+    raise rm_ink.InkError(
         f"cover must be true (the '{DEFAULT_LAYER}' layer) or a layer name of up to "
         f"{MAX_LAYER_NAME} characters."
     )

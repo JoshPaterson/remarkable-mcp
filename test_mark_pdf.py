@@ -14,7 +14,7 @@ import pytest
 from PIL import Image
 
 from remarkable_mcp import pdf_marks, tablet_json
-from remarkable_mcp.pages import pdf_page_map
+from remarkable_mcp.pages import pdf_page_map, tablet_page
 from remarkable_mcp.pdf_marks import MarkError
 from remarkable_mcp.server import mcp
 from remarkable_mcp.sync import RemarkableClient, _hash_entries, _serialize_doc_index
@@ -310,7 +310,7 @@ def test_marks_follow_pdf_pages_not_tablet_positions():
         add=[{"page": 3, "id": "a", "shape": "check", "at": [0.5, 0.5]}], page_map=[0, None, 1]
     )
     assert result["marks"][0]["pdf_page"] == 1
-    assert pdf_marks.tablet_page(1, [1, 0]) == 1
+    assert tablet_page(1, [1, 0]) == 1
     with pytest.raises(MarkError, match="added on the tablet"):
         _edit(add=[{"page": 2, "shape": "check", "at": [0.5, 0.5]}], page_map=[0, None, 1])
 

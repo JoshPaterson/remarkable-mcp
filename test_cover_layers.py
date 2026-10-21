@@ -52,7 +52,7 @@ def test_layer_name():
     assert cl.layer_name(" Answer key ") == "Answer key"
     assert cl.layer_name(None) is None and cl.layer_name(False) is None
     for bad in ("", "x" * 41, 3):
-        with pytest.raises(cl.CoverError):
+        with pytest.raises(rm_ink.InkError):
             cl.layer_name(bad)
 
 

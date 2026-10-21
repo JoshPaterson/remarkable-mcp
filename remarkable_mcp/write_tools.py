@@ -46,7 +46,7 @@ from remarkable_mcp.api import (
     get_rmapi,
 )
 from remarkable_mcp.capabilities import client_supports_elicitation
-from remarkable_mcp.pages import content_page_ids
+from remarkable_mcp.pages import content_page_ids, tablet_page
 from remarkable_mcp.responses import make_error, make_response
 from remarkable_mcp.ssh import XOCHITL_PATH, Document, SSHClient
 from remarkable_mcp.ssh_reliability import (
@@ -1329,7 +1329,7 @@ def _page_obstacles(client, files: list, pdf: bytes):
     user's ink and the PDF's printed text on a page, for placing marks with
     ``near``."""
     from remarkable_mcp.extract import page_ink_regions
-    from remarkable_mcp.pdf_marks import original_pdf, tablet_page, text_lines
+    from remarkable_mcp.pdf_marks import original_pdf, text_lines
 
     base = original_pdf(pdf)
     cache: dict = {}
@@ -1399,7 +1399,7 @@ def _mark_editor(
         touched |= {m["pdf_page"] for m in result["marks"] if m["id"] in result["added"]}
         result["page_map"] = page_map
         result["touched_pages"] = sorted(
-            p for p in (pdf_marks.tablet_page(i, page_map) for i in touched) if p
+            p for p in (tablet_page(i, page_map) for i in touched) if p
         )
         result["ink"] = {}
         if build and result["changed"] and mark_ink.has_ink(marks + result["marks"]):
@@ -1546,7 +1546,7 @@ def _page_layer_list(client, files: list, page: int) -> list:
 
 
 def _mark_response(target, result: dict, dry_run: bool) -> str:
-    from remarkable_mcp.pdf_marks import summarize, tablet_page
+    from remarkable_mcp.pdf_marks import summarize
 
     page_map = result["page_map"]
     data = {
@@ -1588,7 +1588,6 @@ MAX_OCR_CHECKS = 100
 
 
 def _tablet_pages(indexes, page_map) -> list:
-    from remarkable_mcp.pdf_marks import tablet_page
 
     return [p for p in (tablet_page(i, page_map) for i in indexes) if p]
 
@@ -1884,7 +1883,7 @@ def _outline_editor(outline, build: bool):
                 {
                     "level": entry["level"],
                     "title": entry["title"],
-                    "page": (pdf_marks.tablet_page(index, page_map) if index is not None else None),
+                    "page": (tablet_page(index, page_map) if index is not None else None),
                     "first_lines": opening.get(index, []),
                 }
             )

@@ -1111,20 +1111,19 @@ def render_mark(
         stored = _render_graphic(request, page)
     else:
         palette = _palette(request.get("shape"))
-        name = request.get("color") or color or ""
-        if (
-            request.get("shape") == "highlight"
-            and "opacity" not in request
-            and isinstance(name, str)
-            and name.strip().lower() in HIGHLIGHT_OPACITY
-        ):
-            request = dict(request, opacity=HIGHLIGHT_OPACITY[name.strip().lower()])
         source = request["color"] if "color" in request else color
         if source:
             rgb = parse_color(source, palette)
+            name = source.strip().lower() if isinstance(source, str) else None
         else:
             rgb = default_color(request.get("shape"))
-            source = "yellow" if request.get("shape") == "highlight" else "black"
+            name = "yellow" if request.get("shape") == "highlight" else "black"
+        if (
+            request.get("shape") == "highlight"
+            and "opacity" not in request
+            and name in HIGHLIGHT_OPACITY
+        ):
+            request = dict(request, opacity=HIGHLIGHT_OPACITY[name])
         render = {
             "text": _render_text,
             "shape": _render_shape,
@@ -1142,8 +1141,8 @@ def render_mark(
         # The request is kept for listing a mark's style and re-drawing it;
         # named colors can be re-drawn in another palette (see for_export).
         stored["request"] = {k: v for k, v in request.items() if k != "color"}
-        if isinstance(source, str) and source.strip().lower() in palette:
-            stored["color_name"] = source.strip().lower()
+        if name in palette:
+            stored["color_name"] = name
     if len(stored["pdf"]) > MAX_SNIPPET_BYTES:
         raise MarkError(f"The rendered mark is larger than {MAX_SNIPPET_BYTES} bytes.")
     stored["pdf"] = base64.b64encode(stored["pdf"]).decode("ascii")
@@ -1683,7 +1682,8 @@ def edit_marks(
 def _text_highlight(options, size, pdf_page: int, color: Optional[str], locate) -> Dict[str, Any]:
     """A text highlight mark from ``{"text_highlight": text, "occurrence",
     "color", "layer"}``: the matched lines, to be written as tablet ink."""
-    from remarkable_mcp.text_highlights import COLORS, DEFAULT_COLOR, HighlightError
+    from remarkable_mcp.rm_ink import InkError
+    from remarkable_mcp.text_highlights import COLORS, DEFAULT_COLOR
 
     unknown = set(options) - {"text_highlight", "occurrence", "color", "layer"}
     if unknown:
@@ -1707,7 +1707,7 @@ def _text_highlight(options, size, pdf_page: int, color: Optional[str], locate) 
         raise MarkError("text_highlight is not available here.")
     try:
         parts = locate(pdf_page, query, occurrence)
-    except HighlightError as e:
+    except InkError as e:
         raise MarkError(str(e)) from None
     width, height = size
     box = [
@@ -1730,11 +1730,12 @@ def _text_highlight(options, size, pdf_page: int, color: Optional[str], locate) 
 def _cover(request: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """The cover a mark asks for: ``{"layer", "shown", "pending"}`` until its
     strokes are written (see ``cover_layers``), or None."""
-    from remarkable_mcp.cover_layers import CoverError, layer_name
+    from remarkable_mcp.cover_layers import layer_name
+    from remarkable_mcp.rm_ink import InkError
 
     try:
         name = layer_name(request.get("cover"))
-    except CoverError as e:
+    except InkError as e:
         raise MarkError(str(e)) from None
     covered = request.get("covered", False)
     if not isinstance(covered, bool):
@@ -1746,11 +1747,3 @@ def _cover(request: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     if request.get("shape") == "highlight":
         raise MarkError("Highlights cannot have a cover: it would hide the text under them.")
     return {"layer": name, "shown": covered, "pending": True}
-
-
-def tablet_page(pdf_page: int, page_map: Sequence[Optional[int]]) -> Optional[int]:
-    """The 1-based tablet page showing ``pdf_page``, if it is still shown."""
-    for position, index in enumerate(page_map, start=1):
-        if index == pdf_page:
-            return position
-    return None

@@ -13,6 +13,7 @@ import uuid
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from remarkable_mcp import cover_layers, ink_marks, rm_ink, text_highlights
+from remarkable_mcp.pages import tablet_page
 
 
 @dataclasses.dataclass(frozen=True)
@@ -77,8 +78,6 @@ def write_marks(
     ink is deleted, then the new marks' ink added. Returns the changed files
     by page id.
     """
-    from remarkable_mcp.pdf_marks import tablet_page
-
     removed = set(removed)
     jobs: Dict[int, Dict[str, list]] = {}
     for mark in before:
@@ -120,8 +119,6 @@ def mark_states(
 ) -> Tuple[Dict[str, str], List[str]]:
     """``(states, notes)``: each mark's ink state on the tablet (see each
     kind's status), and notes about the user's strokes on cover layers."""
-    from remarkable_mcp.pdf_marks import tablet_page
-
     states: Dict[str, str] = {}
     pages: Dict[int, Optional[bytes]] = {}
     covered: Dict[int, int] = {}

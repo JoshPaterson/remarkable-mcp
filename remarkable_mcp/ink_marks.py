@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from remarkable_mcp import colors, rm_ink, svg_path
+from remarkable_mcp.pdf_marks import BORDER_PAD, BORDER_RADIUS
 
 FONT_DIR = Path(__file__).parent / "fonts"
 FONT_FILES = {False: "EMSReadability.svg", True: "EMSReadabilityItalic.svg"}
@@ -32,8 +33,6 @@ UNDERLINE_DROP = 0.12
 TEXT_WIDTH = 0.07
 BOLD_WIDTH = 1.8
 MIN_WIDTH = 0.4
-BORDER_PAD = 3.0
-BORDER_RADIUS = 3.5
 CURVE_STEPS = 8
 # Highlights taller than this are drawn as several highlighter rows.
 MAX_HIGHLIGHT_ROW = 24.0
@@ -43,10 +42,6 @@ PEN_COLORS = {c.name: c.color_id for c in colors.PENS}
 FINELINER = "fineliner"
 HIGHLIGHTER = "highlighter"
 ERASABLE_KINDS = ("text", "shape", "path")
-
-
-class InkError(rm_ink.InkError):
-    """An erasable mark that cannot be written as ink."""
 
 
 # --- Single-stroke text ----------------------------------------------------

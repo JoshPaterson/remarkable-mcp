@@ -37,7 +37,8 @@ Id = Tuple[int, int]
 
 
 class InkError(ValueError):
-    """Raised when ink cannot be written to a page."""
+    """Ink that cannot be written: a bad cover, layer or text to highlight,
+    or a page the MCP cannot write to."""
 
 
 def author_uuid(directory: Optional[Path] = None) -> uuid.UUID:
