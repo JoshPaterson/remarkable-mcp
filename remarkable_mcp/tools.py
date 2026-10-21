@@ -7,6 +7,7 @@ file on the MCP server host and returns it as a resource link.
 """
 
 import base64
+import bisect
 import io
 import json
 import logging
@@ -27,6 +28,7 @@ from mcp.types import (
     TextResourceContents,
     ToolAnnotations,
 )
+from pydantic.json_schema import SkipJsonSchema
 
 from remarkable_mcp import export_save, ocr
 from remarkable_mcp.api import (
@@ -53,7 +55,6 @@ from remarkable_mcp.extract import (
     extract_text_from_document_zip,
     extract_text_from_epub,
     extract_text_from_pdf,
-    find_similar_documents,
     get_background_color,
     get_cached_ocr_result,
     get_document_file_type,
@@ -66,6 +67,8 @@ from remarkable_mcp.extract import (
     render_page_full_page_from_document_zip,
     render_tablet_pdf_page_to_png,
 )
+from remarkable_mcp.lookup import find_item, lookup, lookup_folder, scoped_items
+from remarkable_mcp.lookup import is_cloud_archived as _is_cloud_archived
 from remarkable_mcp.pages import tablet_page
 from remarkable_mcp.pdf_marks import (
     for_export,
@@ -74,7 +77,7 @@ from remarkable_mcp.pdf_marks import (
     stored_marks,
 )
 from remarkable_mcp.pdf_ocr import pages_needing_ocr
-from remarkable_mcp.responses import make_error, make_response
+from remarkable_mcp.responses import invalid_param, make_error, make_response, resolve_alias
 from remarkable_mcp.roots import get_root as _get_root_path
 from remarkable_mcp.roots import is_under_root as _is_within_root
 from remarkable_mcp.roots import to_library_path as _resolve_root_path
@@ -87,21 +90,8 @@ logger = logging.getLogger(__name__)
 
 
 def _find_target_document(collection, items_by_id: dict, document: str):
-    """Find an in-scope document by display name or full path."""
-    root = _get_root_path()
-    actual_document = _resolve_root_path(document) if document.startswith("/") else document
-    document_lower = actual_document.lower().strip("/")
-    for item in collection:
-        if item.is_folder or _is_cloud_archived(item, items_by_id):
-            continue
-        item_path = get_item_path(item, items_by_id)
-        if not _is_within_root(item_path, root):
-            continue
-        if item.VissibleName.lower() == document_lower:
-            return item
-        if item_path.lower().strip("/") == document_lower:
-            return item
-    return None
+    """Find an in-scope document by display name or root-relative path."""
+    return find_item(document, collection, items_by_id, kind="document")
 
 
 # Base annotations for read-only operations
@@ -143,6 +133,11 @@ IMAGE_ANNOTATIONS = ToolAnnotations(
     **_BASE_ANNOTATIONS,
 )
 
+LAYOUT_ANNOTATIONS = ToolAnnotations(
+    title="Get reMarkable Page Layout",
+    **_BASE_ANNOTATIONS,
+)
+
 EXPORT_ANNOTATIONS = ToolAnnotations(
     title="Export reMarkable Document",
     read_only_hint=False,
@@ -154,17 +149,10 @@ EXPORT_ANNOTATIONS = ToolAnnotations(
 # Default page size for pagination (characters) - used for PDFs/EPUBs
 DEFAULT_PAGE_SIZE = 8000
 
-
-def _is_directly_archived(item) -> bool:
-    """Check the item's own metadata, ignoring its ancestors."""
-    # SSH/local-dir/USB expose an explicit property. Require a real bool so
-    # permissive proxy objects do not accidentally hide otherwise valid items.
-    archived = getattr(item, "is_cloud_archived", None)
-    if isinstance(archived, bool):
-        return archived
-    # Cloud mode: check parent == "trash"
-    parent = item.Parent if hasattr(item, "Parent") else getattr(item, "parent", "")
-    return parent == "trash"
+# remarkable_search reads at most this many documents, and returns this much
+# text of each.
+MAX_SEARCH_DOCUMENTS = 20
+SEARCH_CONTENT_CHARS = 2000
 
 
 def _item_tags(item) -> List[str]:
@@ -276,27 +264,6 @@ def _descendant_items(items_by_parent: dict, parent_id: str) -> List:
     return found
 
 
-def _is_cloud_archived(item, items_by_id: Optional[dict] = None) -> bool:
-    """Check if an item is cloud-archived (not available on device).
-
-    Trashing a folder only re-parents the folder itself, so with
-    ``items_by_id`` the ancestors are checked too.
-    """
-    if _is_directly_archived(item):
-        return True
-    if not items_by_id:
-        return False
-    seen = {item.ID}
-    parent_id = getattr(item, "Parent", "")
-    while parent_id in items_by_id and parent_id not in seen:
-        seen.add(parent_id)
-        parent = items_by_id[parent_id]
-        if _is_directly_archived(parent):
-            return True
-        parent_id = getattr(parent, "Parent", "")
-    return False
-
-
 def _modified_sort_key(item) -> float:
     """Return a sortable timestamp for an item's modified date.
 
@@ -332,18 +299,90 @@ def _count_pdf_pages(pdf_bytes: bytes) -> int:
         return len(document)
 
 
+# Page headings in extracted text: "--- Page N ---" (PDF text and OCR) and
+# "Page N: ..." (the annotated pages list). Other section headings end a page.
+_PAGE_MARK = re.compile(r"^--- Page (\d+) ---$|^Page (\d+): ", re.MULTILINE)
+_SECTION_MARK = re.compile(r"^(?:=== .+ ===|--- (?!Page \d+ ---).+ ---)$", re.MULTILINE)
+GREP_CONTEXT = 100
+
+
+def _page_starts(text: str, source_chars: int = 0, page_map: Optional[list] = None) -> list:
+    """``[(offset, tablet_page or None)]`` where each page's text starts in
+    ``text``, in order. In the first ``source_chars`` (a PDF's own text) the
+    headings number PDF pages, mapped to tablet pages with ``page_map``."""
+    starts = [(m.start(), None) for m in _SECTION_MARK.finditer(text)]
+    for m in _PAGE_MARK.finditer(text):
+        number = int(m.group(1) or m.group(2))
+        if m.group(1) and m.start() < source_chars and page_map:
+            number = tablet_page(number - 1, page_map)
+        starts.append((m.start(), number))
+    return sorted(starts, key=lambda start: start[0])
+
+
+def _grep_text(text: str, pattern, starts: list) -> List[dict]:
+    """Each match of ``pattern`` in ``text``: ``{"page", "text"}``, the text
+    being the match with up to GREP_CONTEXT characters around it."""
+    offsets = [offset for offset, _ in starts]
+    matches = []
+    for match in pattern.finditer(text):
+        if match.start() == match.end():
+            continue
+        index = bisect.bisect_right(offsets, match.start()) - 1
+        start = max(0, match.start() - GREP_CONTEXT)
+        end = min(len(text), match.end() + GREP_CONTEXT)
+        context = (
+            ("..." if start > 0 else "") + text[start:end] + ("..." if end < len(text) else "")
+        )
+        matches.append({"page": starts[index][1] if index >= 0 else None, "text": context})
+    return matches
+
+
+def _match_line(match: dict) -> str:
+    return f"[page {match['page']}] {match['text']}" if match["page"] else match["text"]
+
+
+def _grep_hint(grep: str, matches: List[dict]) -> str:
+    if not matches:
+        return f"No matches for '{grep}' in the document."
+    pages = list(dict.fromkeys(m["page"] for m in matches if m["page"]))
+    where = f" on page(s) {pages}" if pages else ""
+    return f"Found {len(matches)} match(es) for '{grep}'{where}."
+
+
+def _group_by_size(items: list, size: int, length) -> List[list]:
+    """``items`` in consecutive groups of at most ``size`` total ``length``
+    (a longer item gets a group of its own); at least one group."""
+    groups: List[list] = [[]]
+    used = 0
+    for item in items:
+        n = length(item)
+        if groups[-1] and used + n > size:
+            groups.append([])
+            used = 0
+        groups[-1].append(item)
+        used += n
+    return groups
+
+
+def _text_chunks(text: str, size: int) -> List[str]:
+    """``text`` in parts of ``size`` characters; one empty part for no text."""
+    return [text[i : i + size] for i in range(0, len(text), size)] or [""]
+
+
 @mcp.tool(annotations=READ_ANNOTATIONS)
 async def remarkable_read(
     document: str,
     content_type: Literal["text", "raw", "annotations"] = "text",
-    page: int = 1,
+    part: int = 1,
     grep: Optional[str] = None,
     include_ocr: bool = False,
+    page: SkipJsonSchema[Optional[int]] = None,
 ) -> str:
     """
     <usecase>Read and extract text content from a reMarkable document.</usecase>
     <instructions>
-    Extracts content from a document with pagination to preserve context window.
+    Extracts a document's text in parts, so a long document does not fill the
+    context window.
 
     Content types:
     - "text" (default): Full extracted text (PDF/EPUB content + annotations)
@@ -356,12 +395,12 @@ async def remarkable_read(
     symbols and equations. When the exact highlighted content matters, render the
     highlight's region with remarkable_image(document, page, region=...).
 
-    Use pagination to read large documents without overwhelming context:
-    - Start with page=1 (default)
-    - Check "more" field - if true, there's more content
-    - Use "next_page" value to get the next page
-    - "total_pages" is the physical document count; "content_pages" is the
-      extracted-text count used by page/more/next_page
+    Long text comes in parts (about 8000 characters each; one OCR'd page
+    each for handwritten notebooks):
+    - Start with part=1 (default)
+    - "more" is true when there is more; "next_part" is the part to read next
+    - "total_pages" is the document's tablet page count; "parts" is the
+      number of text parts (also given as "content_pages")
     - "total_pages_known" reports whether the physical count was available.
       Raw PDF reads count the downloaded PDF directly. If a raw EPUB archive
       cannot be read, content still returns with total_pages=null.
@@ -369,26 +408,51 @@ async def remarkable_read(
       text without annotations and "annotations" reports that the archive is
       unavailable instead of trying to parse the PDF as a zip.
 
-    Use grep to search for specific content on the current page.
+    grep searches the whole document (a regex, case-insensitive) and returns
+    each match with about 100 characters of context and the tablet page it is
+    on ("matches": [{"page", "text"}]), in parts like the text. page is null
+    for text with no page, such as EPUB text.
 
     OCR uses Google Vision when configured, otherwise Tesseract.
     </instructions>
     <parameters>
     - document: Document name or path (use remarkable_browse to find documents)
     - content_type: "text" (full), "raw" (PDF/EPUB only), "annotations" (notes only)
-    - page: Extracted-content page number (default: 1). Physical document pages
-      are reported separately as total_pages.
-    - grep: Optional regex pattern to filter content (searches current page)
+    - part: Text part to read (default: 1); not a tablet page
+    - grep: Optional regex to find in the whole document
     - include_ocr: Enable handwriting OCR for annotations (default: False)
     </parameters>
     <examples>
     - remarkable_read("Meeting Notes")  # Get first page of text
     - remarkable_read("Book.pdf", content_type="raw")  # Get raw PDF text
     - remarkable_read("Notes", content_type="annotations")  # Only annotations
-    - remarkable_read("Report", page=2)  # Get second page
-    - remarkable_read("Manual", grep="installation")  # Search for keyword
+    - remarkable_read("Report", part=2)  # Get the second part
+    - remarkable_read("Manual", grep="installation")  # Find a keyword
     </examples>
     """
+    part, error = resolve_alias(part, page, "part", "page", default=1)
+    if error:
+        return error
+    out = await _read_document(document, content_type, part, grep, include_ocr)
+    if isinstance(out, str):
+        return out
+    return make_response(*out)
+
+
+async def _read_document(
+    document: str, content_type: str, page: int, grep: Optional[str], include_ocr: bool
+):
+    """remarkable_read: ``(data, hint)``, or an error reply. ``page`` is the
+    text part to read."""
+    pattern = None
+    if grep:
+        try:
+            pattern = re.compile(grep, re.IGNORECASE | re.MULTILINE)
+        except re.error as e:
+            return invalid_param(
+                f"grep: invalid regex pattern: {e}",
+                "Use a valid regex pattern or simple text string.",
+            )
     try:
         client = await run_blocking(get_rmapi)
         collection = await run_blocking(client.get_meta_items)
@@ -399,30 +463,11 @@ async def remarkable_read(
         # Internal page size for PDF/EPUB character-based pagination
         page_size = DEFAULT_PAGE_SIZE
 
-        root = _get_root_path()
-        documents = [
-            item
-            for item in collection
-            if not item.is_folder and not _is_cloud_archived(item, items_by_id)
-        ]
-        target_doc = _find_target_document(collection, items_by_id, document)
-
-        if not target_doc:
-            # Find similar documents for suggestion (only within root)
-            filtered_docs = [
-                doc for doc in documents if _is_within_root(get_item_path(doc, items_by_id), root)
-            ]
-            similar = find_similar_documents(document, filtered_docs)
-            search_term = document.split()[0] if document else "notes"
-            return make_error(
-                error_type="document_not_found",
-                message=f"Document not found: '{document}'",
-                suggestion=(
-                    f"Try remarkable_browse(query='{search_term}') to search, "
-                    "or remarkable_browse('/') to list all files."
-                ),
-                did_you_mean=similar if similar else None,
-            )
+        target_doc, error = lookup(
+            client, document, kind="document", collection=collection, items_by_id=items_by_id
+        )
+        if error:
+            return error
 
         doc_path = get_item_path(target_doc, items_by_id)
         file_type = await run_blocking(get_file_type, client, target_doc)
@@ -448,6 +493,7 @@ async def remarkable_read(
 
         # Collect content based on content_type
         text_parts = []
+        source_chars = 0  # leading characters of text_parts that are the PDF's own text
         raw_available = False
         raw_data: Optional[bytes] = None
         page_count_note = None
@@ -482,6 +528,7 @@ async def remarkable_read(
                         raw_text = await run_blocking(extract_text_from_epub, tmp_path)
                     if raw_text:
                         text_parts.append(raw_text)
+                        source_chars = len(raw_text)
                 finally:
                     tmp_path.unlink(missing_ok=True)
             elif content_type == "raw":
@@ -708,8 +755,11 @@ async def remarkable_read(
         )
 
         # OCR results remain content-pagination units. They can be fewer than
-        # physical pages when blank or non-OCR pages are omitted.
-        if notebook_pages:
+        # physical pages when blank or non-OCR pages are omitted. grep searches
+        # them as text, like any other document.
+        if notebook_pages and grep:
+            text_parts = list(notebook_pages)
+        elif notebook_pages:
             content_pages = len(notebook_pages)
 
             if page > content_pages:
@@ -726,48 +776,17 @@ async def remarkable_read(
             page_content = notebook_pages[page - 1]
             has_more = page < content_pages
 
-            # Apply grep filter if specified
-            grep_matches = 0
-            if grep:
-                try:
-                    pattern = re.compile(grep, re.IGNORECASE | re.MULTILINE)
-                    if not pattern.search(page_content):
-                        # No match on this page, search all pages
-                        matching_pages = []
-                        for i, pg in enumerate(notebook_pages, 1):
-                            if pattern.search(pg):
-                                matching_pages.append(i)
-                        if matching_pages:
-                            return make_error(
-                                error_type="no_match_on_page",
-                                message=f"No match for '{grep}' on page {page}.",
-                                suggestion=f"Matches found on page(s): {matching_pages}. "
-                                f"Try remarkable_read('{document}', "
-                                f"page={matching_pages[0]}, grep='{grep}').",
-                            )
-                        else:
-                            return make_error(
-                                error_type="no_grep_matches",
-                                message=f"No matches for '{grep}' in document.",
-                                suggestion="Try a different search term.",
-                            )
-                    grep_matches = len(pattern.findall(page_content))
-                except re.error as e:
-                    return make_error(
-                        error_type="invalid_grep",
-                        message=f"Invalid regex pattern: {e}",
-                        suggestion="Use a valid regex pattern or simple text string.",
-                    )
-
             result = {
                 "document": target_doc.VissibleName,
                 "path": _apply_root_filter(doc_path),
                 "file_type": "notebook",
                 "content_type": content_type,
                 "content": page_content,
+                "part": page,
                 "page": page,
                 "total_pages": total_pages,
                 "total_pages_known": total_pages_known,
+                "parts": content_pages,
                 "content_pages": content_pages,
                 "page_type": "notebook",
                 "total_chars": len(page_content),
@@ -784,13 +803,9 @@ async def remarkable_read(
                 result["handwriting"] = [handwriting[page - 1]]
 
             if has_more:
-                result["next_page"] = page + 1
+                result["next_part"] = result["next_page"] = page + 1
 
-            if grep:
-                result["grep"] = grep
-                result["grep_matches"] = grep_matches
-
-            hint_parts = [f"Notebook content page {page}/{content_pages}; {physical_page_summary}."]
+            hint_parts = [f"Notebook text part {page}/{content_pages}; {physical_page_summary}."]
             ocr_note = _ocr_reliability_note(
                 result.get("handwriting"), ocr_backend_used, target_doc.VissibleName
             )
@@ -799,75 +814,41 @@ async def remarkable_read(
                 hint_parts.append(ocr_note)
             if has_more:
                 doc_name = target_doc.VissibleName
-                hint_parts.append(f"Next: remarkable_read('{doc_name}', page={page + 1}).")
+                hint_parts.append(f"Next: remarkable_read('{doc_name}', part={page + 1}).")
             else:
-                hint_parts.append("(last page)")
-            if grep_matches:
-                hint_parts.insert(0, f"Found {grep_matches} match(es) for '{grep}'.")
+                hint_parts.append("(last part)")
 
-            return make_response(result, " ".join(hint_parts))
+            return result, " ".join(hint_parts)
 
         # Combine all content
         full_text = "\n\n".join(text_parts) if text_parts else ""
+
+        # A notebook with no typed text: read it again with OCR.
+        if not full_text and not include_ocr and file_type not in ("pdf", "epub"):
+            out = await _read_document(document, content_type, page, grep, include_ocr=True)
+            if isinstance(out, str):
+                return out
+            data, hint = out
+            data["_ocr_auto_enabled"] = True
+            return data, "OCR auto-enabled (notebook had no typed text). " + hint
+
+        matches: list = []
+        if pattern is not None:
+            page_map = []
+            if file_type == "pdf" and source_chars:
+                try:
+                    page_map = _archive_page_map(await load_archive())
+                except Exception:
+                    page_map = []
+            starts = _page_starts(full_text, source_chars, page_map)
+            matches = _grep_text(full_text, pattern, starts)
+            match_parts = _group_by_size(matches, page_size, lambda m: len(m["text"]))
+            units = ["\n\n---\n\n".join(_match_line(m) for m in group) for group in match_parts]
+        else:
+            units = _text_chunks(full_text, page_size)
         total_chars = len(full_text)
 
-        # Apply grep filter if specified
-        grep_matches = 0
-        if grep and full_text:
-            try:
-                pattern = re.compile(grep, re.IGNORECASE | re.MULTILINE)
-                # Find all matches and include context
-                matches = []
-                for match in pattern.finditer(full_text):
-                    start = max(0, match.start() - 100)
-                    end = min(len(full_text), match.end() + 100)
-                    context = full_text[start:end]
-                    # Add ellipsis if truncated
-                    if start > 0:
-                        context = "..." + context
-                    if end < len(full_text):
-                        context = context + "..."
-                    matches.append(context)
-                    grep_matches += 1
-
-                if matches:
-                    full_text = "\n\n---\n\n".join(matches)
-                    total_chars = len(full_text)
-                else:
-                    full_text = ""
-                    total_chars = 0
-            except re.error as e:
-                return make_error(
-                    error_type="invalid_grep",
-                    message=f"Invalid regex pattern: {e}",
-                    suggestion="Use a valid regex pattern or simple text string.",
-                )
-
-        # Apply pagination
-        start_idx = (page - 1) * page_size
-        end_idx = start_idx + page_size
-
-        # Handle empty content case - auto-retry with OCR if not already enabled
-        if total_chars == 0 and not include_ocr and file_type not in ("pdf", "epub"):
-            # Auto-retry with OCR for notebooks
-            import json
-
-            ocr_result = await remarkable_read(
-                document=document,
-                content_type=content_type,
-                page=page,
-                grep=grep,
-                include_ocr=True,  # Enable OCR automatically
-            )
-            result_data = json.loads(ocr_result)
-            if "_error" not in result_data:
-                result_data["_ocr_auto_enabled"] = True
-                result_data["_hint"] = (
-                    "OCR auto-enabled (notebook had no typed text). " + result_data.get("_hint", "")
-                )
-            return json.dumps(result_data, indent=2)
-
-        if total_chars == 0:
+        if total_chars == 0 and pattern is None:
             if page > 1:
                 return make_error(
                     error_type="page_out_of_range",
@@ -875,7 +856,7 @@ async def remarkable_read(
                         f"Content page {page} does not exist. Extracted content has "
                         f"1 page; {physical_page_summary}."
                     ),
-                    suggestion="Use page=1 to start from the beginning.",
+                    suggestion="Use part=1 to start from the beginning.",
                 )
             # Return empty result for page 1
             result = {
@@ -884,9 +865,11 @@ async def remarkable_read(
                 "file_type": file_type or "notebook",
                 "content_type": content_type,
                 "content": "",
+                "part": 1,
                 "page": 1,
                 "total_pages": total_pages,
                 "total_pages_known": total_pages_known,
+                "parts": 1,
                 "content_pages": 1,
                 "total_chars": 0,
                 "more": False,
@@ -901,23 +884,21 @@ async def remarkable_read(
             if page_count_note:
                 result["page_count_note"] = page_count_note
                 hint = f"{hint} {page_count_note}"
-            return make_response(result, hint)
+            return result, hint
 
-        if start_idx >= total_chars:
-            # Page out of range
-            content_pages = max(1, (total_chars + page_size - 1) // page_size)
+        content_pages = len(units)
+        if page > content_pages:
             return make_error(
                 error_type="page_out_of_range",
                 message=(
-                    f"Content page {page} does not exist. Extracted content has "
-                    f"{content_pages} page(s); {physical_page_summary}."
+                    f"Part {page} does not exist. The text has {content_pages} "
+                    f"part(s); {physical_page_summary}."
                 ),
-                suggestion="Use page=1 to start from the beginning.",
+                suggestion="Use part=1 to start from the beginning.",
             )
 
-        page_content = full_text[start_idx:end_idx]
-        has_more = end_idx < total_chars
-        content_pages = max(1, (total_chars + page_size - 1) // page_size)
+        page_content = units[page - 1]
+        has_more = page < content_pages
 
         result = {
             "document": target_doc.VissibleName,
@@ -925,9 +906,11 @@ async def remarkable_read(
             "file_type": file_type or "notebook",
             "content_type": content_type,
             "content": page_content,
+            "part": page,
             "page": page,
             "total_pages": total_pages,
             "total_pages_known": total_pages_known,
+            "parts": content_pages,
             "content_pages": content_pages,
             "total_chars": total_chars,
             "more": has_more,
@@ -979,32 +962,22 @@ async def remarkable_read(
             result["handwriting"] = content["handwriting"]
 
         if has_more:
-            result["next_page"] = page + 1
+            result["next_part"] = result["next_page"] = page + 1
 
-        if grep:
-            result["grep"] = grep
-            result["grep_matches"] = grep_matches
-
-        # Build contextual hint
         hint_parts = []
-
-        if grep:
-            if grep_matches > 0:
-                hint_parts.append(f"Found {grep_matches} match(es) for '{grep}'.")
-            else:
-                hint_parts.append(f"No matches for '{grep}' on this page.")
-                if has_more:
-                    hint_parts.append("Try searching other pages.")
+        if pattern is not None:
+            result["grep"] = grep
+            result["grep_matches"] = len(matches)
+            result["matches"] = match_parts[page - 1]
+            hint_parts.append(_grep_hint(grep, matches))
 
         if has_more:
             hint_parts.append(
-                f"Content page {page}/{content_pages}; {physical_page_summary}. "
-                f"Next: remarkable_read('{document}', page={page + 1})"
+                f"Part {page}/{content_pages}; {physical_page_summary}. "
+                f"Next: remarkable_read('{document}', part={page + 1})"
             )
         else:
-            hint_parts.append(
-                f"Content page {page}/{content_pages} (complete); {physical_page_summary}."
-            )
+            hint_parts.append(f"Part {page}/{content_pages} (complete); {physical_page_summary}.")
         if page_count_note:
             result["page_count_note"] = page_count_note
             hint_parts.append(page_count_note)
@@ -1031,7 +1004,7 @@ async def remarkable_read(
                 "to the cloud; try SSH/USB mode with the device connected."
             )
 
-        return make_response(result, " ".join(hint_parts))
+        return result, " ".join(hint_parts)
 
     except Exception as e:
         return make_error(
@@ -1188,21 +1161,14 @@ async def remarkable_browse(
                                 ),
                                 suggestion="Check REMARKABLE_ROOT_PATH configuration.",
                             )
-                        # Call remarkable_read internally and add redirect note
-                        read_result = await remarkable_read(
-                            _apply_root_filter(doc_path),
-                            page=1,
+                        out = await _read_document(
+                            _apply_root_filter(doc_path), "text", 1, None, False
                         )
-                        import json
-
-                        result_data = json.loads(read_result)
-                        if "_error" not in result_data:
-                            result_data["_redirected_from"] = f"browse:{path}"
-                            result_data["_hint"] = (
-                                f"Auto-redirected from browse to read. "
-                                f"{result_data.get('_hint', '')}"
-                            )
-                        return json.dumps(result_data, indent=2)
+                        if isinstance(out, str):
+                            return out
+                        data, hint = out
+                        data["_redirected_from"] = f"browse:{path}"
+                        return make_response(data, f"Auto-redirected from browse to read. {hint}")
 
                     # Folder not found - suggest alternatives
                     available_folders = [
@@ -1432,124 +1398,148 @@ async def remarkable_recent(limit: int = 10, include_preview: bool = False) -> s
 
 @mcp.tool(annotations=SEARCH_ANNOTATIONS)
 async def remarkable_search(
-    query: str,
+    query: Optional[str] = None,
     grep: Optional[str] = None,
     limit: int = 5,
     include_ocr: bool = False,
     tags: Optional[List[str]] = None,
+    folder: Optional[str] = None,
 ) -> str:
     """
-    <usecase>Search across multiple documents and return matching content.</usecase>
+    <usecase>Read several documents in one call, picked by name, folder or tags,
+    optionally keeping only the lines that match a pattern.</usecase>
     <instructions>
-    Searches document names for the query, then optionally searches content with grep.
-    Can filter by tags to narrow results.
-    Returns summaries from multiple documents in a single call.
+    Picks documents first, then reads each one:
+    1. Candidates are documents whose names contain query (case-insensitive),
+       inside folder and its subfolders when given, with any of tags when
+       given. At least one of query, folder or tags is needed. Without query,
+       every document in folder (or with tags) is a candidate, so grep
+       searches content regardless of names.
+    2. The first `limit` candidates by path (default 5, at most 20) are read
+       like remarkable_read: the first part of the text (up to 2000
+       characters per document), or with grep each match with its context
+       and tablet page. "candidates" gives how many there were.
 
-    This is efficient for finding information across your library without
-    making many individual tool calls.
-
-    Limits:
-    - Max 5 documents per search (to keep response size manageable)
-    - Returns first page (~8000 chars) of each matching document
-    - Use grep to filter to relevant sections
+    To find a document by name only, remarkable_browse(query=...) is faster.
+    To search one long document, use remarkable_read(document, grep=...).
     </instructions>
     <parameters>
-    - query: Search term for document names
-    - grep: Optional pattern to search within document content
-    - limit: Max documents to return (default: 5, max: 5)
-    - include_ocr: Enable OCR for handwritten content (default: False)
-    - tags: List of tags to filter documents (optional, case-insensitive)
+    - query: Text the document names must contain (optional)
+    - grep: Optional regex to find in each document's text
+    - limit: Documents to read (default: 5, max: 20)
+    - include_ocr: OCR handwriting before searching it (default: False; slow)
+    - tags: Documents with any of these tags (optional, case-insensitive)
+    - folder: Only documents in this folder and its subfolders (optional)
     </parameters>
     <examples>
-    - remarkable_search("meeting")  # Find docs with "meeting" in name
-    - remarkable_search("journal", grep="project")  # Find "project" in journals
-    - remarkable_search("notes", include_ocr=True)  # Search with OCR enabled
-    - remarkable_search("project", tags=["work"])  # Find work-tagged projects
+    - remarkable_search("meeting")  # Read docs with "meeting" in the name
+    - remarkable_search("journal", grep="project")  # "project" in journals
+    - remarkable_search(folder="/Work", grep="budget")  # content search in a folder
+    - remarkable_search("project", tags=["work"])  # Work-tagged projects
     </examples>
     """
-    import json
-
+    if not query and folder is None and not tags:
+        return invalid_param(
+            "query: give query, folder or tags to pick the documents to search.",
+            "Example: remarkable_search(folder='/Work', grep='budget').",
+        )
+    limit = min(max(1, limit), MAX_SEARCH_DOCUMENTS)
     try:
-        # Enforce limits
-        limit = min(max(1, limit), 5)
+        client = await run_blocking(get_rmapi)
+        collection = await run_blocking(client.get_meta_items)
+        items_by_id = get_items_by_id(collection)
+        candidates = scoped_items(collection, items_by_id, "document")
+        if folder is not None:
+            folder_id, error = lookup_folder(folder, collection, items_by_id)
+            if error:
+                return error
+            if folder_id:
+                inside = _descendant_items(get_items_by_parent(collection), folder_id)
+                inside_ids = {item.ID for item in inside}
+                candidates = [item for item in candidates if item.ID in inside_ids]
+        if query:
+            candidates = [c for c in candidates if query.lower() in c.VissibleName.lower()]
+        if tags:
+            candidates = [c for c in candidates if _matches_item_tags(c, tags)]
+        paths = {c.ID: _apply_root_filter(get_item_path(c, items_by_id)) for c in candidates}
+        candidates.sort(key=lambda c: paths[c.ID].lower())
 
-        # First, find matching documents
-        browse_result = await remarkable_browse(query=query, tags=tags)
-        browse_data = json.loads(browse_result)
-
-        if "_error" in browse_data:
-            return browse_result
-
-        results = browse_data.get("results", [])
-        documents = [r for r in results if r.get("type") == "document"][:limit]
-
-        if not documents:
+        if not candidates:
+            picked = " and ".join(
+                part
+                for part in (
+                    f"names containing '{query}'" if query else "",
+                    f"in '{folder}'" if folder is not None else "",
+                    f"with tags {tags}" if tags else "",
+                )
+                if part
+            )
             return make_error(
                 error_type="no_documents_found",
-                message=f"No documents found matching '{query}'.",
+                message=f"No documents found {picked}.",
                 suggestion="Try a different search term or use remarkable_browse('/') to list all.",
             )
 
-        # Read each document
         search_results = []
-        for doc in documents:
+        for doc in candidates[:limit]:
             doc_result = {
-                "name": doc["name"],
-                "path": doc["path"],
-                "modified": doc.get("modified"),
+                "name": doc.VissibleName,
+                "path": paths[doc.ID],
+                "modified": getattr(doc, "ModifiedClient", None),
             }
-            # Include tags if present
-            if "tags" in doc:
-                doc_result["tags"] = doc["tags"]
-            if "page_tags" in doc:
-                doc_result["page_tags"] = doc["page_tags"]
-
+            if _item_tags(doc):
+                doc_result["tags"] = _item_tags(doc)
+            if _item_page_tags(doc):
+                doc_result["page_tags"] = _item_page_tags(doc)
             try:
-                read_result = await remarkable_read(
-                    document=doc["path"],
-                    page=1,
-                    grep=grep,
-                    include_ocr=include_ocr,
-                )
-                read_data = json.loads(read_result)
-
-                if "_error" not in read_data:
-                    doc_result["content"] = read_data.get("content", "")[:2000]  # Limit per doc
-                    doc_result["total_pages"] = read_data.get("total_pages", 1)
-                    doc_result["total_pages_known"] = read_data.get("total_pages_known", True)
-                    doc_result["content_pages"] = read_data.get("content_pages", 1)
-                    if grep:
-                        doc_result["grep_matches"] = read_data.get("grep_matches", 0)
-                    if len(read_data.get("content", "")) > 2000:
-                        doc_result["truncated"] = True
+                out = await _read_document(paths[doc.ID], "text", 1, grep, include_ocr)
+                if isinstance(out, str):
+                    doc_result["error"] = json.loads(out)["_error"]["message"]
                 else:
-                    doc_result["error"] = read_data["_error"]["message"]
+                    data, _ = out
+                    content = data.get("content", "")
+                    doc_result["content"] = content[:SEARCH_CONTENT_CHARS]
+                    doc_result["total_pages"] = data.get("total_pages", 1)
+                    doc_result["total_pages_known"] = data.get("total_pages_known", True)
+                    doc_result["content_pages"] = data.get("content_pages", 1)
+                    if grep:
+                        doc_result["grep_matches"] = data.get("grep_matches", 0)
+                        doc_result["match_pages"] = list(
+                            dict.fromkeys(m["page"] for m in data.get("matches", []) if m["page"])
+                        )
+                    if len(content) > SEARCH_CONTENT_CHARS:
+                        doc_result["truncated"] = True
             except Exception as e:
                 doc_result["error"] = str(e)
-
             search_results.append(doc_result)
 
         result = {
             "query": query,
             "grep": grep,
             "count": len(search_results),
+            "candidates": len(candidates),
             "documents": search_results,
         }
+        if folder is not None:
+            result["folder"] = folder
         if tags:
             result["filter_tags"] = tags
 
-        # Build hint
         docs_with_content = [d for d in search_results if "content" in d]
         tag_desc = f" with tags {tags}" if tags else ""
         if grep:
-            matches = sum(d.get("grep_matches", 0) for d in docs_with_content)
+            found = [d for d in docs_with_content if d.get("grep_matches")]
+            matches = sum(d["grep_matches"] for d in found)
             hint = (
-                f"Found {len(docs_with_content)} document(s){tag_desc} "
-                f"with {matches} grep match(es)."
+                f"Read {len(docs_with_content)} document(s){tag_desc}; {len(found)} "
+                f"have {matches} match(es) for '{grep}'."
             )
         else:
-            hint = f"Found {len(docs_with_content)} document(s) matching '{query}'{tag_desc}."
-
+            hint = f"Found {len(docs_with_content)} document(s){tag_desc}."
+        if len(candidates) > limit:
+            hint += (
+                f" {len(candidates) - limit} more candidate(s) were not read; narrow the search."
+            )
         if docs_with_content:
             hint += f" To read more: remarkable_read('{docs_with_content[0]['path']}')."
 
@@ -1561,6 +1551,85 @@ async def remarkable_search(
             message=str(e),
             suggestion="Check remarkable_status() to verify your connection.",
         )
+
+
+def _archive_layout(archive: bytes, pdf: Optional[bytes], page: int) -> dict:
+    """``page_layout.page_layout`` for a downloaded document archive."""
+    from remarkable_mcp.page_layout import page_layout
+
+    page_map = _archive_page_map(archive)
+    with tempfile.TemporaryDirectory(prefix="remarkable-layout-") as tmp:
+        root = Path(tmp)
+        with zipfile.ZipFile(io.BytesIO(archive)) as zf:
+            zf.extractall(root)
+        return page_layout(root, pdf, page, page_map)
+
+
+@mcp.tool(annotations=LAYOUT_ANNOTATIONS)
+async def remarkable_page_layout(document: str, page: int = 1) -> str:
+    """
+    <usecase>Find where things are on a page: the PDF's text lines, the user's
+    handwriting, marks and free space.</usecase>
+    <instructions>
+    Returns regions on one tablet page as page fractions [left, top, right,
+    bottom], the frame remarkable_image's region uses:
+    - text_lines: the PDF's printed lines (before marks), each with its text
+    - ink: boxes around the user's handwriting on visible layers (roughly a
+      word or a line each)
+    - free: the largest empty regions, clear of ink, text and marks
+    - layers: the page's layers, bottom first
+    Pass an ink box to remarkable_image(document, page, region=...) to read
+    that writing, or place marks in free space with remarkable_mark_pdf.
+    Notebooks have ink but no text lines. Never changes the tablet.
+    </instructions>
+    <parameters>
+    - document: Document name or path
+    - page: Tablet page number (default: 1)
+    </parameters>
+    <examples>
+    - remarkable_page_layout("Week 3 worksheet", page=2)
+    </examples>
+    """
+    from remarkable_mcp.pdf_marks import MarkError
+
+    try:
+        client = await run_blocking(get_rmapi)
+        collection = await run_blocking(client.get_meta_items)
+        items_by_id = get_items_by_id(collection)
+        target_doc, error = lookup(
+            client, document, kind="document", collection=collection, items_by_id=items_by_id
+        )
+        if error:
+            return error
+        archive = await run_blocking(client.download, target_doc)
+        if _is_pdf_payload(archive):
+            return make_error(
+                error_type="layout_not_available",
+                message="This transport returned only the PDF, without the tablet's page files.",
+                suggestion="Use remarkable_image to look at the page instead.",
+            )
+        pdf = None
+        if await run_blocking(get_file_type, client, target_doc) == "pdf":
+            pdf = await run_blocking(download_raw_file, client, target_doc, "pdf")
+        layout = await run_blocking(_archive_layout, archive, pdf, page)
+    except MarkError as e:
+        return invalid_param(f"page: {e}", "Pages are numbered from 1.")
+    except Exception as e:
+        return make_error(
+            error_type="layout_failed",
+            message=f"Failed to read the page layout: {e}",
+            suggestion="Check remarkable_status() and try again.",
+        )
+    data = {
+        "document": target_doc.VissibleName,
+        "path": _apply_root_filter(get_item_path(target_doc, items_by_id)),
+        **layout,
+    }
+    hint = (
+        f"Page {page}: {len(layout['text_lines'])} text lines, {len(layout['ink'])} ink "
+        "regions. Crop to a region with remarkable_image(document, page, region=...)."
+    )
+    return make_response(data, hint)
 
 
 @mcp.tool(annotations=STATUS_ANNOTATIONS)
@@ -1965,7 +2034,7 @@ async def remarkable_image(
     output_format: str = "png",
     compatibility: bool = False,
     include_ocr: bool = False,
-    render_merged: Optional[bool] = None,
+    render_merged: bool = True,
     layers: str = "visible",
     dpi: Optional[int] = None,
     region: Optional[List[float]] = None,
@@ -2016,9 +2085,9 @@ async def remarkable_image(
     - compatibility: If True, return resource URI in JSON instead of embedded resource.
       Use this if your client doesn't support embedded resources in tool responses.
     - include_ocr: Enable OCR text extraction from the image (default: False).
-    - render_merged: PDF compositing mode for PNG: None (default) automatically
-      merges PDF-backed pages, True explicitly requests merging, and False returns
-      the annotation-only layer. SVG output remains annotation-only.
+    - render_merged: For PNG, True (default) draws PDF-backed pages over their
+      PDF page; False returns the annotation-only layer. SVG output is always
+      annotation-only.
     - layers: Which page layers to draw: "visible" (default) draws what the tablet
       shows, "all" includes hidden layers, or a layer name (e.g. "Layer 3") draws
       only that layer. remarkable_read(content_type="annotations") lists layers.
@@ -2057,58 +2126,35 @@ async def remarkable_image(
         collection = await run_blocking(client.get_meta_items)
         items_by_id = get_items_by_id(collection)
 
-        root = _get_root_path()
-        documents = [
-            item
-            for item in collection
-            if not item.is_folder and not _is_cloud_archived(item, items_by_id)
-        ]
-        target_doc = _find_target_document(collection, items_by_id, document)
-
-        if not target_doc:
-            # Find similar documents for suggestion (only within root)
-            filtered_docs = [
-                doc for doc in documents if _is_within_root(get_item_path(doc, items_by_id), root)
-            ]
-            similar = find_similar_documents(document, filtered_docs)
-            search_term = document.split()[0] if document else "notes"
-            return make_error(
-                error_type="document_not_found",
-                message=f"Document not found: '{document}'",
-                suggestion=(
-                    f"Try remarkable_browse(query='{search_term}') to search, "
-                    "or remarkable_browse('/') to list all files."
-                ),
-                did_you_mean=similar if similar else None,
-            )
+        target_doc, error = lookup(
+            client, document, kind="document", collection=collection, items_by_id=items_by_id
+        )
+        if error:
+            return error
 
         format_lower = output_format.lower()
         if format_lower not in ("png", "svg"):
-            return make_error(
-                error_type="invalid_format",
-                message=f"Invalid format: '{output_format}'. Supported formats: png, svg",
-                suggestion="Use output_format='png' for raster or 'svg' for vectors.",
+            return invalid_param(
+                f"output_format: invalid format '{output_format}'. Supported formats: png, svg",
+                "Use output_format='png' for raster or 'svg' for vectors.",
             )
 
         if (dpi is not None or region is not None) and format_lower != "png":
-            return make_error(
-                error_type="invalid_parameter",
-                message="dpi and region apply to PNG output only.",
-                suggestion="Use output_format='png' with dpi or region.",
+            return invalid_param(
+                "dpi and region apply to PNG output only.",
+                "Use output_format='png' with dpi or region.",
             )
         if dpi is not None and not (MIN_IMAGE_DPI <= dpi <= MAX_IMAGE_DPI):
-            return make_error(
-                error_type="invalid_parameter",
-                message=f"dpi must be between {MIN_IMAGE_DPI} and {MAX_IMAGE_DPI}.",
-                suggestion="Use dpi=300 to read handwriting; add region to keep images small.",
+            return invalid_param(
+                f"dpi must be between {MIN_IMAGE_DPI} and {MAX_IMAGE_DPI}.",
+                "Use dpi=300 to read handwriting; add region to keep images small.",
             )
         if region is not None:
             region_error = _image_region_error(region)
             if region_error:
-                return make_error(
-                    error_type="invalid_parameter",
-                    message=region_error,
-                    suggestion="Example: region=[0, 0.5, 1, 0.75] for the third quarter.",
+                return invalid_param(
+                    region_error,
+                    "Example: region=[0, 0.5, 1, 0.75] for the third quarter.",
                 )
 
         raw_doc = await run_blocking(client.download, target_doc)
@@ -2130,7 +2176,8 @@ async def remarkable_image(
                 file_type = await run_blocking(get_document_file_type, tmp_path)
                 if not file_type:
                     file_type = await run_blocking(get_file_type, client, target_doc)
-            use_merged = render_merged is True or (render_merged is None and file_type == "pdf")
+            # Notebooks and EPUBs have no PDF page to draw under the ink.
+            use_merged = render_merged and file_type not in ("notebook", "epub")
 
             if total_pages == 0:
                 return make_error(
@@ -2182,11 +2229,6 @@ async def remarkable_image(
                             "a native PDF instead of a document archive."
                         ),
                         suggestion="Retry with output_format='png'.",
-                    )
-                if render_merged is True:
-                    merged_note = (
-                        "render_merged is only supported with PNG format; "
-                        "returning annotation-only SVG."
                     )
 
                 svg_content = await run_blocking(
@@ -2246,7 +2288,7 @@ async def remarkable_image(
                     info = TextContent(type="text", text=info_text)
                     return [info, embedded]
             else:
-                if native_pdf is not None and render_merged is False:
+                if native_pdf is not None and not render_merged:
                     return make_error(
                         error_type="annotation_only_not_available",
                         message=(
@@ -2279,7 +2321,7 @@ async def remarkable_image(
                         page,
                         background,
                         use_merged,
-                        render_merged is not False,
+                        render_merged,
                         layer_selection,
                         dpi,
                         dpi is not None or region is not None,
@@ -2453,8 +2495,9 @@ def _select_pages(ranges: List[tuple], page_count: int) -> List[int]:
         first, last = out_of_range[0]
         label = f"{first}" if first == last else f"{first}-{last}"
         raise _ExportRequestError(
-            "invalid_page_selection",
-            f"Page selection {label} is outside the document, which has {page_count} page(s).",
+            "invalid_parameter",
+            f"pages: page selection {label} is outside the document, which has "
+            f"{page_count} page(s).",
             f"Choose pages between 1 and {page_count}.",
         )
     return sorted({page for first, last in ranges for page in range(first, last + 1)})
@@ -3032,29 +3075,28 @@ async def _remarkable_export_many(
 ):
     """remarkable_export for a folder and/or tags."""
 
-    def invalid(message: str, suggestion: str):
-        return make_error(
-            error_type="invalid_export_options", message=message, suggestion=suggestion
-        )
-
     if document is not None:
-        return invalid(
-            "Give document, or folder and/or tags, not both.",
+        return invalid_param(
+            "document: give document, or folder and/or tags, not both.",
             "Omit document to export a folder or tagged documents.",
         )
     if pages is not None:
-        return invalid("pages applies to one document only.", "Omit pages.")
+        return invalid_param("pages applies to one document only.", "Omit pages.")
     if output_format == "markdown" and pdf_mode != "merged":
-        return invalid("pdf_mode applies only to PDF exports.", "Use pdf_mode='merged'.")
+        return invalid_param("pdf_mode applies only to PDF exports.", "Use pdf_mode='merged'.")
     if output_format == "pdf" and include_ocr:
-        return invalid("include_ocr applies only to Markdown exports.", "Set include_ocr=False.")
+        return invalid_param(
+            "include_ocr applies only to Markdown exports.", "Set include_ocr=False."
+        )
     if tags is not None and (
         not isinstance(tags, list) or not tags or not all(isinstance(t, str) for t in tags)
     ):
-        return invalid("tags must be a non-empty list of tag names.", 'Example: tags=["Graded"]')
+        return invalid_param(
+            "tags must be a non-empty list of tag names.", 'Example: tags=["Graded"]'
+        )
     if save_to is None:
-        return invalid(
-            "Exporting several documents needs save_to, a folder to save them in.",
+        return invalid_param(
+            "save_to: exporting several documents needs a folder to save them in.",
             "Pass save_to as a folder inside REMARKABLE_EXPORT_DIRS.",
         )
     try:
@@ -3071,8 +3113,9 @@ async def _remarkable_export_many(
             "No documents matched; nothing was exported.",
         )
     if len(documents) > MAX_BATCH_EXPORTS:
-        return invalid(
-            f"{len(documents)} documents match; at most {MAX_BATCH_EXPORTS} are exported at once.",
+        return invalid_param(
+            f"folder/tags: {len(documents)} documents match; at most {MAX_BATCH_EXPORTS}"
+            " are exported at once.",
             "Narrow the export with a subfolder or tags.",
         )
     result = await run_blocking(
@@ -3114,9 +3157,10 @@ async def remarkable_export(
     tags: Optional[List[str]] = None,
 ):
     """
-    <usecase>Export one reMarkable document as a reusable PDF or Markdown file.</usecase>
+    <usecase>Export reMarkable documents as PDF or Markdown files: one document (or
+    some of its pages), or every document in a folder or with given tags.</usecase>
     <instructions>
-    Exports a single document without modifying the tablet or its library.
+    Exports without modifying the tablet or its library.
 
     The generated file is written to a server-managed temporary directory and
     returned as an MCP ResourceLink. The tool response stays small: it never embeds
@@ -3188,46 +3232,40 @@ async def remarkable_export(
             document, output_format, pdf_mode, include_ocr, pages, save_to, overwrite, folder, tags
         )
     if not isinstance(document, str) or not document.strip():
-        return make_error(
-            error_type="invalid_export_options",
-            message="Give document, or folder and/or tags to export several.",
-            suggestion="Example: remarkable_export('Meeting Notes').",
+        return invalid_param(
+            "document: give a document, or folder and/or tags to export several.",
+            "Example: remarkable_export('Meeting Notes').",
         )
     if output_format == "markdown" and pdf_mode != "merged":
-        return make_error(
-            error_type="invalid_export_options",
-            message="pdf_mode applies only to PDF exports.",
-            suggestion="Use pdf_mode='merged' for Markdown, or choose output_format='pdf'.",
+        return invalid_param(
+            "pdf_mode applies only to PDF exports.",
+            "Use pdf_mode='merged' for Markdown, or choose output_format='pdf'.",
         )
     if output_format == "pdf" and include_ocr:
-        return make_error(
-            error_type="invalid_export_options",
-            message="include_ocr applies only to Markdown exports.",
-            suggestion="Set include_ocr=False, or choose output_format='markdown'.",
+        return invalid_param(
+            "include_ocr applies only to Markdown exports.",
+            "Set include_ocr=False, or choose output_format='markdown'.",
         )
     page_ranges = None
     if pages is not None:
         if output_format != "pdf":
-            return make_error(
-                error_type="invalid_export_options",
-                message="pages applies only to PDF exports.",
-                suggestion="Omit pages for Markdown, or choose output_format='pdf'.",
+            return invalid_param(
+                "pages applies only to PDF exports.",
+                "Omit pages for Markdown, or choose output_format='pdf'.",
             )
         try:
             page_ranges = _parse_page_spec(pages)
         except ValueError as exc:
-            return make_error(
-                error_type="invalid_page_selection",
-                message=str(exc),
-                suggestion="Examples: pages=5, pages='5-9', pages='1,3,10-12'.",
+            return invalid_param(
+                f"pages: {exc}",
+                "Examples: pages=5, pages='5-9', pages='1,3,10-12'.",
             )
 
     save_path = None
     if overwrite and save_to is None:
-        return make_error(
-            error_type="invalid_export_options",
-            message="overwrite applies only with save_to.",
-            suggestion="Pass save_to with the path to save at, or omit overwrite.",
+        return invalid_param(
+            "overwrite applies only with save_to.",
+            "Pass save_to with the path to save at, or omit overwrite.",
         )
     if save_to is not None:
         try:
@@ -3241,23 +3279,11 @@ async def remarkable_export(
         client = await run_blocking(get_rmapi)
         collection = await run_blocking(client.get_meta_items)
         items_by_id = get_items_by_id(collection)
-        target_doc = _find_target_document(collection, items_by_id, document)
-        if target_doc is None:
-            root = _get_root_path()
-            candidates = [
-                item
-                for item in collection
-                if not item.is_folder
-                and not _is_cloud_archived(item, items_by_id)
-                and _is_within_root(get_item_path(item, items_by_id), root)
-            ]
-            similar = find_similar_documents(document, candidates)
-            return make_error(
-                error_type="document_not_found",
-                message=f"Document not found: '{document}'",
-                suggestion="Use remarkable_browse() to find the exact document name or path.",
-                did_you_mean=similar if similar else None,
-            )
+        target_doc, error = lookup(
+            client, document, kind="document", collection=collection, items_by_id=items_by_id
+        )
+        if error:
+            return error
 
         if save_path is not None and overwrite:
             await run_blocking(export_save.check_replace, save_path, target_doc.ID)

@@ -282,7 +282,7 @@ class TestExportToolContract:
             "remarkable_export",
             {"document": "Anything", **arguments},
         )
-        assert _json_result(result)["_error"]["type"] == "invalid_export_options"
+        assert _json_result(result)["_error"]["type"] == "invalid_parameter"
 
     @pytest.mark.asyncio
     async def test_document_not_found_uses_standard_educational_error(self):
@@ -516,7 +516,7 @@ class TestExportSaveTo:
     async def test_overwrite_needs_save_to(self, allowed):
         data, _ = await self._export(overwrite=True)
 
-        assert data["_error"]["type"] == "invalid_export_options"
+        assert data["_error"]["type"] == "invalid_parameter"
 
     @pytest.mark.asyncio
     async def test_without_save_to_returns_a_temporary_resource(self, allowed):
@@ -619,15 +619,15 @@ class TestExportFolderAndTags:
         "arguments, error",
         [
             ({"folder": "/Nope", "save_to": "{allowed}"}, "folder_not_found"),
-            ({"folder": "/Classes"}, "invalid_export_options"),
+            ({"folder": "/Classes"}, "invalid_parameter"),
             ({"folder": "/Classes", "save_to": "/elsewhere"}, "save_path_not_allowed"),
-            ({"folder": "/Classes", "save_to": "{allowed}", "pages": 1}, "invalid_export_options"),
+            ({"folder": "/Classes", "save_to": "{allowed}", "pages": 1}, "invalid_parameter"),
             (
                 {"document": "Other", "tags": ["x"], "save_to": "{allowed}"},
-                "invalid_export_options",
+                "invalid_parameter",
             ),
-            ({"tags": [], "save_to": "{allowed}"}, "invalid_export_options"),
-            ({}, "invalid_export_options"),
+            ({"tags": [], "save_to": "{allowed}"}, "invalid_parameter"),
+            ({}, "invalid_parameter"),
         ],
     )
     async def test_bad_requests_export_nothing(self, allowed, arguments, error):

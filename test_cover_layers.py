@@ -308,3 +308,18 @@ def test_read_lists_cover_state_from_the_archive():
     (summary,) = _mark_summaries([mark], buf.getvalue())
     assert summary["cover"] == {"layer": "Mark cover", "state": cl.HIDDEN}
     assert _mark_line(summary).endswith("[cover 'Mark cover': hidden on tablet]")
+
+
+def test_canvas_strokes_never_land_on_a_cover_layer():
+    from remarkable_mcp import strokes
+
+    data, placed = cl.edit_page(
+        _tablet_page(), AUTHOR, A4, add=[{"layer": "Mark cover", "rows": _rows(), "shown": False}]
+    )
+    # The cover's strokes are the page's last, so the layer of the last stroke
+    # is the cover layer.
+    assert rm_ink.key(_lines(data)[-1].parent_id) == placed[0]["layer"]
+
+    stroke = {"points": [[0.5, 0.5], [0.6, 0.6]], "color": "black"}
+    out = strokes.append_strokes(data, [stroke], author=AUTHOR)
+    assert rm_ink.key(_lines(out)[-1].parent_id) == rm_ink.LAYER_1

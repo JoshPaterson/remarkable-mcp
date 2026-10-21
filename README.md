@@ -422,11 +422,12 @@ Or copy the `SKILL.md` from this repository into your `~/.openclaw/skills/remark
 |------|-------------|
 | `remarkable_read` | Read and extract text from documents (with pagination and search) |
 | `remarkable_browse` | Navigate folders, search by document name, or filter by tags |
-| `remarkable_search` | Search content across multiple documents (with tag filtering) |
+| `remarkable_search` | Read several documents picked by name, folder or tags, optionally keeping only the lines matching a pattern |
 | `remarkable_recent` | Get recently modified documents |
 | `remarkable_status` | Check connection status and the per-transport capability matrix |
 | `remarkable_image` | Get PNG/SVG images of pages with optional OCR |
-| `remarkable_export` | Export one document as a temporary PDF or Markdown resource, or save it, or a whole folder or tag, into a folder allowed by `REMARKABLE_EXPORT_DIRS` |
+| `remarkable_page_layout` | A page's printed text lines, the user's ink, marks and free space as page-fraction regions (every transport, read-only mode too) |
+| `remarkable_export` | Export one document (or selected pages) as a temporary PDF or Markdown resource, or save it, or a whole folder or tag, into a folder allowed by `REMARKABLE_EXPORT_DIRS` |
 
 The read/search/render tools are read-only. `remarkable_export` never changes the
 tablet, but it writes a bounded temporary file on the MCP server host and therefore
@@ -444,8 +445,10 @@ disable them. See [Write Tools](#write-tools-by-transport). Clients that support
 - Empty notebook text can trigger OCR automatically.
 - Search can scan several matching documents.
 - Image tools return visual content that text extraction misses.
-- `remarkable_read.total_pages` is the physical document count; `content_pages`
-  counts extracted-text chunks, and `more` / `next_page` continue those chunks.
+- `remarkable_read.total_pages` is the physical document count; `parts` counts
+  extracted-text parts, and `more` / `next_part` (with `part=N`) continue them.
+  `grep` returns each match with its context and tablet page, for notebooks and
+  PDF/EPUB text alike.
   Raw PDF reads count pages from the already-downloaded PDF. If a raw EPUB's
   separate archive cannot be read, its text still returns with
   `total_pages: null` and `total_pages_known: false`.
@@ -670,17 +673,23 @@ Or set the environment variable:
 
 ### Available Write Tools
 
+Folder parameters are named `folder`. Earlier names still work but are no
+longer shown in the tool schemas: `parent` (mkdir), `dest_folder` (move),
+`parent_folder` (upload, markdown_to_pdf), and `check` (pdf_ocr, now
+`dry_run`). `defer_restart` and `remarkable_refresh` exist in SSH mode only;
+other modes leave them out of the schemas and ignore `defer_restart`.
+
 | Tool | Description |
 |------|-------------|
-| `remarkable_upload(file_path \| file_content, parent_folder, document_name, defer_restart, file_format)` | Upload a PDF or EPUB from a local path or from base64 contents (cloud, SSH, and USB web; USB web preserves the name but ignores `parent_folder`) |
-| `remarkable_markdown_to_pdf(markdown, document_name, parent_folder, defer_restart, outline)` | Render Markdown as a paginated PDF and upload it; its headings become the table of contents the tablet shows (cloud, SSH, and USB web) |
-| `remarkable_mkdir(folder_name, parent, defer_restart)` | Create a new folder (cloud and SSH) |
-| `remarkable_move(document, dest_folder, defer_restart)` | Move a document or folder, or a list of them in one write (cloud and SSH) |
+| `remarkable_upload(file_path \| file_content, folder, document_name, defer_restart, file_format)` | Upload a PDF or EPUB from a local path or from base64 contents (cloud, SSH, and USB web; USB web preserves the name but ignores `folder`) |
+| `remarkable_markdown_to_pdf(markdown, document_name, folder, defer_restart, outline)` | Render Markdown as a paginated PDF and upload it; its headings become the table of contents the tablet shows (cloud, SSH, and USB web) |
+| `remarkable_mkdir(folder_name, folder, defer_restart)` | Create a new folder (cloud and SSH) |
+| `remarkable_move(document, folder, defer_restart)` | Move a document or folder, or a list of them in one write (cloud and SSH) |
 | `remarkable_rename(document, new_name, renames, defer_restart)` | Rename a document or folder, or several with `renames={old: new}` in one write (cloud and SSH) |
 | `remarkable_tag(document, add, remove, rename, page, defer_restart)` | Add, rename or remove document tags, or a page's tags with `page`; `document` may be a list, changed together in one write (cloud and SSH) |
-| `remarkable_mark_pdf(document, add, remove, clear, color, dry_run, layout)` | Add or remove marks (text, shapes, highlights, freeform paths, LaTeX equations, and SVG, PDF, PNG or JPEG graphics) on a PDF's pages, e.g. to grade a worksheet or annotate a paper; `dry_run` previews, `layout` returns text and ink positions (**cloud only**) |
+| `remarkable_mark_pdf(document, add, remove, clear, color, dry_run, layout_page)` | Add or remove marks (text, shapes, highlights, freeform paths, LaTeX equations, and SVG, PDF, PNG or JPEG graphics) on a PDF's pages, e.g. to grade a worksheet or annotate a paper; `dry_run` previews, `layout_page` returns text and ink positions (the old name `layout` still works). Placement, cover and erasable rules are in the `remarkable://help/marks` resource (**cloud only**) |
 | `remarkable_pdf_outline(document, outline, dry_run)` | List, set or remove a PDF's outline, the table of contents the tablet shows, e.g. chapters for a book without one (**cloud only**) |
-| `remarkable_pdf_ocr(document, folder, tags, check)` | Write OCR text into a PDF's scanned pages so they can be read, searched and highlighted; `check=True` lists which PDFs need it (**cloud only**) |
+| `remarkable_pdf_ocr(document, folder, tags, dry_run)` | Write OCR text into a PDF's scanned pages so they can be read, searched and highlighted; `dry_run=True` lists which PDFs need it (**cloud only**) |
 | `remarkable_pdf_pages(document, insert, dry_run)` | Insert blank, Markdown or PDF-file pages anywhere in a PDF; ink, marks, outline and OCR text stay on their pages (**cloud only**) |
 | `remarkable_delete(document, defer_restart, permanent)` | Move a document/folder (or a list, with one confirmation) to Trash; SSH can permanently remove it with `permanent=True` |
 | `remarkable_refresh()` | Safely restart `xochitl` once to apply pending writes made with `defer_restart=True`; no-op after this process has confirmed a clean state — **SSH only** |
@@ -690,13 +699,14 @@ Or set the environment variable:
 
 - **Upload registers in cloud, SSH, and USB web mode** — local-directory mode never exposes write tools.
 - **Tag changes are written the way the tablet writes them** — tags live only in a document's `.content` file, so `remarkable_tag` rewrites it in the tablet's own JSON layout and key order, changes nothing but the tag lists (checked before upload), and updates only `lastModified` in `.metadata`, as the desktop app does. A request that changes nothing writes nothing. A list of documents is checked in full before anything is written, so one unknown name changes nothing; the changes then go out in one cloud commit, or over SSH with one restart. Like the desktop app, a tag change replaces the tablet's tag list: tag edits made on the tablet while offline and not yet synced are lost.
-- **Marks are drawn into the PDF.** The tablet never changes a document's PDF and keeps the user's ink in separate files, so `remarkable_mark_pdf` replaces the PDF (and `lastModified` in `.metadata`) with a copy of the same page count and page sizes, refusing any change that would move the ink. Each mark is rendered once, when it is added, into a small PDF stored with it, so it looks the same however often the PDF is rebuilt. The marked PDF carries the original PDF and the mark list as embedded attachments; every change places the remaining marks on the original, so a removed mark leaves nothing behind and `clear=True` restores the original bytes. Marks cannot be erased on the tablet, only hidden with a cover (below). LaTeX is rendered on the server with [ziamath](https://github.com/cdelker/ziamath) (math only, no TeX install needed). Positions are page fractions: points `[x, y]` and regions `[left, top, right, bottom]`, the same regions `remarkable_image` takes and `remarkable_read` returns. Graphics rendered elsewhere are passed inline (SVG markup, or base64 up to 2 MB) or as a `graphic_file` path (up to 10 MB), and must parse as SVG, a one-page PDF, PNG or JPEG; SVG may only reference its own elements or `data:` URIs, so no local file can be pulled into an uploaded PDF. Named colors are the tablet's pen colors (black, gray, white, blue, red, green, yellow, cyan, magenta) as the Paper Pro's screen shows them (pure colors it draws without dithering) and, for highlights, its highlighter colors (yellow, blue, pink, orange, green, gray) from the tablet's PDF export; highlights use the Darken blend like the tablet's highlighter, so text under them stays dark. Named colors are tuned for the tablet's screen, where they match its own pens and highlighters; `remarkable_export` PDFs re-draw named-color marks in the desktop and browser apps' colors and leave out the embedded original and mark list. Marks are black by default, and highlights yellow.
+- **Marks are drawn into the PDF.** The tablet never changes a document's PDF and keeps the user's ink in separate files, so `remarkable_mark_pdf` replaces the PDF (and `lastModified` in `.metadata`) with a copy of the same page count and page sizes, refusing any change that would move the ink. Each mark is rendered once, when it is added, into a small PDF stored with it, so it looks the same however often the PDF is rebuilt. The marked PDF carries the original PDF and the mark list as embedded attachments; every change places the remaining marks on the original, so a removed mark leaves nothing behind and `clear=True` restores the original bytes. Marks drawn into the PDF cannot be erased on the tablet; covers hide them there, and erasable marks and text highlights are tablet ink the user can erase (below). LaTeX is rendered on the server with [ziamath](https://github.com/cdelker/ziamath) (math only, no TeX install needed). Positions are page fractions: points `[x, y]` and regions `[left, top, right, bottom]`, the same regions `remarkable_image` takes and `remarkable_read` returns. Graphics rendered elsewhere are passed inline (SVG markup, or base64 up to 2 MB) or as a `graphic_file` path (up to 10 MB), and must parse as SVG, a one-page PDF, PNG or JPEG; SVG may only reference its own elements or `data:` URIs, so no local file can be pulled into an uploaded PDF. Named colors are the tablet's pen colors (black, gray, white, blue, red, green, yellow, cyan, magenta) as the Paper Pro's screen shows them (pure colors it draws without dithering) and, for highlights, its highlighter colors (yellow, blue, pink, orange, green, gray) from the tablet's PDF export; highlights use the Darken blend like the tablet's highlighter, so text under them stays dark. Named colors are tuned for the tablet's screen, where they match its own pens and highlighters; `remarkable_export` PDFs re-draw named-color marks in the desktop and browser apps' colors and leave out the embedded original and mark list. Marks are black by default, and highlights yellow.
 - **Pages are inserted as real PDF pages.** `remarkable_pdf_pages` adds pages to the PDF and to the document's page list in one commit, in either page-list format the tablet uses: formatVersion 1 (`pages` and `redirectionPageMap`) or 2 (`cPages`, where new entries sort between their neighbours and changed entries carry the MCP's own author id). Later PDF pages move down, and marks, outline entries and OCR records move with them; ink is stored per page id, so it stays on its page. Verified on a Paper Pro in both formats.
 - **OCR text is written into the PDF.** `remarkable_pdf_ocr` OCRs every scanned page that has no text (Google Vision when `GOOGLE_VISION_API_KEY` is set, else Tesseract) and writes the words over the image as invisible text, as OCRmyPDF does, so the page looks the same but its text can be read, searched and highlighted on the tablet. Pages that already have text are never changed, and a PDF is only written once all its scanned pages are done: a long book is OCR'd over several calls, each about 40 seconds, with progress kept in `~/.remarkable/ocr-work`. The page count and sizes stay the same, so ink stays in place, and marks and outlines are kept.
 - **Outlines are stored with the marks.** `remarkable_pdf_outline` replaces the PDF's table of contents the same way marks are added: the page count and page sizes stay the same, so the ink stays in place, and the tablet shows the new table of contents after its next sync. Marks and outline are rebuilt together, so changing one keeps the other, and `outline="original"` restores the PDF's own. Entries use tablet page numbers; pages added on the tablet are not in the PDF and cannot be targets.
 - **Erasable marks are ink.** With `"erasable": true`, text, shape and path marks are rendered as usual and written as pen strokes (highlights as highlighter strokes) into the page's ink under the MCP's own author id, instead of into the PDF. The user can erase, move and recolor them on the tablet, and their named colors match on the tablet and in the desktop and browser apps. Text uses EMS Readability, a single-stroke font bundled under the SIL Open Font License (`remarkable_mcp/fonts`); bold is a thicker line. Filled paths, opacity, LaTeX and graphics cannot be erasable.
-- **Text highlights are the tablet's own.** A `text_highlight` mark is written into the page's ink as the tablet's highlighter writes it (one item per line, with the tablet's text offsets and rectangles, calibrated on a Paper Pro), under the MCP's own author id. The user can erase it on the tablet, and listings show whether it is still there; removing the mark deletes it. It goes on the page's selected layer, or on a named layer (made on top if needed) so the user can hide all of the agent's highlights at once. `layout` lists the page's layers.
+- **Text highlights are the tablet's own.** A `text_highlight` mark is written into the page's ink as the tablet's highlighter writes it (one item per line, with the tablet's text offsets and rectangles, calibrated on a Paper Pro), under the MCP's own author id. The user can erase it on the tablet, and listings show whether it is still there; removing the mark deletes it. It goes on the page's selected layer, or on a named layer (made on top if needed) so the user can hide all of the agent's highlights at once. `layout_page` (or `remarkable_page_layout`) lists the page's layers.
 - **Covers let the user hide marks on the tablet.** A mark added with `"cover": true` also gets white ink over it on a "Mark cover" layer at the bottom of its page, made hidden: showing the layer hides the mark, and the user's ink on the layers above stays visible. A layer name instead of `true` makes a separate group, and `"covered": true` makes a new layer shown. This is the only ink the MCP writes: it uses its own author id (stored in `~/.remarkable/mcp-author`) so it never collides with the tablet's ink, writes the PDF and the ink in one commit, and removes a cover by deleting its strokes the way the tablet does. On a page without ink it creates Layer 1 too, selected, so the user's writing never lands on the cover. Listings and `remarkable_read` give each covered mark's state (hidden on tablet, shown on tablet, or cover erased on tablet). See [native-ink notes](docs/native-ink.md).
+- **One document or a list take the same path.** Move, rename and delete run a single document as a batch of one, so a single reply has the same fields in cloud and SSH mode: both name the `transport`, and SSH replies add `refresh_pending`. A one-document cloud change is one metadata commit, like a batch.
 - **mkdir, move, rename, tag, delete register in cloud and SSH modes only** — they are not exposed on USB web (the tablet's USB web firmware has no folder/move/rename/delete endpoints), keeping the tool list scoped to what the active transport actually supports.
 - **Delete prompts for confirmation when possible** — if the client supports MCP elicitation, `remarkable_delete` asks the user to confirm before deleting. MCP SDK 2.x carries that prompt as a multi-round input request for `2026-07-28` clients and as push elicitation for legacy clients. If the client can't show a prompt, the delete is **refused** (not performed) unless `REMARKABLE_SKIP_CONFIRM=1` is set — so write-on-by-default can't silently delete from clients that lack elicitation. Cloud and SSH move items to Trash by default. SSH also supports `permanent=True` for an explicitly requested permanent removal; cloud permanent deletion remains a Trash-management operation in the app/tablet. Set `REMARKABLE_SKIP_CONFIRM=1` to allow deletes without a prompt in automated setups. All write tools carry `ToolAnnotations(read_only_hint=False)` (and `destructive_hint=True` for delete) so an agent harness can gate writes at the MCP layer.
 - **SSH work is fair and serialized per server** — one FIFO dispatcher owns every SSH subprocess, so startup scans, reads, uploads, mutations, and refresh probes cannot churn the tablet's USB CDC connection concurrently. Cached metadata reads bypass the queue.
@@ -714,20 +724,20 @@ Or set the environment variable:
 
 ```python
 # Upload a PDF
-remarkable_upload("paper.pdf", parent_folder="/Research")
+remarkable_upload("paper.pdf", folder="/Research")
 
 # Upload base64 contents when the file isn't on the server's machine
-remarkable_upload(file_content=pdf_base64, document_name="Week 3", parent_folder="/Course")
+remarkable_upload(file_content=pdf_base64, document_name="Week 3", folder="/Course")
 
 # Render Markdown and upload the PDF without creating a local file
 remarkable_markdown_to_pdf(
     "# Meeting Notes\n\n- Follow up with Sam",
     document_name="Meeting Notes",
-    parent_folder="/Research",
+    folder="/Research",
 )
 
 # Create a folder
-remarkable_mkdir("2024 Archive", parent="/Archive")
+remarkable_mkdir("2024 Archive", folder="/Archive")
 
 # Move a document
 remarkable_move("Meeting Notes", "/Archive/2024 Archive")
@@ -741,7 +751,7 @@ remarkable_tag("Week 3 worksheet", rename={"to-grade": "graded"})
 remarkable_tag(["Week 3 worksheet", "Week 4 worksheet"], add="graded")
 
 # Grade a worksheet: find where to place marks, preview, then write
-remarkable_mark_pdf("Week 3 worksheet", layout=1)
+remarkable_mark_pdf("Week 3 worksheet", layout_page=1)
 remarkable_mark_pdf("Week 3 worksheet", color="red", add=[
     {"page": 1, "id": "score", "text": "3/4", "at": [0.8, 0.06], "size": 24, "bold": True},
     {"page": 1, "id": "q1", "shape": "check", "at": [0.38, 0.20], "color": "green"},
@@ -780,8 +790,8 @@ remarkable_delete("Disposable Test", permanent=True)
 
 # Bulk import (SSH): defer the restart on each write, then refresh once.
 # One xochitl restart for the whole batch instead of one per upload.
-remarkable_upload("a.pdf", parent_folder="/Research", defer_restart=True)
-remarkable_upload("b.pdf", parent_folder="/Research", defer_restart=True)
+remarkable_upload("a.pdf", folder="/Research", defer_restart=True)
+remarkable_upload("b.pdf", folder="/Research", defer_restart=True)
 remarkable_refresh()
 
 # Author native ink and notebooks (SSH only)
@@ -859,7 +869,9 @@ Limit the MCP server to a specific folder on your reMarkable. All operations wil
 With this configuration:
 - `remarkable_browse("/")` shows contents of `/Work`
 - `remarkable_browse("/Projects")` shows `/Work/Projects`
-- Documents outside `/Work` are not accessible
+- Documents outside `/Work` are not accessible, to read and write tools alike
+- Write tools take root-relative paths too: `remarkable_move("/Notes", "/Archive")`
+  moves `/Work/Notes` to `/Work/Archive`, and `/` as a destination is `/Work`
 
 Useful for:
 - Focusing on work documents during office hours

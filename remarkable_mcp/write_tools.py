@@ -39,15 +39,17 @@ from typing import Annotated, Any, Dict, List, Optional, Union
 from mcp.server.mcpserver import Context, Elicit, ElicitationResult, Resolve
 from mcp.types import ToolAnnotations
 from pydantic import BaseModel, Field
+from pydantic.json_schema import SkipJsonSchema
 
 from remarkable_mcp.api import (
-    get_item_path,
     get_items_by_id,
     get_rmapi,
 )
 from remarkable_mcp.capabilities import client_supports_elicitation
+from remarkable_mcp.lookup import display_path, lookup_folder, scoped_items
+from remarkable_mcp.lookup import lookup as lookup_item
 from remarkable_mcp.pages import content_page_ids, tablet_page
-from remarkable_mcp.responses import make_error, make_response
+from remarkable_mcp.responses import invalid_param, make_error, make_response, resolve_alias
 from remarkable_mcp.ssh import XOCHITL_PATH, Document, SSHClient
 from remarkable_mcp.ssh_reliability import (
     SSHExecutionUnknownError,
@@ -930,81 +932,10 @@ def _add_upload_source(response: str, fields: dict) -> str:
     return json.dumps(data, indent=2)
 
 
-def _resolve_parent_id(parent_path: str, items_by_id: dict, collection: list) -> Optional[str]:
-    """Resolve a folder path to its UUID.
-
-    Args:
-        parent_path: Path like "/" or "/Folder/Subfolder"
-        items_by_id: Dict mapping item IDs to items
-        collection: Full list of items
-
-    Returns:
-        The UUID of the folder, "" for root, or None if not found
-    """
-    if not parent_path or parent_path == "/":
-        return ""
-
-    from remarkable_mcp.tools import _is_cloud_archived
-
-    # Normalize
-    parent_path = parent_path.strip("/")
-
-    for item in collection:
-        # Never write into a trashed folder.
-        if not item.is_folder or _is_cloud_archived(item, items_by_id):
-            continue
-        item_path = get_item_path(item, items_by_id).strip("/")
-        if item_path.lower() == parent_path.lower():
-            return item.ID
-
-    return None
-
-
-def _resolve_document(
-    name_or_path: str, collection: list, items_by_id: dict, folders_only: bool = False
-) -> Optional[object]:
-    """Find a document or folder by name or path.
-
-    Args:
-        name_or_path: Document name or full path
-        collection: Full list of items
-        items_by_id: Dict mapping item IDs to items
-        folders_only: If True, only match folders
-
-    Live items win. A trashed item is only matched by its explicit
-    ``/trash/...`` path (e.g. to permanently delete it over SSH), never by a
-    bare name that a live item could also carry.
-
-    Returns:
-        The matching item, or None
-    """
-    from remarkable_mcp.tools import _is_cloud_archived
-
-    target = name_or_path.lower().strip("/")
-
-    trashed = []
-    for item in collection:
-        if folders_only and not item.is_folder:
-            continue
-        if _is_cloud_archived(item, items_by_id):
-            trashed.append(item)
-            continue
-        # Match by name
-        if item.VissibleName.lower() == target:
-            return item
-        # Match by path
-        item_path = get_item_path(item, items_by_id).strip("/")
-        if item_path.lower() == target:
-            return item
-
-    # Trashed items need the explicit absolute path, not "trash/...".
-    if not name_or_path.lower().startswith("/trash/"):
-        return None
-    for item in trashed:
-        if get_item_path(item, items_by_id).strip("/").lower() == target:
-            return item
-
-    return None
+def lookup(client, document: str, **options):
+    """``lookup.lookup`` for write tools: an explicit ``/trash/...`` path (no
+    root set) also reaches a trashed item, e.g. to delete it permanently."""
+    return lookup_item(client, document, include_trash=True, **options)
 
 
 def _invalidate_client_cache(client) -> None:
@@ -1090,13 +1021,9 @@ def _cloud_mkdir(folder_name: str, parent: str) -> str:
     client = get_rmapi()
     collection = client.get_meta_items()
     items_by_id = get_items_by_id(collection)
-    parent_id = _resolve_parent_id(parent, items_by_id, collection)
-    if parent_id is None:
-        return make_error(
-            error_type="folder_not_found",
-            message=f"Parent folder not found: '{parent}'",
-            suggestion="Use remarkable_browse('/') to see available folders.",
-        )
+    parent_id, error = lookup_folder(parent, collection, items_by_id, param="folder")
+    if error:
+        return error
     doc = client.create_folder(folder_name, parent_id)
     _invalidate_client_cache(client)
     return make_response(
@@ -1108,97 +1035,6 @@ def _cloud_mkdir(folder_name: str, parent: str) -> str:
             "transport": "cloud",
         },
         "Folder created in the reMarkable cloud. Use remarkable_browse() to verify.",
-    )
-
-
-def _cloud_move(document: str, dest_folder: str) -> str:
-    """Move a document or folder to another folder in the cloud."""
-    client = get_rmapi()
-    collection = client.get_meta_items()
-    items_by_id = get_items_by_id(collection)
-
-    target = _resolve_document(document, collection, items_by_id)
-    if not target:
-        from remarkable_mcp.extract import find_similar_documents
-
-        similar = find_similar_documents(document, collection)
-        return make_error(
-            error_type="document_not_found",
-            message=f"Document not found: '{document}'",
-            suggestion="Use remarkable_browse() to find the correct name.",
-            did_you_mean=similar if similar else None,
-        )
-
-    dest_id = _resolve_parent_id(dest_folder, items_by_id, collection)
-    if dest_id is None:
-        return make_error(
-            error_type="folder_not_found",
-            message=f"Destination folder not found: '{dest_folder}'",
-            suggestion="Use remarkable_browse('/') to see available folders.",
-        )
-
-    # Prevent moving a folder into itself or one of its descendants
-    if target.is_folder:
-        if dest_id == target.ID:
-            return make_error(
-                error_type="invalid_move",
-                message="Cannot move a folder into itself",
-                suggestion="Choose a different destination folder.",
-            )
-        check_id = dest_id
-        while check_id and check_id in items_by_id:
-            if check_id == target.ID:
-                return make_error(
-                    error_type="invalid_move",
-                    message="Cannot move a folder into one of its subfolders",
-                    suggestion="Choose a destination that is not inside the folder being moved.",
-                )
-            check_id = getattr(items_by_id[check_id], "Parent", "")
-
-    old_path = get_item_path(target, items_by_id)
-    client.move(target.ID, dest_id)
-    _invalidate_client_cache(client)
-    return make_response(
-        {
-            "moved": True,
-            "name": target.VissibleName,
-            "from": old_path,
-            "to": dest_folder,
-            "transport": "cloud",
-        },
-        "Document moved in the reMarkable cloud. Use remarkable_browse() to verify.",
-    )
-
-
-def _cloud_rename(document: str, new_name: str) -> str:
-    """Rename a document or folder in the cloud."""
-    client = get_rmapi()
-    collection = client.get_meta_items()
-    items_by_id = get_items_by_id(collection)
-
-    target = _resolve_document(document, collection, items_by_id)
-    if not target:
-        from remarkable_mcp.extract import find_similar_documents
-
-        similar = find_similar_documents(document, collection)
-        return make_error(
-            error_type="document_not_found",
-            message=f"Document not found: '{document}'",
-            suggestion="Use remarkable_browse() to find the correct name.",
-            did_you_mean=similar if similar else None,
-        )
-
-    old_name = target.VissibleName
-    client.rename(target.ID, new_name)
-    _invalidate_client_cache(client)
-    return make_response(
-        {
-            "renamed": True,
-            "old_name": old_name,
-            "new_name": new_name,
-            "transport": "cloud",
-        },
-        "Document renamed in the reMarkable cloud. Use remarkable_browse() to verify.",
     )
 
 
@@ -1507,60 +1343,12 @@ def _mark_preview_images(client, files: list, pdf: bytes, pages: list) -> list:
 
 
 def _mark_layout(client, files: list, pdf: bytes, page: int, page_map: list) -> dict:
-    """The original PDF's text lines, the user's ink and the free space on a
-    tablet page."""
-    from remarkable_mcp.extract import page_ink_regions
-    from remarkable_mcp.pdf_marks import (
-        MarkError,
-        free_regions,
-        original_pdf,
-        stored_marks,
-        text_lines,
-    )
+    """``page_layout.page_layout`` for a cloud document's index ``files``."""
+    from remarkable_mcp.page_layout import page_layout
+    from remarkable_mcp.pdf_marks import original_pdf
 
-    if not 1 <= page <= len(page_map):
-        raise MarkError(f"Page {page} does not exist; the document has {len(page_map)}.")
-    pdf_page = page_map[page - 1]
-    base = original_pdf(pdf)
-    with _document_dir(client, files, base) as root:
-        ink = page_ink_regions(root, page)
-    lines = text_lines(base, pdf_page) if pdf_page is not None else []
-    marks = [m["box"] for m in stored_marks(pdf) if m.get("pdf_page") == pdf_page]
-    return {
-        "page": page,
-        "text_lines": lines,
-        "ink": ink,
-        "free": free_regions(ink + [line["region"] for line in lines] + marks),
-        "layers": _page_layer_list(client, files, page),
-    }
-
-
-def _page_layer_list(client, files: list, page: int) -> list:
-    """A tablet page's layers, bottom first: ``{"name", "visible",
-    "selected"}``; empty when the page has no ink yet (Layer 1 is made with
-    the first ink)."""
-    from remarkable_mcp import rm_ink
-    from remarkable_mcp.pages import content_page_ids
-
-    content_file = next((f for f in files if f["id"].endswith(".content")), None)
-    if content_file is None:
-        return []
-    content = json.loads(client._get_file(content_file["hash"], content_file["id"]))
-    page_ids = content_page_ids(content)
-    if not 1 <= page <= len(page_ids):
-        return []
-    rm = next((f for f in files if f["id"].endswith(f"/{page_ids[page - 1]}.rm")), None)
-    if rm is None:
-        return []
-    data = client._get_file(rm["hash"], rm["id"])
-    layers = rm_ink.page_layers(data)
-    selected = rm_ink.selected_layer(data)
-    if selected is None and layers:
-        selected = layers[0]["id"]
-    return [
-        {"name": layer["name"], "visible": layer["visible"], "selected": layer["id"] == selected}
-        for layer in layers
-    ]
+    with _document_dir(client, files, original_pdf(pdf)) as root:
+        return page_layout(root, pdf, page, page_map)
 
 
 def _mark_response(target, result: dict, dry_run: bool) -> str:
@@ -1618,48 +1406,36 @@ def _ocr_check(client, collection, items_by_id, document, folder, tags) -> str:
     from remarkable_mcp.pdf_marks import original_pdf
 
     if document is not None:
-        target = _resolve_document(document, collection, items_by_id)
-        if not target or target.is_folder:
-            return make_error(
-                error_type="document_not_found",
-                message=f"PDF document not found: '{document}'",
-                suggestion="Use remarkable_browse() to find the correct name.",
-            )
+        target, error = lookup(
+            client, document, kind="pdf", collection=collection, items_by_id=items_by_id
+        )
+        if error:
+            return error
         targets = [target]
     else:
-        base_id = ""
-        if folder not in (None, "", "/"):
-            base = _resolve_document(folder, collection, items_by_id, folders_only=True)
-            if base is None:
-                return make_error(
-                    error_type="folder_not_found",
-                    message=f"Folder not found: '{folder}'",
-                    suggestion="Use remarkable_browse('/') to see the folders.",
-                )
-            base_id = base.ID
+        base_id, error = lookup_folder(folder or "/", collection, items_by_id, param="folder")
+        if error:
+            return error
         wanted = {t.lower() for t in tags or []}
 
         def under(item) -> bool:
             parent = getattr(item, "Parent", "")
             while parent:
-                if parent == base_id or parent == "trash":
-                    return parent == base_id
+                if parent == base_id:
+                    return True
                 parent = getattr(items_by_id.get(parent), "Parent", "")
             return not base_id
 
         targets = [
             item
-            for item in collection
-            if not item.is_folder
-            and getattr(item, "Parent", "") != "trash"
-            and under(item)
+            for item in scoped_items(collection, items_by_id, "document")
+            if under(item)
             and (not wanted or wanted & {t.lower() for t in getattr(item, "tags", None) or []})
         ]
     if len(targets) > MAX_OCR_CHECKS:
-        return make_error(
-            error_type="invalid_parameter",
-            message=f"{len(targets)} documents match; at most {MAX_OCR_CHECKS} are checked.",
-            suggestion="Narrow the check with a subfolder or tags.",
+        return invalid_param(
+            f"folder/tags: {len(targets)} documents match; at most {MAX_OCR_CHECKS} are checked.",
+            "Narrow the check with a subfolder or tags.",
         )
     needing, checked = [], 0
     for item in targets:
@@ -1673,7 +1449,7 @@ def _ocr_check(client, collection, items_by_id, document, folder, tags) -> str:
         if found["scanned"] or found["rotated"]:
             entry = {
                 "document": item.VissibleName,
-                "path": get_item_path(item, items_by_id),
+                "path": display_path(item, items_by_id),
                 "pages_needing_ocr": _tablet_pages(found["scanned"], page_map),
                 "pages": len(page_map),
             }
@@ -1980,39 +1756,6 @@ def _outline_response(target, result: dict, dry_run: bool) -> str:
     return make_response(data, hint)
 
 
-def _cloud_delete(document: str) -> str:
-    """Move a document or folder to the cloud trash (recoverable on-device)."""
-    client = get_rmapi()
-    collection = client.get_meta_items()
-    items_by_id = get_items_by_id(collection)
-
-    target = _resolve_document(document, collection, items_by_id)
-    if not target:
-        from remarkable_mcp.extract import find_similar_documents
-
-        similar = find_similar_documents(document, collection)
-        return make_error(
-            error_type="document_not_found",
-            message=f"Document not found: '{document}'",
-            suggestion="Use remarkable_browse() to find the correct name.",
-            did_you_mean=similar if similar else None,
-        )
-
-    doc_path = get_item_path(target, items_by_id)
-    client.delete(target.ID)
-    _invalidate_client_cache(client)
-    return make_response(
-        {
-            "deleted": True,
-            "name": target.VissibleName,
-            "path": doc_path,
-            "type": "folder" if target.is_folder else "document",
-            "transport": "cloud",
-        },
-        "Moved to the trash on your reMarkable (recoverable from the device's Trash).",
-    )
-
-
 def _describe_documents(document) -> str:
     """``'Name'``, or ``3 items ('A', 'B', 'C')`` for a list."""
     if isinstance(document, str):
@@ -2024,18 +1767,16 @@ def _describe_documents(document) -> str:
 
 
 def _invalid_document_list() -> str:
-    return make_error(
-        error_type="invalid_parameter",
-        message="document must be a name or a non-empty list of names.",
-        suggestion='Example: document=["Week 1 worksheet", "Week 2 worksheet"]',
+    return invalid_param(
+        "document must be a name or a non-empty list of names.",
+        'Example: document=["Week 1 worksheet", "Week 2 worksheet"]',
     )
 
 
 def _invalid_rename() -> str:
-    return make_error(
-        error_type="invalid_parameter",
-        message="Give document and new_name, or renames (not both).",
-        suggestion='Example: renames={"Week 1": "Week 1 - graded"}',
+    return invalid_param(
+        "renames: give document and new_name, or renames (not both).",
+        'Example: renames={"Week 1": "Week 1 - graded"}',
     )
 
 
@@ -2072,17 +1813,15 @@ def _resolve_targets(names: List[str], collection, items_by_id) -> tuple:
     naming the first that cannot be found; nothing has been changed then."""
     targets: list = []
     for name in names:
-        target = _resolve_document(name, collection, items_by_id)
-        if not target:
-            from remarkable_mcp.extract import find_similar_documents
-
-            similar = find_similar_documents(name, collection)
-            return None, make_error(
-                error_type="document_not_found",
-                message=f"Document not found: '{name}'",
-                suggestion="Use remarkable_browse() to find the correct name. Nothing was changed.",
-                did_you_mean=similar if similar else None,
-            )
+        target, error = lookup(
+            None,
+            name,
+            collection=collection,
+            items_by_id=items_by_id,
+            note="Nothing was changed.",
+        )
+        if error:
+            return None, error
         if all(t.ID != target.ID for t in targets):
             targets.append(target)
     return targets, None
@@ -2131,50 +1870,75 @@ def _trash_metadata(metadata: dict) -> None:
         metadata["version"] = 1
 
 
-def _move_many(client, names: List[str], dest_folder: str, cloud: bool, defer_restart: bool):
-    """Move several documents or folders into one folder in one write."""
+def _write_reply(data: dict, cloud: bool, restarted: bool, done: str, verify: str = "") -> str:
+    """A move, rename or delete success reply. Every reply names its
+    ``transport``; SSH replies add ``refresh_pending``."""
+    verify = verify or "Use remarkable_browse() to verify."
+    if cloud:
+        return make_response(dict(data, transport="cloud"), f"{done} {verify}")
+    return make_response(
+        dict(data, transport="ssh", refresh_pending=not restarted),
+        _write_result_message(restarted, done, verify),
+    )
+
+
+def _update_metadata(client, cloud: bool, changes: list, defer_restart: bool) -> bool:
+    """Apply ``[(target, apply)]`` to each target's metadata in one write;
+    returns whether xochitl restarted (always True in cloud mode)."""
+    if cloud:
+        client.update_documents_metadata({target.ID: apply for target, apply in changes})
+        _invalidate_client_cache(client)
+        return True
+    return _ssh_update_metadata(client, changes, defer_restart)
+
+
+def _move_many(
+    client,
+    names: List[str],
+    dest_folder: str,
+    cloud: bool,
+    defer_restart: bool,
+    single: bool = False,
+):
+    """Move documents or folders into one folder in one write. ``single``
+    gives the one-document reply shape."""
     collection = client.get_meta_items()
     items_by_id = get_items_by_id(collection)
     targets, error = _resolve_targets(names, collection, items_by_id)
     if error:
         return error
-    dest_id = _resolve_parent_id(dest_folder, items_by_id, collection)
-    if dest_id is None:
-        return make_error(
-            error_type="folder_not_found",
-            message=f"Destination folder not found: '{dest_folder}'",
-            suggestion="Use remarkable_browse('/') to see available folders. Nothing was changed.",
-        )
+    dest_id, error = lookup_folder(
+        dest_folder, collection, items_by_id, param="folder", note="Nothing was changed."
+    )
+    if error:
+        return error
     for target in targets:
         error = _move_cycle_error(target, dest_id, items_by_id)
         if error:
             return error
-    moved = [{"name": t.VissibleName, "from": get_item_path(t, items_by_id)} for t in targets]
+    moved = [{"name": t.VissibleName, "from": display_path(t, items_by_id)} for t in targets]
 
     def apply(metadata: dict) -> None:
         metadata["parent"] = dest_id
 
+    restarted = _update_metadata(client, cloud, [(t, apply) for t in targets], defer_restart)
+    if not cloud:
+        for target in targets:
+            target.parent = dest_id
+            target.last_modified = datetime.now()
+            _update_deferred_ssh_cache(client, restarted, document=target)
+    if single:
+        data = {"moved": True, **moved[0], "to": dest_folder}
+        return _write_reply(data, cloud, restarted, "Document moved.")
     data = {"moved": moved, "to": dest_folder, "count": len(targets)}
-    if cloud:
-        client.update_documents_metadata({t.ID: apply for t in targets})
-        _invalidate_client_cache(client)
-        return make_response(
-            dict(data, transport="cloud"),
-            f"Moved {len(targets)} items in the reMarkable cloud in one change.",
-        )
-    restarted = _ssh_update_metadata(client, [(t, apply) for t in targets], defer_restart)
-    for target in targets:
-        target.parent = dest_id
-        target.last_modified = datetime.now()
-        _update_deferred_ssh_cache(client, restarted, document=target)
-    return make_response(
-        dict(data, refresh_pending=not restarted),
-        _write_result_message(restarted, f"Moved {len(targets)} items."),
-    )
+    return _write_reply(data, cloud, restarted, f"Moved {len(targets)} items in one change.")
 
 
-def _rename_many(client, renames: Dict[str, str], cloud: bool, defer_restart: bool):
-    """Rename several documents or folders in one write."""
+def _rename_many(
+    client, renames: Dict[str, str], cloud: bool, defer_restart: bool, single: bool = False
+):
+    """Rename documents or folders in one write. ``single`` gives the
+    one-document reply shape."""
     collection = client.get_meta_items()
     items_by_id = get_items_by_id(collection)
     targets, error = _resolve_targets(list(renames), collection, items_by_id)
@@ -2182,12 +1946,11 @@ def _rename_many(client, renames: Dict[str, str], cloud: bool, defer_restart: bo
         return error
     new_names: dict = {}
     for name, new_name in renames.items():
-        target = _resolve_document(name, collection, items_by_id)
+        target, _ = lookup(client, name, collection=collection, items_by_id=items_by_id)
         if target.ID in new_names and new_names[target.ID] != new_name:
-            return make_error(
-                error_type="invalid_parameter",
-                message=f"'{target.VissibleName}' is given two new names.",
-                suggestion="Give each document one new name. Nothing was changed.",
+            return invalid_param(
+                f"renames: '{target.VissibleName}' is given two new names.",
+                "Give each document one new name. Nothing was changed.",
             )
         new_names[target.ID] = new_name
     renamed = [{"old_name": t.VissibleName, "new_name": new_names[t.ID]} for t in targets]
@@ -2198,28 +1961,30 @@ def _rename_many(client, renames: Dict[str, str], cloud: bool, defer_restart: bo
 
         return apply
 
+    changes = [(t, apply_for(t)) for t in targets]
+    restarted = _update_metadata(client, cloud, changes, defer_restart)
+    if not cloud:
+        for target in targets:
+            target.name = new_names[target.ID]
+            target.last_modified = datetime.now()
+            _update_deferred_ssh_cache(client, restarted, document=target)
+    if single:
+        return _write_reply({"renamed": True, **renamed[0]}, cloud, restarted, "Document renamed.")
     data = {"renamed": renamed, "count": len(targets)}
-    if cloud:
-        client.update_documents_metadata({t.ID: apply_for(t) for t in targets})
-        _invalidate_client_cache(client)
-        return make_response(
-            dict(data, transport="cloud"),
-            f"Renamed {len(targets)} items in the reMarkable cloud in one change.",
-        )
-    restarted = _ssh_update_metadata(client, [(t, apply_for(t)) for t in targets], defer_restart)
-    for target in targets:
-        target.name = new_names[target.ID]
-        target.last_modified = datetime.now()
-        _update_deferred_ssh_cache(client, restarted, document=target)
-    return make_response(
-        dict(data, refresh_pending=not restarted),
-        _write_result_message(restarted, f"Renamed {len(targets)} items."),
-    )
+    return _write_reply(data, cloud, restarted, f"Renamed {len(targets)} items in one change.")
 
 
-def _delete_many(client, names: List[str], cloud: bool, permanent: bool, defer_restart: bool):
-    """Move several documents or folders to the trash (or, over SSH with
-    ``permanent``, remove them) in one write."""
+def _delete_many(
+    client,
+    names: List[str],
+    cloud: bool,
+    permanent: bool,
+    defer_restart: bool,
+    single: bool = False,
+):
+    """Move documents or folders to the trash (or, over SSH with
+    ``permanent``, remove them) in one write. ``single`` gives the
+    one-document reply shape."""
     collection = client.get_meta_items()
     items_by_id = get_items_by_id(collection)
     targets, error = _resolve_targets(names, collection, items_by_id)
@@ -2228,20 +1993,11 @@ def _delete_many(client, names: List[str], cloud: bool, permanent: bool, defer_r
     deleted = [
         {
             "name": t.VissibleName,
-            "path": get_item_path(t, items_by_id),
+            "path": display_path(t, items_by_id),
             "type": "folder" if t.is_folder else "document",
         }
         for t in targets
     ]
-    data = {"deleted": deleted, "count": len(targets)}
-    if cloud:
-        client.update_documents_metadata({t.ID: _trash_metadata for t in targets})
-        _invalidate_client_cache(client)
-        return make_response(
-            dict(data, transport="cloud"),
-            f"Moved {len(targets)} items to the trash on your reMarkable "
-            "(recoverable from the device's Trash).",
-        )
     if permanent:
         for target in targets:
             if target.is_folder and any(item.Parent == target.ID for item in collection):
@@ -2257,17 +2013,96 @@ def _delete_many(client, names: List[str], cloud: bool, permanent: bool, defer_r
             _permanently_delete_ssh_entry(client, target.ID)
         restarted = _maybe_restart_xochitl(client, defer_restart)
     else:
-        restarted = _ssh_update_metadata(
-            client, [(t, _trash_metadata) for t in targets], defer_restart
-        )
-    for target in targets:
-        _update_deferred_ssh_cache(client, restarted, remove_id=target.ID)
-        _clear_document_extraction_cache(target.ID)
-    done = "permanently deleted" if permanent else "moved to Trash"
-    return make_response(
-        dict(data, permanent=permanent, refresh_pending=not restarted),
-        _write_result_message(restarted, f"{len(targets)} items {done}."),
+        changes = [(t, _trash_metadata) for t in targets]
+        restarted = _update_metadata(client, cloud, changes, defer_restart)
+    if not cloud:
+        for target in targets:
+            _update_deferred_ssh_cache(client, restarted, remove_id=target.ID)
+            _clear_document_extraction_cache(target.ID)
+    where = "permanently deleted" if permanent else "moved to Trash"
+    verify = (
+        "It will no longer appear in the active library."
+        if permanent
+        else "It stays recoverable from the device's Trash."
     )
+    if single:
+        data = {"deleted": True, **deleted[0], "permanent": permanent}
+        return _write_reply(data, cloud, restarted, f"Document {where}.", verify)
+    data = {"deleted": deleted, "count": len(targets), "permanent": permanent}
+    return _write_reply(data, cloud, restarted, f"{len(targets)} items {where}.", verify)
+
+
+def _permanent_delete_error() -> Optional[str]:
+    """The error for ``permanent=True`` in cloud mode, else None."""
+    if not _is_cloud_mode():
+        return None
+    return make_error(
+        error_type="permanent_delete_unsupported",
+        message="Permanent deletion is not supported in cloud mode.",
+        suggestion=(
+            "Delete normally to move the item to Trash, then empty "
+            "Trash from a reMarkable app or tablet."
+        ),
+    )
+
+
+async def _dispatch(operation: str, impl, defer_restart: bool = False):
+    """Run ``impl`` in a worker thread; over SSH through the SSH operation
+    queue, which serializes writes and shares one xochitl refresh."""
+    if _is_ssh_mode():
+        ssh_client = _get_ssh_client()
+        if isinstance(ssh_client, SSHClient):
+            return await _run_ssh_tool_operation(
+                ssh_client, operation, impl, defer_restart=defer_restart
+            )
+    return await asyncio.to_thread(impl)
+
+
+def _replace_pdf(client, doc_id: str, edit, **options) -> dict:
+    """``client.replace_document_pdf`` that drops the cached library when the
+    document changed."""
+    result = client.replace_document_pdf(doc_id, edit, **options)
+    if result.get("changed", True):
+        _invalidate_client_cache(client)
+    return result
+
+
+async def _cloud_pdf_call(
+    document: Optional[str],
+    run,
+    *,
+    failed: str,
+    failure: str,
+    invalid_errors: tuple,
+    invalid_hint: str,
+):
+    """Run ``run(client, target)`` in a worker thread for a cloud-only PDF
+    tool, with ``target`` the PDF named ``document`` (None when no document
+    is given). ``invalid_errors`` become ``invalid_parameter`` errors; other
+    failures become a ``failed`` error reading ``failure: <reason>``."""
+
+    def _impl():
+        error = _require_managed_write_mode()
+        if error:
+            return error
+        client = get_rmapi()
+        try:
+            target = None
+            if document is not None:
+                target, error = lookup(client, document, kind="pdf")
+                if error:
+                    return error
+            return run(client, target)
+        except invalid_errors as e:
+            return invalid_param(str(e), invalid_hint)
+        except Exception as e:
+            return make_error(
+                error_type=failed,
+                message=f"{failure}: {e}",
+                suggestion="Check that the document is a PDF and try again.",
+            )
+
+    return await asyncio.to_thread(_impl)
 
 
 class _DeleteConfirmation(BaseModel):
@@ -2387,17 +2222,11 @@ def _author_draw(
     ssh_client = _get_ssh_client()
     collection = ssh_client.get_meta_items()
     items_by_id = get_items_by_id(collection)
-    target = _resolve_document(document, collection, items_by_id)
-    if not target:
-        from remarkable_mcp.extract import find_similar_documents
-
-        similar = find_similar_documents(document, collection)
-        return make_error(
-            error_type="document_not_found",
-            message=f"Document not found: '{document}'",
-            suggestion="Use remarkable_browse() to find the correct name.",
-            did_you_mean=similar or None,
-        )
+    target, error = lookup(
+        ssh_client, document, kind="document", collection=collection, items_by_id=items_by_id
+    )
+    if error:
+        return error
 
     doc_uuid = target.ID
     content_raw = _read_remote_bytes(ssh_client, f"{XOCHITL_PATH}/{doc_uuid}.content")
@@ -2501,17 +2330,11 @@ def _author_add_page(document: str, defer_restart: bool = False) -> str:
     ssh_client = _get_ssh_client()
     collection = ssh_client.get_meta_items()
     items_by_id = get_items_by_id(collection)
-    target = _resolve_document(document, collection, items_by_id)
-    if not target:
-        from remarkable_mcp.extract import find_similar_documents
-
-        similar = find_similar_documents(document, collection)
-        return make_error(
-            error_type="document_not_found",
-            message=f"Document not found: '{document}'",
-            suggestion="Use remarkable_browse() to find the correct name.",
-            did_you_mean=similar or None,
-        )
+    target, error = lookup(
+        ssh_client, document, kind="document", collection=collection, items_by_id=items_by_id
+    )
+    if error:
+        return error
 
     doc_uuid = target.ID
     content_raw = _read_remote_bytes(ssh_client, f"{XOCHITL_PATH}/{doc_uuid}.content")
@@ -2595,15 +2418,9 @@ def _author_create_document(
     ssh_client = _get_ssh_client()
     collection = ssh_client.get_meta_items()
     items_by_id = get_items_by_id(collection)
-    parent_id = _resolve_parent_id(folder or "/", items_by_id, collection)
-    if parent_id is None:
-        folders = [get_item_path(i, items_by_id) for i in collection if i.is_folder]
-        return make_error(
-            error_type="folder_not_found",
-            message=f"Folder not found: '{folder}'",
-            suggestion="Use remarkable_browse('/') to see available folders.",
-            did_you_mean=folders[:5] if folders else None,
-        )
+    parent_id, error = lookup_folder(folder or "/", collection, items_by_id, param="folder")
+    if error:
+        return error
 
     doc_uuid = nb.new_uuid()
     page_id = nb.new_uuid()
@@ -2763,15 +2580,7 @@ def register_write_tools():
                 return _author_create_document(name, text, folder, defer_restart)
             raise AssertionError(f"Validated author method is unsupported: {method}")
 
-        ssh_client = _get_ssh_client()
-        if isinstance(ssh_client, SSHClient):
-            return await _run_ssh_tool_operation(
-                ssh_client,
-                f"author-{method}",
-                _impl,
-                defer_restart=defer_restart,
-            )
-        return await asyncio.to_thread(_impl)
+        return await _dispatch(f"author-{method}", _impl, defer_restart)
 
     # Native ink/notebook authoring is SSH-only today (cloud/USB-web write-back
     # is not implemented yet), so only expose the tool in SSH mode rather than
@@ -2815,15 +2624,11 @@ def register_write_tools():
                     client = get_rmapi()
                     collection = client.get_meta_items()
                     items_by_id = get_items_by_id(collection)
-                    parent_id = _resolve_parent_id(parent_folder, items_by_id, collection)
-                    if parent_id is None:
-                        folders = [get_item_path(i, items_by_id) for i in collection if i.is_folder]
-                        return make_error(
-                            error_type="folder_not_found",
-                            message=f"Folder not found: '{parent_folder}'",
-                            suggestion="Use remarkable_browse('/') to see available folders.",
-                            did_you_mean=folders[:5] if folders else None,
-                        )
+                    parent_id, error = lookup_folder(
+                        parent_folder, collection, items_by_id, param="folder"
+                    )
+                    if error:
+                        return error
 
                     name = document_name or os.path.splitext(os.path.basename(file_path))[0]
                     with open(file_path, "rb") as f:
@@ -2860,7 +2665,7 @@ def register_write_tools():
                     }
                     if parent_folder != "/":
                         result["note"] = (
-                            "USB web ignores parent_folder. The tablet web "
+                            "USB web ignores folder. The tablet web "
                             "service chooses the destination folder. Use SSH or "
                             "cloud mode for explicit folder placement."
                         )
@@ -2876,15 +2681,11 @@ def register_write_tools():
                 items_by_id = get_items_by_id(collection)
 
                 # Resolve parent folder
-                parent_id = _resolve_parent_id(parent_folder, items_by_id, collection)
-                if parent_id is None:
-                    folders = [get_item_path(i, items_by_id) for i in collection if i.is_folder]
-                    return make_error(
-                        error_type="folder_not_found",
-                        message=f"Folder not found: '{parent_folder}'",
-                        suggestion="Use remarkable_browse('/') to see available folders.",
-                        did_you_mean=folders[:5] if folders else None,
-                    )
+                parent_id, error = lookup_folder(
+                    parent_folder, collection, items_by_id, param="folder"
+                )
+                if error:
+                    return error
 
                 # Generate UUID and set name
                 doc_uuid = str(uuid.uuid4())
@@ -2965,30 +2766,22 @@ def register_write_tools():
                     suggestion=f"Check {transport} connection and try again.",
                 )
 
-        if _is_ssh_mode():
-            ssh_client = _get_ssh_client()
-            if isinstance(ssh_client, SSHClient):
-                return await _run_ssh_tool_operation(
-                    ssh_client,
-                    "upload",
-                    _impl,
-                    defer_restart=defer_restart,
-                )
-        if _is_usb_web_mode():
+        if _is_usb_web_mode() and not _is_ssh_mode():
             usb_client = get_rmapi()
             run_operation = getattr(type(usb_client), "run_operation_async", None)
             if callable(run_operation):
                 return await run_operation(usb_client, "upload", _impl)
-        return await asyncio.to_thread(_impl)
+        return await _dispatch("upload", _impl, defer_restart)
 
     async def _upload_tool(
         file_path: Optional[str] = None,
-        parent_folder: str = "/",
+        folder: str = "/",
         document_name: Optional[str] = None,
         defer_restart: bool = False,
         file_content: Optional[str] = None,
         file_format: str = "pdf",
         trash_source_after_upload: bool = False,
+        parent_folder: Optional[str] = None,
     ) -> str:
         """
         <usecase>Upload a PDF or EPUB file to the reMarkable tablet.</usecase>
@@ -3003,10 +2796,10 @@ def register_write_tools():
           file_path for anything larger. Requires document_name.
 
         Works in all three transports:
-        - Cloud: uploaded via the sync protocol; supports parent_folder + document_name
-        - SSH: transferred over SSH, metadata created; supports parent_folder + document_name
+        - Cloud: uploaded via the sync protocol; supports folder + document_name
+        - SSH: transferred over SSH, metadata created; supports folder + document_name
         - USB web: uploaded via POST /upload. The multipart filename carries
-          document_name, parent_folder is ignored, and the tablet web service
+          document_name, folder is ignored, and the tablet web service
           chooses the destination folder.
 
         The result also reports source ("path" or "content") and size_bytes.
@@ -3015,7 +2808,7 @@ def register_write_tools():
         </instructions>
         <parameters>
         - file_path: Absolute path to the local PDF or EPUB file
-        - parent_folder: Destination folder path on tablet (default: root "/").
+        - folder: Destination folder path on tablet (default: root "/").
           Honored in cloud and SSH modes; ignored by the USB web interface.
         - document_name: Display name on tablet (default: filename without
           extension). Required with file_content. Honored in every mode; USB web
@@ -3034,10 +2827,10 @@ def register_write_tools():
         </parameters>
         <examples>
         - remarkable_upload("/tmp/paper.pdf")
-        - remarkable_upload("/tmp/book.epub", parent_folder="/Books")
+        - remarkable_upload("/tmp/book.epub", folder="/Books")
         - remarkable_upload("/tmp/report.pdf", document_name="Q4 Report")
         - remarkable_upload(file_content="JVBERi0xLjQK...", document_name="Notes",
-          parent_folder="/Course")
+          folder="/Course")
         - # batch import: defer every upload, refresh once at the end
           remarkable_upload("/tmp/a.pdf", defer_restart=True)
           remarkable_upload("/tmp/b.pdf", defer_restart=True)
@@ -3046,13 +2839,13 @@ def register_write_tools():
         """
         import tempfile
 
-        def invalid(message: str, suggestion: str) -> str:
-            return make_error(
-                error_type="invalid_parameter", message=message, suggestion=suggestion
-            )
-
+        parent_folder, error = resolve_alias(
+            folder, parent_folder, "folder", "parent_folder", default="/"
+        )
+        if error:
+            return error
         if (file_path is None) == (file_content is None):
-            return invalid(
+            return invalid_param(
                 "Give exactly one of file_path or file_content.",
                 "Use file_path for a file on this machine, or file_content for "
                 "base64-encoded bytes (up to the inline size limit).",
@@ -3060,25 +2853,25 @@ def register_write_tools():
 
         if file_content is not None:
             if trash_source_after_upload:
-                return invalid(
+                return invalid_param(
                     "trash_source_after_upload applies only to file_path uploads.",
                     "Omit trash_source_after_upload when using file_content.",
                 )
             if not document_name or not document_name.strip():
-                return invalid(
+                return invalid_param(
                     "document_name is required with file_content.",
                     "Pass the display name the document should have on the tablet.",
                 )
             fmt = (file_format or "").strip().lower()
             if fmt not in UPLOAD_FORMATS:
-                return invalid(
+                return invalid_param(
                     f"Unsupported file_format: '{file_format}'",
                     "Use file_format='pdf' or file_format='epub'.",
                 )
             try:
                 data = _decode_inline_file(file_content, fmt)
             except ValueError as e:
-                return invalid(
+                return invalid_param(
                     str(e),
                     "Send the whole file base64-encoded, or use file_path for large files.",
                 )
@@ -3098,7 +2891,7 @@ def register_write_tools():
                 source = _staged_source(file_path)
                 uploaded_sha256 = await asyncio.to_thread(_file_sha256, source)
             except (ValueError, OSError) as e:
-                return invalid(
+                return invalid_param(
                     str(e),
                     "Upload without trash_source_after_upload, or put the file directly "
                     "in the staging folder.",
@@ -3125,21 +2918,23 @@ def register_write_tools():
 
         async def remarkable_upload(
             file_path: Optional[str] = None,
-            parent_folder: str = "/",
+            folder: str = "/",
             document_name: Optional[str] = None,
             defer_restart: bool = False,
             file_content: Optional[str] = None,
             file_format: str = "pdf",
             trash_source_after_upload: bool = False,
+            parent_folder: SkipJsonSchema[Optional[str]] = None,
         ) -> str:
             return await _upload_tool(
                 file_path,
-                parent_folder,
+                folder,
                 document_name,
                 defer_restart,
                 file_content,
                 file_format,
                 trash_source_after_upload,
+                parent_folder,
             )
 
         # Docstrings may or may not keep their indentation (Python 3.13 strips
@@ -3167,14 +2962,21 @@ def register_write_tools():
 
         async def remarkable_upload(
             file_path: Optional[str] = None,
-            parent_folder: str = "/",
+            folder: str = "/",
             document_name: Optional[str] = None,
             defer_restart: bool = False,
             file_content: Optional[str] = None,
             file_format: str = "pdf",
+            parent_folder: SkipJsonSchema[Optional[str]] = None,
         ) -> str:
             return await _upload_tool(
-                file_path, parent_folder, document_name, defer_restart, file_content, file_format
+                file_path,
+                folder,
+                document_name,
+                defer_restart,
+                file_content,
+                file_format,
+                parent_folder=parent_folder,
             )
 
         remarkable_upload.__doc__ = upload_doc
@@ -3186,9 +2988,10 @@ def register_write_tools():
     async def remarkable_markdown_to_pdf(
         markdown: str,
         document_name: str = "Markdown",
-        parent_folder: str = "/",
+        folder: str = "/",
         defer_restart: bool = False,
         outline: bool = True,
+        parent_folder: SkipJsonSchema[Optional[str]] = None,
     ) -> str:
         """
         <usecase>Render Markdown text as a PDF and upload it to the reMarkable tablet.</usecase>
@@ -3201,17 +3004,17 @@ def register_write_tools():
         headings become the PDF's table of contents, which the tablet shows.
 
         Works in all three transports:
-        - Cloud: sync upload with parent_folder and document_name
-        - SSH: filesystem upload with parent_folder and document_name
+        - Cloud: sync upload with folder and document_name
+        - SSH: filesystem upload with folder and document_name
         - USB web: upload whose multipart filename is document_name + ".pdf";
-          parent_folder is ignored and the tablet web service chooses the folder.
+          folder is ignored and the tablet web service chooses the folder.
 
         Requires write mode (the default; disabled with --read-only).
         </instructions>
         <parameters>
         - markdown: Markdown source text. Must not be empty.
         - document_name: Display name on the tablet (default: "Markdown").
-        - parent_folder: Destination folder (default: root "/"). USB web ignores
+        - folder: Destination folder (default: root "/"). USB web ignores
           this parameter because its upload endpoint has no folder argument.
         - defer_restart: SSH only. When True, skip the xochitl restart and call
           remarkable_refresh() once after the batch. Forwarded exactly like
@@ -3223,7 +3026,7 @@ def register_write_tools():
         - remarkable_markdown_to_pdf(
             "# Q4 Report\\n\\nRevenue increased **20%**.",
             document_name="Q4 Report",
-            parent_folder="/Reports",
+            folder="/Reports",
           )
         - remarkable_markdown_to_pdf(
             "# Batch item", document_name="Item 1", defer_restart=True
@@ -3233,6 +3036,11 @@ def register_write_tools():
         """
         from remarkable_mcp.markdown_pdf import render_markdown_pdf
 
+        parent_folder, error = resolve_alias(
+            folder, parent_folder, "folder", "parent_folder", default="/"
+        )
+        if error:
+            return error
         try:
             pdf_bytes = await asyncio.to_thread(render_markdown_pdf, markdown, outline)
         except Exception as e:
@@ -3255,8 +3063,9 @@ def register_write_tools():
         @mcp.tool(annotations=MKDIR_ANNOTATIONS)
         async def remarkable_mkdir(
             folder_name: str,
-            parent: str = "/",
+            folder: str = "/",
             defer_restart: bool = False,
+            parent: SkipJsonSchema[Optional[str]] = None,
         ) -> str:
             """
             <usecase>Create a new folder on the reMarkable tablet.</usecase>
@@ -3270,16 +3079,20 @@ def register_write_tools():
             </instructions>
             <parameters>
             - folder_name: Name of the new folder
-            - parent: Parent folder path (default: root "/")
+            - folder: Folder to create it in (default: root "/")
             - defer_restart: SSH only. Skip the xochitl restart so a batch of
               writes can refresh once via remarkable_refresh() instead of once
               per write. Sets "refresh_pending": true. Ignored in cloud mode.
             </parameters>
             <examples>
             - remarkable_mkdir("Projects")
-            - remarkable_mkdir("2024", parent="/Archive")
+            - remarkable_mkdir("2024", folder="/Archive")
             </examples>
             """
+
+            parent, error = resolve_alias(folder, parent, "folder", "parent", default="/")
+            if error:
+                return error
 
             def _impl() -> str:
                 error = _require_managed_write_mode()
@@ -3295,13 +3108,11 @@ def register_write_tools():
                     items_by_id = get_items_by_id(collection)
 
                     # Resolve parent
-                    parent_id = _resolve_parent_id(parent, items_by_id, collection)
-                    if parent_id is None:
-                        return make_error(
-                            error_type="folder_not_found",
-                            message=f"Parent folder not found: '{parent}'",
-                            suggestion="Use remarkable_browse('/') to see available folders.",
-                        )
+                    parent_id, error = lookup_folder(
+                        parent, collection, items_by_id, param="folder"
+                    )
+                    if error:
+                        return error
 
                     # Generate UUID
                     doc_uuid = str(uuid.uuid4())
@@ -3343,6 +3154,7 @@ def register_write_tools():
                             "folder_name": folder_name,
                             "uuid": doc_uuid,
                             "parent": parent,
+                            "transport": "ssh",
                             "refresh_pending": not restarted,
                         },
                         _write_result_message(restarted, "Folder created."),
@@ -3357,22 +3169,14 @@ def register_write_tools():
                         suggestion="Check SSH connection and try again.",
                     )
 
-            if _is_ssh_mode():
-                ssh_client = _get_ssh_client()
-                if isinstance(ssh_client, SSHClient):
-                    return await _run_ssh_tool_operation(
-                        ssh_client,
-                        "mkdir",
-                        _impl,
-                        defer_restart=defer_restart,
-                    )
-            return await asyncio.to_thread(_impl)
+            return await _dispatch("mkdir", _impl, defer_restart)
 
         @mcp.tool(annotations=MOVE_ANNOTATIONS)
         async def remarkable_move(
             document: Union[str, List[str]],
-            dest_folder: str,
+            folder: Optional[str] = None,
             defer_restart: bool = False,
+            dest_folder: SkipJsonSchema[Optional[str]] = None,
         ) -> str:
             """
             <usecase>Move a document or folder to a different location.</usecase>
@@ -3387,7 +3191,7 @@ def register_write_tools():
             </instructions>
             <parameters>
             - document: Name or path of the document/folder to move, or a list
-            - dest_folder: Destination folder path (use "/" for root)
+            - folder: Destination folder path, required (use "/" for root)
             - defer_restart: SSH only. Skip the xochitl restart so a batch of
               writes can refresh once via remarkable_refresh() instead of once
               per write. Sets "refresh_pending": true. Ignored in cloud mode.
@@ -3401,121 +3205,29 @@ def register_write_tools():
             names = _document_names(document)
             if names is None:
                 return _invalid_document_list()
+            dest_folder, error = resolve_alias(folder, dest_folder, "folder", "dest_folder")
+            if error:
+                return error
+            if not isinstance(dest_folder, str):
+                return invalid_param(
+                    "folder: give the destination folder.",
+                    'Example: remarkable_move("Notes", folder="/Archive"); "/" is the root.',
+                )
 
             def _impl() -> str:
                 error = _require_managed_write_mode()
                 if error:
                     return error
 
-                if not isinstance(document, str):
-                    return _run_batch(
-                        "move",
-                        lambda client, cloud: _move_many(
-                            client, names, dest_folder, cloud, defer_restart
-                        ),
-                    )
-                if _is_cloud_mode():
-                    return _cloud_move(document, dest_folder)
+                single = isinstance(document, str)
+                return _run_batch(
+                    "move",
+                    lambda client, cloud: _move_many(
+                        client, names, dest_folder, cloud, defer_restart, single=single
+                    ),
+                )
 
-                try:
-                    ssh_client = _get_ssh_client()
-                    collection = ssh_client.get_meta_items()
-                    items_by_id = get_items_by_id(collection)
-
-                    # Find the document
-                    target = _resolve_document(document, collection, items_by_id)
-                    if not target:
-                        from remarkable_mcp.extract import find_similar_documents
-
-                        similar = find_similar_documents(document, collection)
-                        return make_error(
-                            error_type="document_not_found",
-                            message=f"Document not found: '{document}'",
-                            suggestion="Use remarkable_browse() to find the correct name.",
-                            did_you_mean=similar if similar else None,
-                        )
-
-                    # Find the destination folder
-                    dest_id = _resolve_parent_id(dest_folder, items_by_id, collection)
-                    if dest_id is None:
-                        return make_error(
-                            error_type="folder_not_found",
-                            message=f"Destination folder not found: '{dest_folder}'",
-                            suggestion="Use remarkable_browse('/') to see available folders.",
-                        )
-
-                    # Prevent moving a folder into itself or a descendant
-                    if target.is_folder:
-                        if dest_id == target.ID:
-                            return make_error(
-                                error_type="invalid_move",
-                                message="Cannot move a folder into itself",
-                                suggestion="Choose a different destination folder.",
-                            )
-                        # Walk up from dest to check for cycles
-                        check_id = dest_id
-                        while check_id and check_id in items_by_id:
-                            if check_id == target.ID:
-                                return make_error(
-                                    error_type="invalid_move",
-                                    message="Cannot move a folder into one of its subfolders",
-                                    suggestion=(
-                                        "Choose a destination that is not inside the folder "
-                                        "being moved."
-                                    ),
-                                )
-                            parent_item = items_by_id[check_id]
-                            check_id = parent_item.Parent if hasattr(parent_item, "Parent") else ""
-
-                    # Read existing metadata
-                    meta_content = ssh_client._scp_download(f"{XOCHITL_PATH}/{target.ID}.metadata")
-                    metadata = json.loads(meta_content.decode("utf-8"))
-
-                    old_path = get_item_path(target, items_by_id)
-
-                    # Update parent
-                    metadata["parent"] = dest_id
-                    metadata["lastModified"] = str(int(time.time() * 1000))
-                    metadata["metadatamodified"] = True
-                    _write_metadata(ssh_client, target.ID, metadata)
-
-                    # Restart xochitl (unless deferred for a batch)
-                    restarted = _maybe_restart_xochitl(ssh_client, defer_restart)
-
-                    target.parent = dest_id
-                    target.last_modified = datetime.now()
-                    _update_deferred_ssh_cache(ssh_client, restarted, document=target)
-
-                    return make_response(
-                        {
-                            "moved": True,
-                            "name": target.VissibleName,
-                            "from": old_path,
-                            "to": dest_folder,
-                            "refresh_pending": not restarted,
-                        },
-                        _write_result_message(restarted, "Document moved."),
-                    )
-
-                except SSHReliabilityError:
-                    raise
-                except Exception as e:
-                    return make_error(
-                        error_type="move_failed",
-                        message=f"Failed to move document: {e}",
-                        suggestion="Check SSH connection and try again.",
-                    )
-
-            if _is_ssh_mode():
-                ssh_client = _get_ssh_client()
-                if isinstance(ssh_client, SSHClient):
-                    return await _run_ssh_tool_operation(
-                        ssh_client,
-                        "move",
-                        _impl,
-                        defer_restart=defer_restart,
-                    )
-            return await asyncio.to_thread(_impl)
+            return await _dispatch("move", _impl, defer_restart)
 
         @mcp.tool(annotations=RENAME_ANNOTATIONS)
         async def remarkable_rename(
@@ -3568,80 +3280,15 @@ def register_write_tools():
                 if error:
                     return error
 
-                if renames is not None:
-                    return _run_batch(
-                        "rename",
-                        lambda client, cloud: _rename_many(client, renames, cloud, defer_restart),
-                    )
-                if _is_cloud_mode():
-                    return _cloud_rename(document, new_name)
+                batch = renames if renames is not None else {document: new_name}
+                return _run_batch(
+                    "rename",
+                    lambda client, cloud: _rename_many(
+                        client, batch, cloud, defer_restart, single=renames is None
+                    ),
+                )
 
-                try:
-                    ssh_client = _get_ssh_client()
-                    collection = ssh_client.get_meta_items()
-                    items_by_id = get_items_by_id(collection)
-
-                    # Find the document
-                    target = _resolve_document(document, collection, items_by_id)
-                    if not target:
-                        from remarkable_mcp.extract import find_similar_documents
-
-                        similar = find_similar_documents(document, collection)
-                        return make_error(
-                            error_type="document_not_found",
-                            message=f"Document not found: '{document}'",
-                            suggestion="Use remarkable_browse() to find the correct name.",
-                            did_you_mean=similar if similar else None,
-                        )
-
-                    # Read existing metadata
-                    meta_content = ssh_client._scp_download(f"{XOCHITL_PATH}/{target.ID}.metadata")
-                    metadata = json.loads(meta_content.decode("utf-8"))
-
-                    old_name = metadata.get("visibleName", target.VissibleName)
-
-                    # Update name
-                    metadata["visibleName"] = new_name
-                    metadata["lastModified"] = str(int(time.time() * 1000))
-                    metadata["metadatamodified"] = True
-                    _write_metadata(ssh_client, target.ID, metadata)
-
-                    # Restart xochitl (unless deferred for a batch)
-                    restarted = _maybe_restart_xochitl(ssh_client, defer_restart)
-
-                    target.name = new_name
-                    target.last_modified = datetime.now()
-                    _update_deferred_ssh_cache(ssh_client, restarted, document=target)
-
-                    return make_response(
-                        {
-                            "renamed": True,
-                            "old_name": old_name,
-                            "new_name": new_name,
-                            "refresh_pending": not restarted,
-                        },
-                        _write_result_message(restarted, "Document renamed."),
-                    )
-
-                except SSHReliabilityError:
-                    raise
-                except Exception as e:
-                    return make_error(
-                        error_type="rename_failed",
-                        message=f"Failed to rename document: {e}",
-                        suggestion="Check SSH connection and try again.",
-                    )
-
-            if _is_ssh_mode():
-                ssh_client = _get_ssh_client()
-                if isinstance(ssh_client, SSHClient):
-                    return await _run_ssh_tool_operation(
-                        ssh_client,
-                        "rename",
-                        _impl,
-                        defer_restart=defer_restart,
-                    )
-            return await asyncio.to_thread(_impl)
+            return await _dispatch("rename", _impl, defer_restart)
 
         @mcp.tool(annotations=WRITE_ANNOTATIONS)
         async def remarkable_tag(
@@ -3696,15 +3343,10 @@ def register_write_tools():
             """
             from remarkable_mcp.tag_edit import TagEditError
 
-            def invalid(message: str, suggestion: str) -> str:
-                return make_error(
-                    error_type="invalid_parameter", message=message, suggestion=suggestion
-                )
-
             if page is not None and page < 1:
-                return invalid("page must be 1 or more.", "Pages are numbered from 1.")
+                return invalid_param("page must be 1 or more.", "Pages are numbered from 1.")
             if rename is not None and not isinstance(rename, dict):
-                return invalid(
+                return invalid_param(
                     "rename must map current names to new names.",
                     'Example: rename={"to-grade": "graded"}',
                 )
@@ -3712,7 +3354,7 @@ def register_write_tools():
             single = isinstance(document, str)
             names = [document] if single else list(document or [])
             if not names or not all(isinstance(n, str) and n for n in names):
-                return invalid(
+                return invalid_param(
                     "document must be a name or a list of names.",
                     'Example: document=["Week 3 worksheet", "Week 4 worksheet"]',
                 )
@@ -3729,26 +3371,16 @@ def register_write_tools():
                     items_by_id = get_items_by_id(collection)
                     targets = []
                     for name in names:
-                        target = _resolve_document(name, collection, items_by_id)
-                        if not target:
-                            from remarkable_mcp.extract import find_similar_documents
-
-                            similar = find_similar_documents(name, collection)
-                            return make_error(
-                                error_type="document_not_found",
-                                message=f"Document not found: '{name}'",
-                                suggestion=(
-                                    "Use remarkable_browse() to find the correct name. "
-                                    "No tags were changed."
-                                ),
-                                did_you_mean=similar if similar else None,
-                            )
-                        if target.is_folder:
-                            return invalid(
-                                f"'{target.VissibleName}' is a folder; only documents have tags.",
-                                "Tag the documents inside the folder instead. "
-                                "No tags were changed.",
-                            )
+                        target, error = lookup(
+                            client,
+                            name,
+                            kind="document",
+                            collection=collection,
+                            items_by_id=items_by_id,
+                            note="No tags were changed.",
+                        )
+                        if error:
+                            return error
                         if all(t.ID != target.ID for t in targets):
                             targets.append(target)
                     apply = _tag_editor(
@@ -3776,7 +3408,7 @@ def register_write_tools():
                         )
                     return _tags_response(targets, page, results, "ssh", refresh_pending=pending)
                 except TagEditError as e:
-                    return invalid(str(e), "Check the tag names and page number.")
+                    return invalid_param(str(e), "Check the tag names and page number.")
                 except SSHReliabilityError:
                     raise
                 except Exception as e:
@@ -3786,18 +3418,12 @@ def register_write_tools():
                         suggestion="Check the connection and try again.",
                     )
 
-            if _is_ssh_mode():
-                ssh_client = _get_ssh_client()
-                if isinstance(ssh_client, SSHClient):
-                    return await _run_ssh_tool_operation(
-                        ssh_client,
-                        "tag",
-                        _impl,
-                        defer_restart=defer_restart,
-                    )
-            return await asyncio.to_thread(_impl)
+            return await _dispatch("tag", _impl, defer_restart)
 
         if _is_cloud_mode():
+            from remarkable_mcp.help import register_marks_help
+
+            register_marks_help(mcp)
 
             @mcp.tool(annotations=WRITE_ANNOTATIONS)
             async def remarkable_mark_pdf(
@@ -3807,7 +3433,8 @@ def register_write_tools():
                 clear: bool = False,
                 color: Optional[str] = None,
                 dry_run: bool = False,
-                layout: Optional[int] = None,
+                layout_page: Optional[int] = None,
+                layout: SkipJsonSchema[Optional[int]] = None,
             ):
                 """
                 <usecase>Add or remove marks on the pages of a PDF document: text,
@@ -3818,120 +3445,60 @@ def register_write_tools():
                 Marks are drawn into the document's PDF, under the user's ink,
                 which is not changed. Each mark has an id; removing a mark
                 rebuilds the PDF without it, so outdated marks can be replaced
-                cleanly. With no changes requested it lists the current marks.
-                Marks cannot be erased on the tablet, only with this tool (or
-                hidden there, with a cover; see below).
+                cleanly. With no changes requested it lists the current marks
+                (remarkable_read lists them too).
 
                 Positions are fractions of the page (0-1 from the top-left): a
                 point is [x, y] and a region is [left, top, right, bottom], the
-                same regions remarkable_image takes and layout, remarkable_read
-                and this tool's listing return, so they can be passed straight
-                back. Sizes and widths are in points. Before marking a
-                page, call with layout=<page> for the positions of the PDF's text
-                lines and of the user's ink on it, and look at the page with
+                same regions remarkable_image takes and listings return. Sizes
+                and widths are in points. Before marking a page, call with
+                layout_page=<page> for the positions of the PDF's text lines,
+                the user's ink and free space, and look at the page with
                 remarkable_image. Place marks beside the user's ink rather than
                 on it, and use dry_run=True to check the result: it returns
                 images of the changed pages without writing anything.
 
-                Name marks after what they mark (e.g. "q3", "q3-note", "intro-hl")
-                so they can be found and replaced later. Listings give each mark's
-                content, color, position and style (size, bold, anchor, width
-                and so on), so it can be re-created exactly. Any mark can take a
-                description (up to 200 characters) saying what it is and why,
-                for later sessions; it is shown when marks are listed and by
-                remarkable_read. Describe path marks, which are otherwise only
-                path data, e.g. "gold star: neat, complete working".
+                Each mark in `add` has a `page` (1-based tablet page), an
+                optional `id` (name it after what it marks, e.g. "q3",
+                "q3-note"), an optional `description` (up to 200 characters,
+                shown in listings; describe path marks) and exactly one of:
+                - text: string ("\\n" starts a new line); options size (default
+                  11), bold, italic, underline, border
+                - shape: "check" or "cross" (at or region; option size);
+                  "circle", "box" or "highlight" (region); "line" or "arrow"
+                  (from [x, y], to [x, y]; option dot). Options width, opacity
+                - path: SVG path data for any other shape, scaled into region
+                  or to size points at at; options width, fill, opacity
+                - latex: LaTeX math, e.g. "\\frac{a}{b}"; options size
+                  (default 12), border
+                - graphic: SVG markup, or base64 one-page PDF, PNG or JPEG (up
+                  to 2 MB), with region
+                - graphic_file: path of such a file on this machine (up to
+                  10 MB), with region
+                - text_highlight: printed text on the page to highlight with
+                  the tablet's own highlighter; options occurrence, layer
+                Place a mark with at [x, y] (option anchor: top-left, top,
+                top-right, left, center, right, bottom-left, bottom or
+                bottom-right), with region, or with near [x, y]: the closest
+                free space to that point, and "leader": true draws a line back
+                to it. Use near with a leader on pages full of writing.
 
-                Any mark can take "cover": true so the user can hide it on the
-                tablet: white ink goes over it on a "Mark cover" layer at the
-                bottom of the page, made hidden, and showing that layer hides
-                the mark. A layer name instead of true (e.g. "Answer key")
-                makes a group the user hides separately; "covered": true makes
-                a new layer shown, so its marks start hidden (e.g. answers to
-                reveal later). Listings give each covered mark's layer and
-                state: hidden on tablet, shown on tablet, or cover erased on
-                tablet. Treat marks the user has hidden as dismissed. Removing
-                a mark removes its cover.
+                Every mark but graphics takes a color: #RRGGBB or a tablet
+                color. Pen colors: black, gray, white, blue, red, green,
+                yellow, cyan, magenta. Highlighter colors (highlights):
+                yellow, blue, pink, orange, green, gray. The default is black,
+                and yellow for highlights. Pick colors for the task: when
+                grading, green for check marks and full scores, red for X
+                marks, notes about mistakes and partial scores.
 
-                Each mark in `add` has a `page` (1-based), an optional `id`, and
-                exactly one of:
-                - text: string ("\n" starts a new line); at, or region to wrap
-                  within; options size (default 11), bold, italic, underline,
-                  border (a rounded box with a white background)
-                - shape: "check" or "cross" with at (option size) or region;
-                  "circle", "box" or "highlight" with region, stretched to fill
-                  it; "line" or "arrow" with from [x, y] and to [x, y].
-                  Options: width (line width), opacity, dot (a dot at the to
-                  end of a line or arrow)
-                - path: SVG path data for any other shape, in any units. With
-                  region it is scaled to fit, centered, keeping its aspect
-                  (stretch: true fills the region instead); with at it is
-                  scaled so its larger side is size points (default 12).
-                  E.g. "M 0 10 L 5 0 L 10 10" is a caret. Options: width
-                  (stays in points), fill (a color), opacity. Several subpaths
-                  (each starting with M) share one style; for drawings with
-                  several colors or text, or output from other tools, use
-                  graphic.
-                - latex: LaTeX math, e.g. "\\frac{a}{b} = \\sqrt{2}"; at, or
-                  region to scale into; options size (default 12), border
-                - graphic: content rendered elsewhere: SVG markup, or base64 PDF
-                  (one page), PNG or JPEG (up to 2 MB); with region, scaled to
-                  fit at its top-left. SVG may only reference its own elements
-                  or data: URIs.
-                - graphic_file: path of such a file on the machine running this
-                  server (up to 10 MB), with region
-                Text, shape (including highlight) and path marks can take
-                "erasable": true: they are written as tablet ink instead of
-                into the PDF, so the user can erase, move or recolor them on the
-                tablet, and their colors match in every app. Text is drawn in a
-                single-stroke font (bold is a thicker line); shapes, paths and
-                leaders with a pen, highlights with the highlighter. Named
-                colors only (pen colors; highlighter colors for highlights), no
-                fill or opacity; option layer as for text_highlight. Listings
-                give their state: on tablet, partly erased or erased on tablet.
-                - text_highlight: text on the page to highlight as the tablet's
-                  own highlighter does (the user can erase it on the tablet);
-                  it may run over several lines. Options: color (a highlighter
-                  color, default yellow), occurrence (which match, default 1),
-                  layer (a layer name; a new one is added on top if the page has
-                  none; default the page's selected layer, as the tablet does).
-                  layout lists the page's layers. Not with at, region or near.
-                Instead of at or region, text, latex, check, cross and path marks
-                can take near [x, y]: the mark is put in the closest free space to
-                that point, clear of the user's ink, the printed text and other
-                marks, and "leader": true draws a thin line from the mark to the
-                point, ending in a dot; it is drawn only when the mark cannot sit
-                beside the point; positions giving a diagonal leader are
-                preferred. It starts at the middle of the note's top or bottom
-                for a point above or below the note, otherwise
-                just past the end that faces the point, at the text's top,
-                middle or baseline, so it never crosses the note (a bordered
-                note's leader starts at its border). Use near, with a leader, on
-                pages full of writing; give the point of what the mark is about,
-                at its edge (such as the end of an answer) rather than its
-                middle. A leader never crosses the user's handwriting or other
-                marks, and crosses printed text only when nothing else reaches
-                the point; if no place fits, the tool says so: shorten the note
-                or make it smaller.
-                Marks placed with `at` take an optional anchor: the point of the
-                mark placed at `at`: top-left, top, top-right, left, center,
-                right, bottom-left, bottom or bottom-right. Default center for
-                check and cross, top-left otherwise. Use anchor "left" with at
-                at the right end of a text line's middle to put a note beside it.
-                Every mark but graphics takes a color: #RRGGBB or one of the
-                tablet's colors. Pen colors (all marks but highlights): black,
-                gray, white, blue, red, green, yellow, cyan, magenta.
-                Highlighter colors (highlights): yellow, blue, pink, orange,
-                green, gray. The default is black, and yellow for highlights.
-                Named colors are tuned to look right on the tablet's screen; PDF
-                exports (remarkable_export) re-draw them in the desktop and
-                browser apps' colors.
-                Highlights darken like the tablet's highlighter: the color shows
-                on the paper and text under it stays dark.
-
-                Pick colors for the task. When grading, for example, use green
-                for check marks and full scores, and red for X marks, notes about
-                mistakes and partial scores.
+                Marks in the PDF can be removed only with this tool. So that
+                the user can dismiss marks on the tablet, a mark can take
+                "cover": true (white ink on a hidden layer that hides the mark
+                when shown) or, for text, shape and path marks, "erasable":
+                true (written as tablet ink the user can erase); text_highlight
+                marks are tablet ink too. Read the resource
+                remarkable://help/marks for near and leader placement, covers,
+                erasable marks, text highlights and listing states.
 
                 Removals run before additions, so a mark can be replaced in one
                 call by removing its id and adding a new mark with that id.
@@ -3950,13 +3517,13 @@ def register_write_tools():
                   or #RRGGBB
                 - dry_run: Return preview images of the changed pages without
                   writing
-                - layout: Tablet page number; the response adds that page's text
-                  lines (from the PDF before marks), each with its region, the
-                  regions of the user's ink, and free: the largest empty regions
-                  (clear of ink, text and marks), largest first. Not combined
-                  with a write; use it alone or with dry_run.
+                - layout_page: Tablet page number; the response adds that
+                  page's layout as remarkable_page_layout gives it (text lines,
+                  ink, free regions, layers). Not combined with a write; use it
+                  alone or with dry_run.
                 </parameters>
                 <examples>
+                - remarkable_mark_pdf("Worksheet", layout_page=1)  # where to place marks
                 - remarkable_mark_pdf("Worksheet", color="red", add=[
                     {"page": 1, "id": "score", "text": "3/4", "at": [0.8, 0.06],
                      "size": 24, "bold": true},
@@ -3964,117 +3531,75 @@ def register_write_tools():
                      "color": "green"},
                     {"page": 1, "id": "q3", "shape": "cross", "at": [0.38, 0.33]},
                     {"page": 1, "id": "q3-note", "text": "Orange is secondary.",
-                     "at": [0.41, 0.33], "anchor": "left", "size": 9}],
+                     "near": [0.6, 0.33], "leader": true, "size": 9}],
                   dry_run=True)
                 - remarkable_mark_pdf("Paper", add=[
-                    {"page": 3, "id": "key-claim", "shape": "highlight",
-                     "region": [0.12, 0.41, 0.88, 0.43]},
-                    {"page": 3, "id": "key-claim-note", "text": "Compare with Fig. 2",
-                     "at": [0.9, 0.42], "anchor": "right", "size": 8}])
-                - remarkable_mark_pdf("Notes", add=[
-                    {"page": 2, "id": "formula",
-                     "latex": "x = \\frac{-b \\pm \\sqrt{b^2-4ac}}{2a}",
-                     "at": [0.45, 0.52]},
-                    {"page": 2, "id": "formula-arrow", "shape": "arrow",
-                     "from": [0.44, 0.53], "to": [0.36, 0.53]},
-                    {"page": 2, "id": "brace", "path":
-                     "M 0 0 C 8 0 4 20 10 20 C 4 20 8 40 0 40",
-                     "region": [0.8, 0.3, 0.83, 0.38]}])
+                    {"page": 3, "id": "key-claim", "text_highlight":
+                     "the effect doubles", "color": "pink"}])
                 - remarkable_mark_pdf("Worksheet", remove=["q3", "q3-note"], add=[
                     {"page": 1, "id": "q3", "shape": "check", "at": [0.38, 0.33],
                      "color": "green"}])  # the answer was revised
-                - remarkable_mark_pdf("Worksheet", color="red", add=[
-                    {"page": 2, "id": "q4-note", "text": "check the sign",
-                     "near": [0.62, 0.41], "leader": true, "size": 9}])
-                - remarkable_mark_pdf("Worksheet", layout=1)  # where to place marks
                 - remarkable_mark_pdf("Worksheet")  # list marks
                 - remarkable_mark_pdf("Worksheet", clear=True)
                 </examples>
                 """
                 from remarkable_mcp.pdf_marks import MarkError
 
-                def invalid(message: str, suggestion: str) -> str:
-                    return make_error(
-                        error_type="invalid_parameter", message=message, suggestion=suggestion
-                    )
-
                 adds, removes = add or [], _as_list(remove)
                 writing = bool(adds or removes or clear) and not dry_run
-                if layout is not None and writing:
-                    return invalid(
-                        "layout cannot be combined with a write.",
-                        "Call with layout alone (or with dry_run=True) first, then write.",
+                layout_page, error = resolve_alias(
+                    layout_page, layout, "layout_page", "layout", default=None
+                )
+                if error:
+                    return error
+                if layout_page is not None and writing:
+                    return invalid_param(
+                        "layout_page cannot be combined with a write.",
+                        "Call with layout_page alone (or with dry_run=True) first, then write.",
                     )
 
-                def _impl():
-                    error = _require_managed_write_mode()
-                    if error:
-                        return error
-                    client = get_rmapi()
-                    try:
-                        collection = client.get_meta_items()
-                        items_by_id = get_items_by_id(collection)
-                        target = _resolve_document(document, collection, items_by_id)
-                        if not target:
-                            from remarkable_mcp.extract import find_similar_documents
-
-                            similar = find_similar_documents(document, collection)
-                            return make_error(
-                                error_type="document_not_found",
-                                message=f"Document not found: '{document}'",
-                                suggestion="Use remarkable_browse() to find the correct name.",
-                                did_you_mean=similar if similar else None,
-                            )
-                        if target.is_folder:
-                            return invalid(
-                                f"'{target.VissibleName}' is a folder.",
-                                "Mark a PDF document instead.",
-                            )
-                        obstacles = None
-                        if any(isinstance(m, dict) and "near" in m for m in adds):
-                            near_pdf, _, near_files = client.read_document_pdf(target.ID)
-                            obstacles = _page_obstacles(client, near_files, near_pdf)
-                        edit = _mark_editor(
-                            adds, removes, clear, color, build=writing, obstacles=obstacles
+                def run(client, target):
+                    obstacles = None
+                    if any(isinstance(m, dict) and "near" in m for m in adds):
+                        near_pdf, _, near_files = client.read_document_pdf(target.ID)
+                        obstacles = _page_obstacles(client, near_files, near_pdf)
+                    edit = _mark_editor(
+                        adds, removes, clear, color, build=writing, obstacles=obstacles
+                    )
+                    if writing:
+                        result = _replace_pdf(client, target.ID, edit, with_ink=True)
+                        return _mark_response(target, result, dry_run=False)
+                    pdf, content, files = client.read_document_pdf(target.ID)
+                    result = edit(pdf, content, client.ink_reader(target.ID, files))
+                    if layout_page is not None:
+                        result["layout"] = _mark_layout(
+                            client, files, pdf, layout_page, result["page_map"]
                         )
-                        if writing:
-                            result = client.replace_document_pdf(target.ID, edit, with_ink=True)
-                            if result["changed"]:
-                                _invalidate_client_cache(client)
-                            return _mark_response(target, result, dry_run=False)
-                        pdf, content, files = client.read_document_pdf(target.ID)
-                        result = edit(pdf, content, client.ink_reader(target.ID, files))
-                        if layout is not None:
-                            result["layout"] = _mark_layout(
-                                client, files, pdf, layout, result["page_map"]
-                            )
-                        response = _mark_response(target, result, dry_run=dry_run)
-                        preview = result.get("preview_pdf")
-                        if not dry_run or not preview:
-                            return response
-                        from mcp.types import TextContent
+                    response = _mark_response(target, result, dry_run=dry_run)
+                    preview = result.get("preview_pdf")
+                    if not dry_run or not preview:
+                        return response
+                    from mcp.types import TextContent
 
-                        images = _mark_preview_images(
-                            client, files, preview, result["touched_pages"]
-                        )
-                        return [TextContent(type="text", text=response), *images]
-                    except MarkError as e:
-                        return invalid(str(e), "Fix the mark and try again.")
-                    except Exception as e:
-                        return make_error(
-                            error_type="mark_failed",
-                            message=f"Failed to change marks: {e}",
-                            suggestion="Check that the document is a PDF and try again.",
-                        )
+                    images = _mark_preview_images(client, files, preview, result["touched_pages"])
+                    return [TextContent(type="text", text=response), *images]
 
-                return await asyncio.to_thread(_impl)
+                return await _cloud_pdf_call(
+                    document,
+                    run,
+                    failed="mark_failed",
+                    failure="Failed to change marks",
+                    invalid_errors=(MarkError,),
+                    invalid_hint="Fix the mark and try again.",
+                )
 
             @mcp.tool(annotations=WRITE_ANNOTATIONS)
             async def remarkable_pdf_ocr(
                 document: Optional[str] = None,
                 folder: Optional[str] = None,
                 tags: Optional[List[str]] = None,
-                check: bool = False,
+                dry_run: bool = False,
+                check: SkipJsonSchema[Optional[bool]] = None,
             ):
                 """
                 <usecase>Make scanned PDF pages readable and searchable: OCR them
@@ -4088,11 +3613,11 @@ def register_write_tools():
                 read, searched and highlighted. The OCR text lives in the
                 document; later reads need no OCR.
 
-                - check=True only reports: for document, or for every PDF in
+                - dry_run=True only reports: for document, or for every PDF in
                   folder (and its subfolders) and/or with any of tags, the
                   tablet pages that have no text but are scanned. Nothing
                   changes.
-                - With document (and check False) it OCRs that PDF: all of its
+                - With document (and no dry_run) it OCRs that PDF: all of its
                   scanned pages, never part of them. Pages that already have
                   text are never changed, so a PDF that has text on every page
                   has nothing to do. A long book takes several minutes: each
@@ -4107,65 +3632,50 @@ def register_write_tools():
                 </instructions>
                 <parameters>
                 - document: Document name or path
-                - folder: With check, every PDF in this folder and its subfolders
-                - tags: With check, PDFs with any of these tags
-                - check: Only report which pages need OCR
+                - folder: With dry_run, every PDF in this folder and its subfolders
+                - tags: With dry_run, PDFs with any of these tags
+                - dry_run: Only report which pages need OCR
                 </parameters>
                 <examples>
-                - remarkable_pdf_ocr(folder="/Books", check=True)
+                - remarkable_pdf_ocr(folder="/Books", dry_run=True)
                 - remarkable_pdf_ocr("Erewhon")  # repeat until it says done
                 </examples>
                 """
                 from remarkable_mcp import pdf_ocr
                 from remarkable_mcp.pdf_marks import MarkError
 
-                def invalid(message: str, suggestion: str) -> str:
-                    return make_error(
-                        error_type="invalid_parameter", message=message, suggestion=suggestion
-                    )
-
-                if not check and (folder is not None or tags is not None):
-                    return invalid(
-                        "folder and tags only work with check=True.",
+                dry_run, error = resolve_alias(dry_run, check, "dry_run", "check", default=False)
+                if error:
+                    return error
+                if not dry_run and (folder is not None or tags is not None):
+                    return invalid_param(
+                        "folder: folder and tags only work with dry_run=True.",
                         "OCR one document at a time: remarkable_pdf_ocr(document).",
                     )
                 if document is None and folder is None and tags is None:
-                    return invalid("Give a document, or folder/tags with check=True.", "")
+                    return invalid_param(
+                        "document: give a document, or folder/tags with dry_run=True.", ""
+                    )
                 if tags is not None and (
                     not isinstance(tags, list) or not all(isinstance(t, str) for t in tags)
                 ):
-                    return invalid("tags must be a list of tag names.", 'Example: ["Books"]')
+                    return invalid_param("tags must be a list of tag names.", 'Example: ["Books"]')
 
-                def _impl():
-                    error = _require_managed_write_mode()
-                    if error:
-                        return error
-                    client = get_rmapi()
-                    try:
-                        collection = client.get_meta_items()
-                        items_by_id = get_items_by_id(collection)
-                        if check:
-                            return _ocr_check(
-                                client, collection, items_by_id, document, folder, tags
-                            )
-                        target = _resolve_document(document, collection, items_by_id)
-                        if not target or target.is_folder:
-                            return make_error(
-                                error_type="document_not_found",
-                                message=f"PDF document not found: '{document}'",
-                                suggestion="Use remarkable_browse() to find the correct name.",
-                            )
+                def run(client, target):
+                    if target is not None:
                         return _ocr_document(client, target)
-                    except (MarkError, pdf_ocr.OcrError) as e:
-                        return invalid(str(e), "See the message.")
-                    except Exception as e:
-                        return make_error(
-                            error_type="ocr_failed",
-                            message=f"OCR failed: {e}",
-                            suggestion="Check that the document is a PDF and try again.",
-                        )
+                    collection = client.get_meta_items()
+                    items_by_id = get_items_by_id(collection)
+                    return _ocr_check(client, collection, items_by_id, document, folder, tags)
 
-                return await asyncio.to_thread(_impl)
+                return await _cloud_pdf_call(
+                    None if dry_run else document,
+                    run,
+                    failed="ocr_failed",
+                    failure="OCR failed",
+                    invalid_errors=(MarkError, pdf_ocr.OcrError),
+                    invalid_hint="See the message.",
+                )
 
             @mcp.tool(annotations=WRITE_ANNOTATIONS)
             async def remarkable_pdf_pages(
@@ -4212,75 +3722,54 @@ def register_write_tools():
                 """
                 from remarkable_mcp.pdf_marks import MarkError
 
-                def invalid(message: str, suggestion: str) -> str:
-                    return make_error(
-                        error_type="invalid_parameter", message=message, suggestion=suggestion
-                    )
-
                 if not isinstance(insert, list) or not insert:
-                    return invalid(
+                    return invalid_param(
                         "insert must be a non-empty list of entries.",
                         'Example: insert=[{"after": 2, "blank": 1}]',
                     )
 
-                def _impl():
-                    error = _require_managed_write_mode()
-                    if error:
-                        return error
-                    client = get_rmapi()
-                    try:
-                        collection = client.get_meta_items()
-                        items_by_id = get_items_by_id(collection)
-                        target = _resolve_document(document, collection, items_by_id)
-                        if not target or target.is_folder:
-                            return make_error(
-                                error_type="document_not_found",
-                                message=f"PDF document not found: '{document}'",
-                                suggestion="Use remarkable_browse() to find the correct name.",
-                            )
-                        edit = _pages_editor(insert, build=not dry_run)
-                        if dry_run:
-                            pdf, content, files = client.read_document_pdf(target.ID)
-                            pagedata_file = next(
-                                (f for f in files if f["id"].endswith(".pagedata")), None
-                            )
-                            pagedata = (
-                                client._get_file(pagedata_file["hash"], pagedata_file["id"]).decode(
-                                    "utf-8"
-                                )
-                                if pagedata_file
-                                else None
-                            )
-                            result = edit(pdf, content, pagedata)
-                        else:
-                            result = client.replace_document_pdf(target.ID, edit, with_pages=True)
-                            _invalidate_client_cache(client)
-                        data = {
-                            "document": target.VissibleName,
-                            "inserted_pages": result["inserted_pages"],
-                            "page_count": result["page_count"],
-                            "transport": "cloud",
-                        }
-                        if dry_run:
-                            data["dry_run"] = True
-                            hint = "Dry run: nothing was written. Repeat without dry_run."
-                        else:
-                            hint = (
-                                f"Inserted {len(result['inserted_pages'])} page(s) into "
-                                f"'{target.VissibleName}'. The tablet shows them after its "
-                                "next sync."
-                            )
-                        return make_response(data, hint)
-                    except (MarkError, ValueError) as e:
-                        return invalid(str(e), "Fix the insert entries and try again.")
-                    except Exception as e:
-                        return make_error(
-                            error_type="insert_failed",
-                            message=f"Failed to insert pages: {e}",
-                            suggestion="Check that the document is a PDF and try again.",
+                def run(client, target):
+                    edit = _pages_editor(insert, build=not dry_run)
+                    if dry_run:
+                        pdf, content, files = client.read_document_pdf(target.ID)
+                        pagedata_file = next(
+                            (f for f in files if f["id"].endswith(".pagedata")), None
                         )
+                        pagedata = (
+                            client._get_file(pagedata_file["hash"], pagedata_file["id"]).decode(
+                                "utf-8"
+                            )
+                            if pagedata_file
+                            else None
+                        )
+                        result = edit(pdf, content, pagedata)
+                    else:
+                        result = _replace_pdf(client, target.ID, edit, with_pages=True)
+                    data = {
+                        "document": target.VissibleName,
+                        "inserted_pages": result["inserted_pages"],
+                        "page_count": result["page_count"],
+                        "transport": "cloud",
+                    }
+                    if dry_run:
+                        data["dry_run"] = True
+                        hint = "Dry run: nothing was written. Repeat without dry_run."
+                    else:
+                        hint = (
+                            f"Inserted {len(result['inserted_pages'])} page(s) into "
+                            f"'{target.VissibleName}'. The tablet shows them after its "
+                            "next sync."
+                        )
+                    return make_response(data, hint)
 
-                return await asyncio.to_thread(_impl)
+                return await _cloud_pdf_call(
+                    document,
+                    run,
+                    failed="insert_failed",
+                    failure="Failed to insert pages",
+                    invalid_errors=(MarkError, ValueError),
+                    invalid_hint="Fix the insert entries and try again.",
+                )
 
             @mcp.tool(annotations=WRITE_ANNOTATIONS)
             async def remarkable_pdf_outline(
@@ -4336,61 +3825,30 @@ def register_write_tools():
                 """
                 from remarkable_mcp.pdf_marks import MarkError
 
-                def invalid(message: str, suggestion: str) -> str:
-                    return make_error(
-                        error_type="invalid_parameter", message=message, suggestion=suggestion
-                    )
-
                 if isinstance(outline, str) and outline != "original":
-                    return invalid(
+                    return invalid_param(
                         'outline must be a list of entries, [] or "original".',
                         'Example: outline=[{"title": "Chapter 1", "page": 3}]',
                     )
                 writing = outline is not None and not dry_run
 
-                def _impl():
-                    error = _require_managed_write_mode()
-                    if error:
-                        return error
-                    client = get_rmapi()
-                    try:
-                        collection = client.get_meta_items()
-                        items_by_id = get_items_by_id(collection)
-                        target = _resolve_document(document, collection, items_by_id)
-                        if not target:
-                            from remarkable_mcp.extract import find_similar_documents
+                def run(client, target):
+                    edit = _outline_editor(outline, build=writing)
+                    if writing:
+                        result = _replace_pdf(client, target.ID, edit)
+                    else:
+                        pdf, content, _ = client.read_document_pdf(target.ID)
+                        result = edit(pdf, content)
+                    return _outline_response(target, result, dry_run)
 
-                            similar = find_similar_documents(document, collection)
-                            return make_error(
-                                error_type="document_not_found",
-                                message=f"Document not found: '{document}'",
-                                suggestion="Use remarkable_browse() to find the correct name.",
-                                did_you_mean=similar if similar else None,
-                            )
-                        if target.is_folder:
-                            return invalid(
-                                f"'{target.VissibleName}' is a folder.",
-                                "Give a PDF document instead.",
-                            )
-                        edit = _outline_editor(outline, build=writing)
-                        if writing:
-                            result = client.replace_document_pdf(target.ID, edit)
-                            if result["changed"]:
-                                _invalidate_client_cache(client)
-                        else:
-                            pdf, content, _ = client.read_document_pdf(target.ID)
-                            result = edit(pdf, content)
-                        return _outline_response(target, result, dry_run)
-                    except MarkError as e:
-                        return invalid(str(e), "Fix the outline and try again.")
-                    except Exception as e:
-                        return make_error(
-                            error_type="outline_failed",
-                            message=f"Failed to change the outline: {e}",
-                            suggestion="Check that the document is a PDF and try again.",
-                        )
-
-                return await asyncio.to_thread(_impl)
+                return await _cloud_pdf_call(
+                    document,
+                    run,
+                    failed="outline_failed",
+                    failure="Failed to change the outline",
+                    invalid_errors=(MarkError,),
+                    invalid_hint="Fix the outline and try again.",
+                )
 
         @mcp.tool(annotations=DELETE_ANNOTATIONS)
         async def remarkable_delete(
@@ -4449,141 +3907,21 @@ def register_write_tools():
             if abort:
                 return abort
 
-            if not isinstance(document, str):
-                if _is_cloud_mode() and permanent:
-                    return make_error(
-                        error_type="permanent_delete_unsupported",
-                        message="Permanent deletion is not supported in cloud mode.",
-                        suggestion=(
-                            "Delete normally to move the items to Trash, then empty "
-                            "Trash from a reMarkable app or tablet."
-                        ),
-                    )
-
-                def _batch() -> str:
-                    return _run_batch(
-                        "delete",
-                        lambda client, cloud: _delete_many(
-                            client, names, cloud, permanent, defer_restart
-                        ),
-                    )
-
-                ssh_client = None if _is_cloud_mode() else _get_ssh_client()
-                if isinstance(ssh_client, SSHClient):
-                    return await _run_ssh_tool_operation(
-                        ssh_client, "delete", _batch, defer_restart=defer_restart
-                    )
-                return await asyncio.to_thread(_batch)
-
-            if _is_cloud_mode():
-                if permanent:
-                    return make_error(
-                        error_type="permanent_delete_unsupported",
-                        message="Permanent deletion is not supported in cloud mode.",
-                        suggestion=(
-                            "Delete normally to move the item to Trash, then empty "
-                            "Trash from a reMarkable app or tablet."
-                        ),
-                    )
-                return await asyncio.to_thread(_cloud_delete, document)
+            if permanent:
+                error = _permanent_delete_error()
+                if error:
+                    return error
+            single = isinstance(document, str)
 
             def _impl() -> str:
-                try:
-                    ssh_client = _get_ssh_client()
-                    collection = ssh_client.get_meta_items()
-                    items_by_id = get_items_by_id(collection)
-
-                    # Find the document
-                    target = _resolve_document(document, collection, items_by_id)
-                    if not target:
-                        from remarkable_mcp.extract import find_similar_documents
-
-                        similar = find_similar_documents(document, collection)
-                        return make_error(
-                            error_type="document_not_found",
-                            message=f"Document not found: '{document}'",
-                            suggestion="Use remarkable_browse() to find the correct name.",
-                            did_you_mean=similar if similar else None,
-                        )
-
-                    doc_path = get_item_path(target, items_by_id)
-
-                    if permanent:
-                        if target.is_folder and any(
-                            item.Parent == target.ID for item in collection
-                        ):
-                            return make_error(
-                                error_type="folder_not_empty",
-                                message=(
-                                    f"Cannot permanently delete non-empty folder "
-                                    f"'{target.VissibleName}'."
-                                ),
-                                suggestion=(
-                                    "Permanently delete its child documents and "
-                                    "folders first, or omit permanent=True to move "
-                                    "the whole folder to Trash."
-                                ),
-                            )
-                        _permanently_delete_ssh_entry(ssh_client, target.ID)
-                    else:
-                        meta_content = ssh_client._scp_download(
-                            f"{XOCHITL_PATH}/{target.ID}.metadata"
-                        )
-                        metadata = json.loads(meta_content.decode("utf-8"))
-                        metadata["parent"] = "trash"
-                        metadata["deleted"] = False
-                        metadata["lastModified"] = str(int(time.time() * 1000))
-                        metadata["metadatamodified"] = True
-                        try:
-                            metadata["version"] = int(metadata.get("version", 0)) + 1
-                        except (TypeError, ValueError):
-                            metadata["version"] = 1
-                        _write_metadata(ssh_client, target.ID, metadata)
-
-                    # Restart xochitl (unless deferred for a batch)
-                    restarted = _maybe_restart_xochitl(ssh_client, defer_restart)
-
-                    _update_deferred_ssh_cache(ssh_client, restarted, remove_id=target.ID)
-                    _clear_document_extraction_cache(target.ID)
-
-                    return make_response(
-                        {
-                            "deleted": True,
-                            "name": target.VissibleName,
-                            "path": doc_path,
-                            "type": "folder" if target.is_folder else "document",
-                            "permanent": permanent,
-                            "refresh_pending": not restarted,
-                        },
-                        _write_result_message(
-                            restarted,
-                            (
-                                "Document permanently deleted."
-                                if permanent
-                                else "Document moved to Trash."
-                            ),
-                            "It will no longer appear in the active library.",
-                        ),
-                    )
-
-                except SSHReliabilityError:
-                    raise
-                except Exception as e:
-                    return make_error(
-                        error_type="delete_failed",
-                        message=f"Failed to delete document: {e}",
-                        suggestion="Check SSH connection and try again.",
-                    )
-
-            ssh_client = _get_ssh_client()
-            if isinstance(ssh_client, SSHClient):
-                return await _run_ssh_tool_operation(
-                    ssh_client,
+                return _run_batch(
                     "delete",
-                    _impl,
-                    defer_restart=defer_restart,
+                    lambda client, cloud: _delete_many(
+                        client, names, cloud, permanent, defer_restart, single=single
+                    ),
                 )
-            return await asyncio.to_thread(_impl)
+
+            return await _dispatch("delete", _impl, defer_restart)
 
     async def remarkable_refresh() -> str:
         """
@@ -4662,3 +4000,49 @@ def register_write_tools():
     # cloud/USB clients have no equivalent, so the tool is hidden there.
     if _is_ssh_mode():
         mcp.tool(annotations=WRITE_ANNOTATIONS)(remarkable_refresh)
+    else:
+        _hide_ssh_only_options(mcp)
+
+
+# Options that only change anything over SSH, where each write restarts xochitl.
+SSH_ONLY_PARAMETERS = ("defer_restart",)
+SSH_ONLY_TERMS = ("defer_restart", "remarkable_refresh")
+
+
+def _strip_ssh_only_bullets(description: str) -> str:
+    """``description`` without the "- " bullets (with their more indented
+    continuation lines) that mention an SSH-only option."""
+    lines = description.split("\n")
+    kept = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        text = line.lstrip()
+        if not text.startswith("- "):
+            kept.append(line)
+            i += 1
+            continue
+        indent = len(line) - len(text)
+        end = i + 1
+        while end < len(lines):
+            following = lines[end]
+            if not following.strip() or len(following) - len(following.lstrip()) <= indent:
+                break
+            end += 1
+        block = lines[i:end]
+        if not any(term in part for part in block for term in SSH_ONLY_TERMS):
+            kept.extend(block)
+        i = end
+    return "\n".join(kept)
+
+
+def _hide_ssh_only_options(server) -> None:
+    """Leave SSH-only options out of the write tools' schemas and
+    descriptions. Calls that still pass them are accepted and ignored."""
+    for tool in server._tool_manager.list_tools():
+        properties = (tool.parameters or {}).get("properties", {})
+        if not any(name in properties for name in SSH_ONLY_PARAMETERS):
+            continue
+        for name in SSH_ONLY_PARAMETERS:
+            properties.pop(name, None)
+        tool.description = _strip_ssh_only_bullets(tool.description or "")

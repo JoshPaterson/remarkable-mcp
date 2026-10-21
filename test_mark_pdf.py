@@ -589,11 +589,36 @@ async def test_cloud_listing_and_layout(cloud):
     assert cloud.commits == 1
 
 
+async def test_cloud_layout_page_and_its_old_name(cloud):
+    with patch("remarkable_mcp.extract.page_ink_regions", return_value=[]):
+        new, _ = await _mark_tool(document="Worksheet", layout_page=1)
+        old, _ = await _mark_tool(document="Worksheet", layout=1)
+        both, _ = await _mark_tool(document="Worksheet", layout_page=1, layout=2)
+    assert new["layout"] == old["layout"]
+    assert both["_error"]["type"] == "invalid_parameter"
+
+
+async def test_layout_is_hidden_from_the_schema(cloud):
+    tool = next(t for t in await mcp.list_tools() if t.name == "remarkable_mark_pdf")
+    assert "layout_page" in tool.input_schema["properties"]
+    assert "layout" not in tool.input_schema["properties"]
+    assert "remarkable://help/marks" in tool.description
+
+
+async def test_marks_help_resource_is_readable(cloud):
+    from remarkable_mcp.help import MARKS_HELP_URI
+
+    contents = await mcp.read_resource(MARKS_HELP_URI)
+    text = "".join(c.content for c in contents)
+    for section in ("## Leaders", "## Covers", "## Erasable marks", "## Text highlights"):
+        assert section in text
+
+
 @pytest.mark.parametrize(
     "arguments, message",
     [
         ({"add": [{"page": 1, "shape": "check", "at": [2, 0]}]}, "from 0 to 1"),
-        ({"add": [{"page": 1, "shape": "check", "at": [0.1, 0.1]}], "layout": 1}, "layout cannot"),
+        ({"add": [{"page": 1, "shape": "check", "at": [0.1, 0.1]}], "layout_page": 1}, "cannot"),
         ({"layout": 5}, "does not exist"),
     ],
 )

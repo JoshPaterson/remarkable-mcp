@@ -9,9 +9,10 @@ dicts that the SSH write path uploads to the tablet:
 - Helpers to append a page entry to an existing notebook's ``.content``.
 
 Pages are built with rmscene's blessed :func:`simple_text_document` builder so
-every generated page contains a real drawable layer node. This is the same
-mechanism validated by :mod:`remarkable_mcp.strokes` (``find_target_layer``
-succeeds on the output, so strokes can be appended immediately afterwards).
+every generated page contains a real drawable layer node, so
+:func:`remarkable_mcp.strokes.append_strokes` (through
+``rm_ink.PageWriter.ink_layer``) finds a layer on the output and strokes can be
+appended immediately afterwards.
 ``simple_text_document`` emits no ``SceneInfo`` block, so the page renders and
 writes at the default paper size (see :data:`DEFAULT_PAPER`).
 """

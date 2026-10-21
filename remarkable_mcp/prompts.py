@@ -39,9 +39,12 @@ def find_notes_prompt(topic: str) -> list:
             "role": "user",
             "content": (
                 f"Search my reMarkable tablet for any notes about '{topic}'. "
-                f"Use remarkable_browse(query='{topic}') to find relevant documents, "
-                "then use remarkable_read() to extract and summarize the content. "
-                "Please organize the information you find."
+                f"remarkable_browse(query='{topic}') finds documents whose names "
+                "mention it; it does not search their content. To search content, "
+                "look at the folders with remarkable_browse('/') and use "
+                f"remarkable_search(folder=<folder>, grep='{topic}') on likely "
+                "ones. Then use remarkable_read() to extract and summarize the "
+                "content. Please organize the information you find."
             ),
         }
     ]
@@ -125,7 +128,10 @@ def meeting_notes_prompt(meeting_keyword: str = "meeting") -> list:
             "role": "user",
             "content": (
                 f"Find all my meeting notes on my reMarkable tablet:\n\n"
-                f"1. Search for documents with remarkable_browse(query='{meeting_keyword}')\n"
+                f"1. Find documents named for meetings with "
+                f"remarkable_browse(query='{meeting_keyword}') (it matches names "
+                "only), and look through likely folders and remarkable_recent() for "
+                "meeting notes with other names\n"
                 "2. Read the content of each meeting notes document\n"
                 "3. Extract key decisions, action items, and attendees mentioned\n"
                 "4. Create a consolidated summary of all meetings"

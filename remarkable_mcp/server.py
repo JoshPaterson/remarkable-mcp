@@ -4,17 +4,20 @@ reMarkable MCP Server initialization.
 
 import logging
 import os
+import re
 from contextlib import asynccontextmanager
 from importlib.metadata import PackageNotFoundError, version
 from ipaddress import ip_address
-from typing import AsyncIterator
+from typing import AsyncIterator, List
 from urllib.parse import quote, unquote
 
 from mcp.server import MCPServer
 from mcp.server.mcpserver import Context
 from mcp.server.transport_security import TransportSecuritySettings
+from mcp.types import TextContent
 
 from remarkable_mcp import ocr
+from remarkable_mcp.responses import is_error_response
 
 logger = logging.getLogger(__name__)
 
@@ -63,57 +66,127 @@ class RemarkableMCP(MCPServer):
 
         return await super().read_resource(uri_str, context)
 
+    async def call_tool(self, name, arguments, context: Context | None = None):
+        """Call a tool; a reply whose first text block is a JSON ``_error``
+        object is returned with ``isError`` set, its body unchanged."""
+        result = await super().call_tool(name, arguments, context)
+        return mark_tool_error(result)
 
-def _build_instructions() -> str:
-    """Build server instructions based on current configuration."""
-    # Check environment
-    ssh_mode = os.environ.get("REMARKABLE_USE_SSH", "").lower() in ("1", "true", "yes")
-    usb_web_mode = os.environ.get("REMARKABLE_USE_USB_WEB", "").lower() in (
-        "1",
-        "true",
-        "yes",
+
+def mark_tool_error(result):
+    """``result`` with ``is_error`` set when its first block is an error reply."""
+    content = getattr(result, "content", None)
+    if not content or getattr(result, "is_error", True):
+        return result
+    first = content[0]
+    if isinstance(first, TextContent) and is_error_response(first.text):
+        return result.model_copy(update={"is_error": True})
+    return result
+
+
+def _env_flag(name: str) -> bool:
+    return os.environ.get(name, "").lower() in ("1", "true", "yes")
+
+
+def tool_summary(description: str) -> str:
+    """The first sentence of a tool docstring's ``<usecase>`` block (or of
+    its first paragraph when it has none), on one line."""
+    match = re.search(r"<usecase>(.*?)</usecase>", description or "", re.S)
+    text = match.group(1) if match else (description or "").strip().split("\n\n")[0]
+    text = " ".join(text.split())
+    sentence = re.match(r"(.+?)[.:!?](\s|$)", text)
+    return (sentence.group(1) if sentence else text) + "."
+
+
+def tool_parameters(parameters: dict) -> List[str]:
+    """Parameter names a tool's input schema shows, without deprecated aliases."""
+    properties = (parameters or {}).get("properties", {})
+    return [name for name, schema in properties.items() if not schema.get("deprecated")]
+
+
+def _tool_list(registered) -> str:
+    """The "Available Tools" section, one line per registered tool."""
+    lines = ["## Available Tools", ""]
+    for tool in sorted(registered, key=lambda t: TOOL_ORDER.get(t.name, len(TOOL_ORDER))):
+        params = ", ".join(tool_parameters(tool.parameters))
+        lines.append(f"- `{tool.name}({params})` - {tool_summary(tool.description)}")
+    return "\n".join(lines) + "\n"
+
+
+# Reading tools first, then writes from the least to the most destructive.
+TOOL_ORDER = {
+    name: index
+    for index, name in enumerate(
+        [
+            "remarkable_status",
+            "remarkable_browse",
+            "remarkable_search",
+            "remarkable_recent",
+            "remarkable_read",
+            "remarkable_image",
+            "remarkable_canvas",
+            "remarkable_export",
+            "remarkable_upload",
+            "remarkable_markdown_to_pdf",
+            "remarkable_mkdir",
+            "remarkable_move",
+            "remarkable_rename",
+            "remarkable_tag",
+            "remarkable_mark_pdf",
+            "remarkable_pdf_outline",
+            "remarkable_pdf_pages",
+            "remarkable_pdf_ocr",
+            "remarkable_author",
+            "remarkable_delete",
+            "remarkable_refresh",
+        ]
     )
-    local_dir_mode = os.environ.get("REMARKABLE_USE_LOCAL_DIR", "").lower() in (
-        "1",
-        "true",
-        "yes",
-    ) or bool(os.environ.get("REMARKABLE_LOCAL_DIR"))
+}
 
-    read_only_mode = os.environ.get("REMARKABLE_READ_ONLY", "").lower() in (
-        "1",
-        "true",
-        "yes",
+
+def _build_instructions(registered=None) -> str:
+    """Build server instructions for the current configuration.
+
+    ``registered`` are the tools to list (``mcp``'s registry when
+    omitted); the workflow notes come from the configuration alone.
+    """
+    if registered is None:
+        server = globals().get("mcp")
+        registered = server._tool_manager.list_tools() if server is not None else []
+    ssh_mode = _env_flag("REMARKABLE_USE_SSH")
+    usb_web_mode = _env_flag("REMARKABLE_USE_USB_WEB")
+    local_dir_mode = _env_flag("REMARKABLE_USE_LOCAL_DIR") or bool(
+        os.environ.get("REMARKABLE_LOCAL_DIR")
     )
     # Local-directory mode is unconditionally read-only (the folder is the
     # desktop app's private sync cache).
-    write_mode = not read_only_mode and not local_dir_mode
+    write_mode = not _env_flag("REMARKABLE_READ_ONLY") and not local_dir_mode
+    names = {tool.name for tool in registered}
 
     read_only_note = "" if write_mode else " All tablet and library operations are read-only."
-
     instructions = (
         "# reMarkable MCP Server\n\n"
-        f"Access documents from your reMarkable tablet.{read_only_note}\n"
-        """
-## Available Tools
-
-- `remarkable_browse(path, query, tags)` - Browse folders, search for documents,
-  or list documents carrying a tag (searches subfolders)
-- `remarkable_read(document, content_type, page, grep)` - Read document content with pagination
-- `remarkable_recent(limit)` - Get recently modified documents
-- `remarkable_status()` - Check connection and diagnose issues
-- `remarkable_image(document, page, include_ocr, layers, dpi, region)` - Get a page
-  image (PNG or SVG) with optional OCR
-- `remarkable_export(document, output_format, pages)` - Export one document (or
-  selected pages, PDF only) as a temporary PDF or Markdown resource
+        f"Access documents from your reMarkable tablet.{read_only_note}\n\n"
+        + _tool_list(registered)
+        + """
+Names and paths: a document is named by its name or its path ("/Folder/Name").
+Paths are relative to the configured root folder, if any.
 
 ## Recommended Workflows
 
 ### Finding and Reading Documents
-1. Use `remarkable_browse(query="keyword")` to search by name
-2. Use `remarkable_read("Document Name")` to get content
-3. Use `remarkable_read("Document", page=2)` to continue reading long documents
-4. Use `remarkable_read("Document", grep="pattern")` to search within a document
-5. Use `remarkable_browse("/Folder", tags=["tag"])` to find tagged documents
+1. `remarkable_browse(query="keyword")` finds documents and folders by name
+   (names only, not content); `remarkable_browse("/Folder", tags=["tag"])`
+   finds tagged documents in a folder and its subfolders
+2. `remarkable_search("keyword", grep="pattern")` reads documents whose names
+   contain the keyword and returns the matches of the pattern;
+   `remarkable_search(folder="/Folder", grep="pattern")` searches the content
+   of every document in a folder whatever its name (up to 20 documents)
+3. `remarkable_read("Document Name")` gets the text; a long document comes in
+   parts (`part=2` continues; `more` and `next_part` say whether there is more)
+4. `remarkable_read("Document", grep="pattern")` finds every match in one
+   document, with the tablet page of each
+5. `remarkable_recent()` lists what was modified recently
 
 ### Reading Annotations
 `remarkable_read("Document", content_type="annotations")` lists each annotated
@@ -125,172 +198,122 @@ The response also returns `highlights`, `highlighter_strokes`, `page_tags` and
 `layers` as structured data.
 
 ### Getting Page Images
-Use `remarkable_image` when you need visual context:
-- Hand-drawn diagrams, sketches, or UI mockups
-- Content that text extraction might miss
-- Implementing designs based on hand-drawn wireframes
+Use `remarkable_image` when you need visual context: hand-drawn diagrams,
+sketches, mockups, or anything text extraction might miss.
+- `remarkable_image("Notes", page=2, dpi=300)` renders a page at 300 dpi,
+  enough to read small handwriting
+- `region=[left, top, right, bottom]` (page fractions) crops to part of the
+  page; a highlighter stroke's `region` from remarkable_read can be passed
+  directly
+- `layers="all"` includes hidden layers; by default only visible layers are drawn
+- `include_ocr=True` adds the page's handwriting as text
+Notebook page templates (dots, lines, grids) are not drawn; remarkable_read
+lists each page's template.
 
-Example: `remarkable_image("UI Mockup", page=1)` returns a PNG image
-Example: `remarkable_image("Notes", include_ocr=True)` returns image with extracted text
-Notebook page templates (dots, lines, grids) are not part of the document and are
-not drawn; pages render on a plain background. remarkable_read lists each page's
-template.
-Example: `remarkable_image("Notes", page=2, dpi=300)` renders the whole page at 300 dpi,
-enough to read small handwriting
-Example: `remarkable_image("Notes", page=2, dpi=300, region=[0, 0.5, 1, 0.75])` crops
-to a band of the page (`[left, top, right, bottom]` as page fractions; a
-highlighter stroke's `region` from remarkable_read can be passed directly)
-Example: `remarkable_image("Notes", page=3, layers="all")` includes hidden layers;
-by default only visible layers are drawn, and `layers="Layer 2"` draws one layer
-
-### Exporting a Document
-Use `remarkable_export` for a complete PDF or structured Markdown artifact.
-Exports never modify the tablet, but they do create a server-managed temporary
-local file. The returned resource link expires after 15 minutes.
-Example: `remarkable_export("Lecture Notes", pages="3-5,9")` exports only those pages.
-
-### For Large Documents
-Use pagination to avoid overwhelming context. The response includes:
-- `page` / `content_pages` - current extracted-text position
-- `total_pages` - physical document page count
-- `more` - true if more content exists
-- `next_page` - page number to request next
-
+### Exporting
+`remarkable_export` never modifies the tablet:
+- one document (or `pages="3-5,9"` of a PDF export) as a temporary PDF or
+  Markdown resource link that expires after 15 minutes
+- with `save_to`, saved to a path inside REMARKABLE_EXPORT_DIRS instead
+- with `folder` and/or `tags` and `save_to` a folder, every matching document
+"""
+    )
+    instructions += """
+### Page Layout, Marks and Outlines
+- `remarkable_page_layout("Worksheet", page=1)` gives a page's printed text
+  lines, boxes around the user's handwriting and free space, as regions
+  `remarkable_image` can crop to
+- `remarkable_read` returns a PDF's `marks` (added with remarkable_mark_pdf)
+  and its `outline` (table of contents)
+"""
+    if "remarkable_pdf_outline" in names:
+        instructions += (
+            '- `remarkable_pdf_outline("Book", outline=[...])` replaces the table of'
+            " contents the tablet shows\n"
+        )
+    instructions += """
 ### Combining Tools
-- Browse → Read: Find documents first, then read them
-- Recent → Read: Check what was recently modified, then read specific ones
-- Read with grep: Search for specific content within large documents
-- Browse → Image: Find a document then get its visual representation
+- Browse -> Read: find documents first, then read them
+- Recent -> Read: check what changed recently, then read specific documents
+- Read with grep: find specific content within a large document
+- Browse -> Image: find a document, then look at a page
 
 ## MCP Resources
 
-Documents are registered as resources for direct access:
-- `remarkable:///{path}.txt` - Get full extracted text content in one request
-- `remarkableimg:///{path}.page-{N}.png` - Get PNG image of page N (notebooks only)
-- `remarkableexport:///{format}/{id}` - Fetch a temporary generated export
-- Use resources when you need complete document content without pagination
+- `remarkable:///{path}.txt` - full extracted text in one request
+- `remarkableraw:///{path}.{pdf|epub}.txt` - original PDF/EPUB text
+- `remarkableimg:///{path}.page-{N}.png` - PNG of page N (notebooks only)
+- `remarkableexport:///{format}/{id}` - a temporary generated export
 """
-    )
+    if "remarkable_mark_pdf" in names:
+        instructions += (
+            "- `remarkable://help/marks` - placement, leader, cover and erasable rules"
+            " for remarkable_mark_pdf\n"
+        )
 
-    # Add transport-specific instructions
     if local_dir_mode:
         instructions += """
 ## Local Directory Mode (Active)
 
 Reading from a local reMarkable data directory (typically the official
-desktop app's sync folder). Fully offline and device-free:
-- **Raw file access**: Use `content_type="raw"` to get original PDF/EPUB text
-- **Read-only**: the folder is the desktop app's sync cache, so write tools
-  are disabled in this mode. Content freshness depends on the desktop app
-  syncing (keep it running/signed in).
-
-### Content Types for remarkable_read
-- `"text"` (default) - Full content: raw PDF/EPUB text + annotations
-- `"raw"` - Only original PDF/EPUB text (no annotations)
-- `"annotations"` - Only typed text, highlights, and OCR content
+desktop app's sync folder). Fully offline and device-free. Write tools are
+disabled: the folder is the desktop app's sync cache. Content freshness
+depends on the desktop app syncing (keep it running and signed in).
 """
     elif ssh_mode:
         instructions += """
 ## SSH Mode (Active)
 
-You're connected directly to the tablet via SSH. This enables:
-- **Raw file access**: Use `content_type="raw"` to get original PDF/EPUB text
-- **Raw resources**: `remarkableraw:///{path}.pdf` or `.epub` for original files
-- **Faster operations**: Direct tablet access is 10-100x faster than cloud
-
-### Content Types for remarkable_read
-- `"text"` (default) - Full content: raw PDF/EPUB text + annotations
-- `"raw"` - Only original PDF/EPUB text (no annotations)
-- `"annotations"` - Only typed text, highlights, and OCR content
+Connected directly to the tablet over SSH: 10-100x faster than the cloud.
 """
         if write_mode:
             instructions += """
-## Write Tools (Active)
-
-Write operations are enabled. These tools modify your tablet's filesystem:
-
-- `remarkable_upload(file_path, parent_folder, document_name, defer_restart)` - Upload a PDF/EPUB
-  (or pass base64 `file_content` with `document_name`, up to 2 MB)
-- `remarkable_markdown_to_pdf(markdown, document_name, parent_folder, defer_restart)` -
-  Render Markdown as a PDF and upload it
-- `remarkable_mkdir(folder_name, parent, defer_restart)` - Create a folder
-- `remarkable_move(document, dest_folder, defer_restart)` - Move a document/folder
-- `remarkable_rename(document, new_name, defer_restart)` - Rename a document/folder
-- `remarkable_tag(document, add, remove, rename, page, defer_restart)` - Add, rename or
-  remove document or page tags
-- `remarkable_delete(document, defer_restart, permanent)` - Delete a document/folder
-- `remarkable_author(method, ..., defer_restart)` - Author native ink/notebooks
-- `remarkable_refresh()` - Restart xochitl once to apply writes deferred with `defer_restart=True`
-
-### Safety
-- **Delete is destructive** and immediate — the MCP client should confirm with the user first
-- Concurrent writes are serialized and share one bounded xochitl refresh; every
-  participating call waits for that refresh before returning success
-- For explicit batches, pass `defer_restart=True` to each write (or set
+### Write Safety
+- **Delete is destructive**: the MCP client should confirm with the user first
+- Each write restarts xochitl so the tablet shows it. Concurrent writes are
+  serialized and share one restart; every call waits for it before returning
+- For a batch, pass `defer_restart=True` to each write (or set
   `REMARKABLE_DEFER_RESTART=1`) and call `remarkable_refresh()` once at the end
-- Use `remarkable_browse()` to verify changes after write operations
+- Use `remarkable_browse()` to verify changes
 - Run with `--read-only` to disable all write tools
 """
     elif usb_web_mode:
+        instructions += """
+## USB Web Mode (Active)
+
+Connected through the tablet's USB web interface.
+"""
         if write_mode:
-            instructions += """
-## Write Tools (Active — USB Web)
-
-Upload is available via the USB web interface:
-
-- `remarkable_upload(file_path)` - Upload a PDF/EPUB file (or base64 `file_content`
-  with `document_name`, up to 2 MB)
-- `remarkable_markdown_to_pdf(markdown, document_name)` - Render Markdown as a
-  named PDF and upload it to the root folder
-
-Note: mkdir, move, rename, and delete require SSH mode.
+            instructions += """Only uploads are available: the web interface
+puts them in the folder open on the tablet. mkdir, move, rename, tag and
+delete need SSH or cloud mode.
 """
     else:
         instructions += """
 ## Cloud Mode (Active)
 
-Connected via reMarkable Cloud API. Some features require SSH mode:
-- Raw PDF/EPUB file downloads
-- `content_type="raw"` parameter
-
-For faster access and raw files, consider SSH mode: `uvx remarkable-mcp --ssh`
+Connected via the reMarkable Cloud API. Every read feature works, including
+`content_type="raw"`; SSH mode (`uvx remarkable-mcp --ssh`) is faster.
 """
         if write_mode:
             instructions += """
-## Write Tools (Active)
-
-Write operations are enabled (the default). These tools modify your cloud library
-and sync to all your devices:
-
-- `remarkable_upload(file_path, parent_folder, document_name)` - Upload a PDF/EPUB
-  (or pass base64 `file_content` with `document_name`, up to 2 MB)
-- `remarkable_markdown_to_pdf(markdown, document_name, parent_folder)` - Render
-  Markdown as a PDF and upload it
-- `remarkable_mkdir(folder_name, parent)` - Create a folder
-- `remarkable_move(document, dest_folder)` - Move a document/folder
-- `remarkable_rename(document, new_name)` - Rename a document/folder
-- `remarkable_tag(document, add, remove, rename, page)` - Add, rename or remove
-  document or page tags
-- `remarkable_mark_pdf(document, add, remove, clear, color, dry_run, layout)` - Add
-  or remove marks (text, shapes, highlights, paths, LaTeX, graphics) drawn into a
-  PDF's pages under the user's ink; each mark has an id for later removal
+### Write Safety
+Writes change your cloud library and sync to all your devices.
+- **Delete is destructive** (it moves items to the Trash): the MCP client
+  should confirm with the user first
+- Use `remarkable_browse()` to verify changes
+- Run with `--read-only` to disable all write tools
 
 ### Marking Up a PDF (e.g. grading a worksheet)
 1. `remarkable_image("Worksheet", page=1)` and `remarkable_read` to see the page
-2. `remarkable_mark_pdf("Worksheet", layout=1)` for text line and ink positions
+2. `remarkable_mark_pdf("Worksheet", layout_page=1)` for text line and ink positions
 3. `remarkable_mark_pdf("Worksheet", add=[...], dry_run=True)` to preview, then
    repeat without dry_run. Marks are black by default; pick colors for the task
    (when grading: green for check marks and full scores, red for mistakes).
 4. To update, remove outdated marks by id and add new ones in one call.
    `remarkable_read` lists current marks.
-
-### Safety
-- **Delete is destructive** — the MCP client should confirm with the user first
-- Changes sync to your devices; use `remarkable_browse()` to verify them
-- Run with `--read-only` to disable all write tools
 """
 
-    # Add OCR instructions based on configuration
     if ocr.preferred_backend() == "google":
         instructions += """
 ## OCR (Google Vision Selected)
@@ -309,6 +332,11 @@ REMARKABLE_OCR_BACKEND=auto (the default) or google.
 """
 
     return instructions
+
+
+def refresh_instructions() -> None:
+    """Rebuild the server instructions from the tools registered now."""
+    mcp._lowlevel_server.instructions = _build_instructions()
 
 
 @asynccontextmanager
@@ -375,7 +403,6 @@ except PackageNotFoundError:
 # process configuration; MCP HTTP authorization headers are intentionally unused.
 mcp = RemarkableMCP(
     "remarkable",
-    instructions=_build_instructions(),
     version=_SERVER_VERSION,
     lifespan=lifespan,
 )
@@ -405,6 +432,9 @@ if _write_tools.write_enabled():
 from remarkable_mcp import app_canvas as _app_canvas  # noqa: E402
 
 _app_canvas.register_app_tools()
+
+# The tool list in the instructions comes from the tools registered above.
+refresh_instructions()
 
 
 def _transport_security_for_host(host: str) -> TransportSecuritySettings:

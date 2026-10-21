@@ -127,10 +127,10 @@ async def test_archive_renders_only_selected_pages():
 @pytest.mark.parametrize(
     "arguments, error_type, message",
     [
-        ({"pages": "7"}, "invalid_page_selection", "has 6 page(s)"),
-        ({"pages": "5-8"}, "invalid_page_selection", "5-8 is outside"),
-        ({"pages": "x"}, "invalid_page_selection", "Invalid page selection"),
-        ({"pages": "3", "output_format": "markdown"}, "invalid_export_options", "PDF exports"),
+        ({"pages": "7"}, "invalid_parameter", "has 6 page(s)"),
+        ({"pages": "5-8"}, "invalid_parameter", "5-8 is outside"),
+        ({"pages": "x"}, "invalid_parameter", "Invalid page selection"),
+        ({"pages": "3", "output_format": "markdown"}, "invalid_parameter", "PDF exports"),
     ],
 )
 async def test_bad_selections_rejected(arguments, error_type, message):

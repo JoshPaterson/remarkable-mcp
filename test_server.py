@@ -150,15 +150,15 @@ class TestMCPServerInitialization:
 
     @pytest.mark.asyncio
     async def test_tools_count(self):
-        """Cloud default: 7 read/export tools + always-on canvas + 11 write tools.
+        """Cloud default: 8 read/export tools + always-on canvas + 11 write tools.
 
         ``remarkable_author`` is SSH-only and therefore hidden in cloud mode, and
         ``remarkable_mark_pdf``, ``remarkable_pdf_outline``, ``remarkable_pdf_ocr``
         and ``remarkable_pdf_pages`` are cloud-only, so the default cloud surface
-        is 19 tools.
+        is 20 tools.
         """
         tools = await _list_tools()
-        assert len(tools) == 19, f"Expected 19 tools, got {len(tools)}"
+        assert len(tools) == 20, f"Expected 20 tools, got {len(tools)}"
 
     @pytest.mark.asyncio
     async def test_tool_schemas(self):
@@ -1108,9 +1108,8 @@ class TestMergedRendering:
         # Check that render_merged parameter exists in the input schema
         assert "render_merged" in image_tool.input_schema.get("properties", {})
         merged_schema = image_tool.input_schema["properties"]["render_merged"]
-        assert merged_schema.get("default") is None
-        assert {"type": "boolean"} in merged_schema.get("anyOf", [])
-        assert {"type": "null"} in merged_schema.get("anyOf", [])
+        assert merged_schema.get("default") is True
+        assert merged_schema.get("type") == "boolean"
 
     @pytest.mark.asyncio
     @patch("remarkable_mcp.tools.get_rmapi")
@@ -1192,9 +1191,8 @@ class TestMergedRendering:
                 )
 
         data = json.loads(result.content[0].text)
-        # SVG should return successfully but merged=False
+        # SVG is always annotation-only
         assert data.get("merged") is False
-        assert "render_merged is only supported with PNG" in data.get("_hint", "")
 
     @pytest.mark.asyncio
     @patch("remarkable_mcp.tools.get_rmapi")
@@ -1622,7 +1620,7 @@ class TestE2E:
         """Test that server can list all tools (e2e)."""
         tools = await _list_tools()
 
-        assert len(tools) == 19
+        assert len(tools) == 20
 
         # Check each tool has required properties and starts with remarkable_
         for tool in tools:
@@ -3449,52 +3447,61 @@ class TestWriteTargetResolutionSkipsTrash:
         return [trashed, trashed_folder, user_trash_notes, live, live_folder, user_trash]
 
     def test_name_lookup_prefers_live_item(self):
-        from remarkable_mcp.write_tools import _resolve_document
+        from remarkable_mcp.lookup import find_item
 
         trashed = self._item("Notes", "trashed-notes", parent="trash")
         live = self._item("Notes", "live-notes")
         collection = [trashed, live]
-        target = _resolve_document("Notes", collection, get_items_by_id(collection))
+        target = find_item("Notes", collection, get_items_by_id(collection), include_trash=True)
         assert target.ID == "live-notes"
 
     def test_name_lookup_ignores_trash_only_match(self):
-        from remarkable_mcp.write_tools import _resolve_document
+        from remarkable_mcp.lookup import find_item
 
         trashed = self._item("Morning Pages", "trashed", parent="trash")
-        assert _resolve_document("Morning Pages", [trashed], {trashed.ID: trashed}) is None
+        assert (
+            find_item("Morning Pages", [trashed], {trashed.ID: trashed}, include_trash=True) is None
+        )
 
     def test_explicit_trash_path_still_reaches_trashed_item(self):
         """SSH permanent delete needs to address items already in the trash."""
-        from remarkable_mcp.write_tools import _resolve_document
+        from remarkable_mcp.lookup import find_item
 
         trashed = self._item("Morning Pages", "trashed", parent="trash")
-        target = _resolve_document("/trash/Morning Pages", [trashed], {trashed.ID: trashed})
+        target = find_item(
+            "/trash/Morning Pages", [trashed], {trashed.ID: trashed}, include_trash=True
+        )
         assert target is trashed
 
     def test_relative_trash_path_does_not_reach_trashed_item(self):
-        from remarkable_mcp.write_tools import _resolve_document
+        from remarkable_mcp.lookup import find_item
 
         trashed = self._item("Morning Pages", "trashed", parent="trash")
-        assert _resolve_document("trash/Morning Pages", [trashed], {trashed.ID: trashed}) is None
+        assert (
+            find_item("trash/Morning Pages", [trashed], {trashed.ID: trashed}, include_trash=True)
+            is None
+        )
 
     def test_user_folder_named_trash_wins_over_trashed_item(self):
-        from remarkable_mcp.write_tools import _resolve_document
+        from remarkable_mcp.lookup import find_item
 
         collection = self._collection()
-        target = _resolve_document("/trash/Notes", collection, get_items_by_id(collection))
+        target = find_item(
+            "/trash/Notes", collection, get_items_by_id(collection), include_trash=True
+        )
         assert target.ID == "user-trash-notes"
 
     def test_parent_resolution_never_picks_trashed_folder(self):
-        from remarkable_mcp.write_tools import _resolve_parent_id
+        from remarkable_mcp.lookup import find_folder_id
 
         collection = self._collection()
         items_by_id = get_items_by_id(collection)
-        assert _resolve_parent_id("/Archive", items_by_id, collection) == "live-archive"
+        assert find_folder_id("/Archive", collection, items_by_id) == "live-archive"
 
         trashed_folder = self._item("Old", "trashed-old", parent="trash", is_folder=True)
         only_trashed = [trashed_folder]
         by_id = get_items_by_id(only_trashed)
-        assert _resolve_parent_id("/trash/Old", by_id, only_trashed) is None
+        assert find_folder_id("/trash/Old", only_trashed, by_id) is None
 
 
 class TestMarkdownPDFWriteback:
@@ -3688,6 +3695,15 @@ class TestMarkdownPDFWriteback:
         }
 
 
+def _applied(client, doc_id: str) -> dict:
+    """The metadata a cloud write's ``update_documents_metadata`` call gives
+    ``doc_id``, applied to empty metadata."""
+    (applies,) = client.update_documents_metadata.call_args.args
+    metadata: dict = {}
+    applies[doc_id](metadata)
+    return metadata
+
+
 class TestCloudWriteDispatch:
     """Cloud-mode write tools dispatch to the RemarkableClient methods."""
 
@@ -3745,7 +3761,7 @@ class TestCloudWriteDispatch:
             register_write_tools()
             try:
                 target = self._make_item("doc-1", "Old Name")
-                client = Mock(spec=["get_meta_items", "rename"])
+                client = Mock(spec=["get_meta_items", "update_documents_metadata"])
                 client.get_meta_items.return_value = [target]
                 with patch("remarkable_mcp.write_tools.get_rmapi", return_value=client):
                     result = await _call_tool(
@@ -3755,7 +3771,7 @@ class TestCloudWriteDispatch:
                 data = json.loads(result.content[0].text)
                 assert data["renamed"] is True
                 assert data["transport"] == "cloud"
-                client.rename.assert_called_once_with("doc-1", "New Name")
+                assert _applied(client, "doc-1")["visibleName"] == "New Name"
             finally:
                 self._cleanup()
 
@@ -3768,7 +3784,7 @@ class TestCloudWriteDispatch:
             try:
                 target = self._make_item("doc-1", "Report")
                 dest = self._make_item("fold-1", "Archive", is_folder=True)
-                client = Mock(spec=["get_meta_items", "move"])
+                client = Mock(spec=["get_meta_items", "update_documents_metadata"])
                 client.get_meta_items.return_value = [target, dest]
                 with patch("remarkable_mcp.write_tools.get_rmapi", return_value=client):
                     result = await _call_tool(
@@ -3778,7 +3794,7 @@ class TestCloudWriteDispatch:
                 data = json.loads(result.content[0].text)
                 assert data["moved"] is True
                 assert data["transport"] == "cloud"
-                client.move.assert_called_once_with("doc-1", "fold-1")
+                assert _applied(client, "doc-1")["parent"] == "fold-1"
             finally:
                 self._cleanup()
 
@@ -3791,14 +3807,14 @@ class TestCloudWriteDispatch:
             register_write_tools()
             try:
                 target = self._make_item("doc-1", "Old Notes")
-                client = Mock(spec=["get_meta_items", "delete"])
+                client = Mock(spec=["get_meta_items", "update_documents_metadata"])
                 client.get_meta_items.return_value = [target]
                 with patch("remarkable_mcp.write_tools.get_rmapi", return_value=client):
                     result = await _call_tool("remarkable_delete", {"document": "Old Notes"})
                 data = json.loads(result.content[0].text)
                 assert data["deleted"] is True
                 assert data["transport"] == "cloud"
-                client.delete.assert_called_once_with("doc-1")
+                assert _applied(client, "doc-1")["parent"] == "trash"
             finally:
                 self._cleanup()
 
@@ -3813,7 +3829,7 @@ class TestCloudWriteDispatch:
             register_write_tools()
             try:
                 target = self._make_item("doc-1", "Old Notes")
-                client = Mock(spec=["get_meta_items", "delete"])
+                client = Mock(spec=["get_meta_items", "update_documents_metadata"])
                 client.get_meta_items.return_value = [target]
                 with (
                     patch("remarkable_mcp.write_tools.get_rmapi", return_value=client),
@@ -3825,7 +3841,7 @@ class TestCloudWriteDispatch:
                     result = await _call_tool("remarkable_delete", {"document": "Old Notes"})
                 data = json.loads(result.content[0].text)
                 assert data["_error"]["type"] == "confirmation_unavailable"
-                client.delete.assert_not_called()
+                client.update_documents_metadata.assert_not_called()
             finally:
                 self._cleanup()
 
@@ -3839,7 +3855,7 @@ class TestCloudWriteDispatch:
             register_write_tools()
             try:
                 target = self._make_item("doc-1", "Old Notes")
-                client = Mock(spec=["get_meta_items", "delete"])
+                client = Mock(spec=["get_meta_items", "update_documents_metadata"])
                 client.get_meta_items.return_value = [target]
                 with (
                     patch("remarkable_mcp.write_tools.get_rmapi", return_value=client),
@@ -3851,7 +3867,7 @@ class TestCloudWriteDispatch:
                     result = await _call_tool("remarkable_delete", {"document": "Old Notes"})
                 data = json.loads(result.content[0].text)
                 assert data["deleted"] is True
-                client.delete.assert_called_once_with("doc-1")
+                assert _applied(client, "doc-1")["parent"] == "trash"
             finally:
                 self._cleanup()
 
@@ -3871,7 +3887,7 @@ class TestCloudWriteDispatch:
         with patch.dict(os.environ, self._cloud_env(), clear=True):
             register_write_tools()
             try:
-                client = Mock(spec=["get_meta_items", "delete"])
+                client = Mock(spec=["get_meta_items", "update_documents_metadata"])
                 with (
                     patch("remarkable_mcp.write_tools.get_rmapi", return_value=client),
                     patch("remarkable_mcp.resources.start_background_loader", return_value=None),
@@ -3887,7 +3903,7 @@ class TestCloudWriteDispatch:
                 data = json.loads(result.content[0].text)
                 assert data["deleted"] is False
                 assert data["cancelled"] is True
-                client.delete.assert_not_called()
+                client.update_documents_metadata.assert_not_called()
             finally:
                 self._cleanup()
 
@@ -6974,9 +6990,12 @@ class TestCLIFlags:
     def test_read_only_instructions_do_not_advertise_markdown_writeback(self):
         from remarkable_mcp.server import _build_instructions
 
+        reads = {"remarkable_read", "remarkable_browse", "remarkable_image", "remarkable_export"}
+        tools = [t for t in mcp._tool_manager.list_tools() if t.name in reads]
         with patch.dict(os.environ, {"REMARKABLE_READ_ONLY": "1"}):
-            instructions = _build_instructions()
+            instructions = _build_instructions(tools)
         assert "remarkable_markdown_to_pdf" not in instructions
+        assert "read-only" in instructions
 
     def test_http_preserves_explicit_ssh_key(self):
         from remarkable_mcp import cli
