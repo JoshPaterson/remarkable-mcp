@@ -37,7 +37,13 @@ WHITE = 2
 ROOT = (0, 1)
 DETACHED = (0, 0)
 LAYER_1 = (0, 11)
-TREE_BLOCK, NODE_BLOCK, GROUP_ITEM_BLOCK, LINE_BLOCK = 0x01, 0x02, 0x04, 0x05
+TREE_BLOCK, NODE_BLOCK, GLYPH_ITEM_BLOCK, GROUP_ITEM_BLOCK, LINE_BLOCK = (
+    0x01,
+    0x02,
+    0x03,
+    0x04,
+    0x05,
+)
 TEXT_BLOCK, PAGE_INFO_BLOCK, AUTHORS_BLOCK = 0x07, 0x0A, 0x09
 
 AUTHOR_FILE_NAME = "mcp-author"
@@ -285,8 +291,11 @@ def _find_cover_layer(data: bytes, author: uuid.UUID, name: str) -> Optional[Id]
     return None
 
 
-def _add_layer(data: bytes, author: uuid.UUID, name: str, shown: bool) -> Tuple[bytes, Id]:
-    """``data`` with a new layer named ``name`` at the bottom of the page."""
+def _add_layer(
+    data: bytes, author: uuid.UUID, name: str, shown: bool, top: bool = False
+) -> Tuple[bytes, Id]:
+    """``data`` with a new layer named ``name`` at the bottom of the page (or
+    with ``top``, above the others)."""
     from rmscene.crdt_sequence import toposort_items
     from rmscene.scene_items import Group
     from rmscene.scene_stream import (
@@ -303,7 +312,9 @@ def _add_layer(data: bytes, author: uuid.UUID, name: str, shown: bool) -> Tuple[
     layer = CrdtId(number, counter)
     root = _crdt(ROOT)
     items = [b.item for b in blocks if isinstance(b, SceneGroupItemBlock) and b.parent_id == root]
-    first = next(iter(toposort_items(items)), CrdtId(0, 0)) if items else CrdtId(0, 0)
+    order = list(toposort_items(items)) if items else []
+    first = order[0] if order and not top else CrdtId(0, 0)
+    last = order[-1] if order and top else CrdtId(0, 0)
     tree = SceneTreeBlock(tree_id=layer, node_id=CrdtId(0, 0), is_update=True, parent_id=root)
     node = TreeNodeBlock(
         Group(
@@ -316,7 +327,7 @@ def _add_layer(data: bytes, author: uuid.UUID, name: str, shown: bool) -> Tuple[
         parent_id=root,
         item=CrdtSequenceItem(
             item_id=CrdtId(number, counter + 3),
-            left_id=CrdtId(0, 0),
+            left_id=last,
             right_id=first,
             deleted_length=0,
             value=layer,
@@ -413,13 +424,13 @@ def _add_strokes(
 
 
 def _tombstone(data: bytes, stroke_ids: Iterable[Sequence[int]]) -> bytes:
-    """``data`` with the given strokes deleted in place."""
+    """``data`` with the given strokes (or text highlights) deleted in place."""
     targets = {tuple(int(v) for v in s) for s in stroke_ids}
     if not targets:
         return data
     parts = [_header()]
     for btype, raw in _raw_blocks(data):
-        block = _parse_one(raw) if btype == LINE_BLOCK else None
+        block = _parse_one(raw) if btype in (LINE_BLOCK, GLYPH_ITEM_BLOCK) else None
         item = getattr(block, "item", None)
         if item is not None and _key(item.item_id) in targets and item.value is not None:
             item = dataclasses.replace(item, value=None, deleted_length=1)
