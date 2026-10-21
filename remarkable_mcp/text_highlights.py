@@ -106,6 +106,48 @@ def add_highlights(
     return page.data, ids
 
 
+RESTORED = "restored on tablet (now tablet ink)"
+
+
+def highlight_status(
+    data: Optional[bytes], item_ids: Sequence[Sequence[int]], mark: Dict[str, Any]
+) -> str:
+    """A text highlight mark's state (see ``ink_marks.ink_status``), or
+    RESTORED when its erased items have live copies by another author with
+    the same text and color: undoing an erase on the tablet writes the
+    highlight again as the tablet's own ink rather than restoring the MCP's."""
+    from rmscene.scene_stream import SceneGlyphItemBlock
+
+    from remarkable_mcp import ink_marks
+
+    status = ink_marks.ink_status(data, item_ids)
+    if status not in ("erased on tablet", "partly erased on tablet"):
+        return status
+    states = rm_ink.item_states(data, item_ids)
+    erased = sum(1 for _, alive in states.values() if not alive)
+    color = COLORS.get(mark.get("color_name"))
+    text = " ".join(str(mark.get("text", "")).split())
+    if color is None or not text:
+        return status
+    own = rm_ink.id_set(item_ids)
+    copies = 0
+    for block in rm_ink.parse(data):
+        if not isinstance(block, SceneGlyphItemBlock) or block.item.value is None:
+            continue
+        value = block.item.value
+        piece = " ".join(str(value.text or "").split())
+        if (
+            rm_ink.key(block.item.item_id) not in own
+            and piece
+            and piece in text
+            and int(value.color) == color[0]
+            # Blue and orange share one color id and differ by their rgba.
+            and (color[0] != 9 or tuple(value.color_rgba or ()) == tuple(color[1]))
+        ):
+            copies += 1
+    return RESTORED if copies >= erased else status
+
+
 def add_mark_highlight(page: rm_ink.PageWriter, mark: Dict[str, Any], size) -> None:
     """Write a pending text highlight mark (on a page of ``size`` points) and
     store its item ids in the mark."""

@@ -130,3 +130,30 @@ async def test_bad_highlight_requests(cloud):
     )
     assert "highlighter" in data["_error"]["message"] or "color" in data["_error"]["message"]
     assert cloud.commits == 0
+
+
+def _restored_page(text="the quick brown fox", tablet_color="blue"):
+    """A page whose MCP highlight was erased and then written again by
+    another author, as the tablet does when an erase is undone."""
+    part = {"start": 0, "length": len(text), "text": text, "rect": [50, 130, 160, 142]}
+    page = rm_ink.PageWriter(None, AUTHOR)
+    layer = page.ink_layer(None)
+    ids = page.add_glyphs(layer, [part], A4, *th.COLORS["blue"])
+    page.tombstone(ids)
+    tablet = rm_ink.PageWriter(page.data, uuid.uuid4())
+    tablet.add_glyphs(layer, [part], A4, *th.COLORS[tablet_color])
+    return tablet.data, ids
+
+
+def test_an_erase_undone_on_the_tablet_reads_as_restored():
+    data, ids = _restored_page()
+    mark = {"text": "the quick brown fox", "color_name": "blue"}
+    assert th.highlight_status(data, ids, mark) == th.RESTORED
+
+
+def test_a_different_highlight_does_not_count_as_restored():
+    mark = {"text": "the quick brown fox", "color_name": "blue"}
+    data, ids = _restored_page(tablet_color="orange")  # same id, other rgba
+    assert th.highlight_status(data, ids, mark) == "erased on tablet"
+    data, ids = _restored_page(text="lazy dog")
+    assert th.highlight_status(data, ids, mark) == "erased on tablet"

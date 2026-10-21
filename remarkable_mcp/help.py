@@ -94,6 +94,10 @@ lines. Options: `color` (a highlighter color, default yellow), `occurrence`
 (which match, default 1), `layer` (a layer name; a new one is added on top if
 the page has none; default the page's selected layer, as the tablet does).
 `layout_page` lists the page's layers. Not with `at`, `region` or `near`.
+Listings give its state: on tablet, partly erased, erased, or restored on
+tablet (now tablet ink): the user undid an erase, which makes the tablet write
+the highlight again as its own ink. Removing the mark then leaves that copy;
+only the user can erase it.
 """
 
 
