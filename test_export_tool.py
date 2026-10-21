@@ -525,3 +525,116 @@ class TestExportSaveTo:
         assert data["temporary_local_file"] is True and "saved_path" not in data
         assert _resource_link(result).uri == data["resource_uri"]
         assert list(allowed.iterdir()) == []
+
+
+class TestExportFolderAndTags:
+    """remarkable_export(folder=..., tags=..., save_to=<folder>) exports many."""
+
+    @pytest.fixture
+    def allowed(self, tmp_path, monkeypatch):
+        root = tmp_path / "Exports"
+        root.mkdir()
+        monkeypatch.setenv("REMARKABLE_EXPORT_DIRS", str(root))
+        return root
+
+    def _library(self):
+        def item(doc_id, name, parent="", folder=False, tags=()):
+            return SimpleNamespace(
+                ID=doc_id,
+                VissibleName=name,
+                Parent=parent,
+                ModifiedClient=None,
+                is_folder=folder,
+                tags=list(tags),
+            )
+
+        return [
+            item("f-classes", "Classes", folder=True),
+            item("f-lt", "LT", "f-classes", folder=True),
+            item("d-sheet1", "Sheet 1", "f-lt", tags=["Graded"]),
+            item("d-sheet2", "Sheet 2", "f-lt"),
+            item("d-sheet2b", "Sheet 2", "f-lt"),
+            item("d-notes", "Notes: week 1", "f-classes", tags=["graded"]),
+            item("d-other", "Other", tags=["Graded"]),
+            item("d-trashed", "Old", "trash", tags=["Graded"]),
+        ]
+
+    async def _export(self, **arguments):
+        import remarkable_mcp.tools as tool_module
+
+        client = Mock()
+        client.get_meta_items.return_value = self._library()
+        client.download.return_value = _pdf_bytes(2)
+        with (
+            patch.object(tool_module, "get_rmapi", return_value=client),
+            patch.object(tool_module, "get_file_type", return_value="pdf"),
+        ):
+            result = await mcp.call_tool("remarkable_export", arguments)
+        return _json_result(result)
+
+    @pytest.mark.asyncio
+    async def test_folder_export_mirrors_subfolders(self, allowed):
+        import hashlib
+
+        data = await self._export(folder="/Classes", save_to=str(allowed / "out"))
+
+        assert data["count"] == 4 and data["failed"] == []
+        files = sorted(
+            str(p.relative_to(allowed / "out")) for p in (allowed / "out").rglob("*.pdf")
+        )
+        assert files == [
+            "LT/Sheet 1.pdf",
+            "LT/Sheet 2 (d-sheet2).pdf",
+            "LT/Sheet 2.pdf",
+            "Notes- week 1.pdf",
+        ]
+        for entry in data["saved"]:
+            on_disk = (allowed / "out" / entry["saved_path"]).read_bytes()
+            assert entry["sha256"] == hashlib.sha256(on_disk).hexdigest()
+
+    @pytest.mark.asyncio
+    async def test_tag_export_covers_the_library(self, allowed):
+        data = await self._export(tags=["GRADED"], save_to=str(allowed))
+
+        assert sorted(entry["path"] for entry in data["saved"]) == [
+            "/Classes/LT/Sheet 1",
+            "/Classes/Notes: week 1",
+            "/Other",
+        ]
+        assert (allowed / "Classes" / "LT" / "Sheet 1.pdf").is_file()
+
+    @pytest.mark.asyncio
+    async def test_existing_files_fail_alone(self, allowed):
+        (allowed / "LT").mkdir()
+        (allowed / "LT" / "Sheet 1.pdf").write_bytes(b"keep")
+
+        data = await self._export(folder="/Classes", tags=["Graded"], save_to=str(allowed))
+
+        assert [entry["document"] for entry in data["saved"]] == ["Notes: week 1"]
+        assert [(f["document"], f["error"]) for f in data["failed"]] == [("Sheet 1", "file_exists")]
+        assert (allowed / "LT" / "Sheet 1.pdf").read_bytes() == b"keep"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "arguments, error",
+        [
+            ({"folder": "/Nope", "save_to": "{allowed}"}, "folder_not_found"),
+            ({"folder": "/Classes"}, "invalid_export_options"),
+            ({"folder": "/Classes", "save_to": "/elsewhere"}, "save_path_not_allowed"),
+            ({"folder": "/Classes", "save_to": "{allowed}", "pages": 1}, "invalid_export_options"),
+            (
+                {"document": "Other", "tags": ["x"], "save_to": "{allowed}"},
+                "invalid_export_options",
+            ),
+            ({"tags": [], "save_to": "{allowed}"}, "invalid_export_options"),
+            ({}, "invalid_export_options"),
+        ],
+    )
+    async def test_bad_requests_export_nothing(self, allowed, arguments, error):
+        arguments = {
+            k: v.format(allowed=allowed) if isinstance(v, str) else v for k, v in arguments.items()
+        }
+        data = await self._export(**arguments)
+
+        assert data["_error"]["type"] == error
+        assert list(allowed.iterdir()) == []

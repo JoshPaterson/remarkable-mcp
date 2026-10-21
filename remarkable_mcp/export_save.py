@@ -93,6 +93,49 @@ def check_path(save_to: str, output_format: str, overwrite: bool) -> Path:
     return resolved
 
 
+def check_dir(save_to: str) -> Path:
+    """The resolved folder to save several exports in, or a SaveError. It may
+    not exist yet; it must be one of the allowed folders or inside one."""
+    dirs = allowed_dirs()
+    if not dirs:
+        raise SaveError(
+            "save_not_configured",
+            f"Saving exports is not enabled: {EXPORT_DIRS_ENV} lists no folders.",
+            f"Set {EXPORT_DIRS_ENV} in the connector's configuration to the folders "
+            "exports may be saved in.",
+        )
+    if not isinstance(save_to, str) or not save_to.strip() or "\0" in save_to:
+        raise SaveError("invalid_save_path", "save_to must be a folder path.", _allowed_hint(dirs))
+    path = Path(save_to).expanduser()
+    if not path.is_absolute():
+        raise SaveError(
+            "invalid_save_path",
+            f"save_to must be an absolute path: '{save_to}'.",
+            _allowed_hint(dirs),
+        )
+    resolved = Path(os.path.realpath(path))
+    if not any(resolved == d or d in resolved.parents for d in dirs):
+        raise SaveError(
+            "save_path_not_allowed",
+            f"'{save_to}' is outside the folders exports may be saved in.",
+            _allowed_hint(dirs),
+        )
+    if resolved.exists() and not resolved.is_dir():
+        raise SaveError(
+            "invalid_save_path",
+            f"'{save_to}' is a file; exporting several documents needs a folder.",
+            "Give a folder path for save_to.",
+        )
+    return resolved
+
+
+def safe_file_name(name: str) -> str:
+    """A document name usable as a file name on macOS, Linux and Windows."""
+    cleaned = "".join("-" if c in '/\\:*?"<>|' or ord(c) < 32 else c for c in name)
+    cleaned = cleaned.strip().strip(".")
+    return cleaned or "Untitled"
+
+
 def exported_document_id(path: Path) -> Optional[str]:
     """The reMarkable document id an earlier export at ``path`` records, if any.
 

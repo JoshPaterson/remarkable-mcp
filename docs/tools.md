@@ -577,6 +577,8 @@ used when configured; otherwise OCR runs locally with Tesseract.
 | `pages` | int \| string | all pages | PDF only: one page (`5`) or ranges (`"5-9,12"`) |
 | `save_to` | string | none | Absolute path of a `.pdf` or `.md` file to save the export at, inside a folder listed in `REMARKABLE_EXPORT_DIRS` |
 | `overwrite` | bool | `False` | With `save_to`: replace an existing file that is an earlier export of the same document |
+| `folder` | string | none | Export every document in this folder and its subfolders (needs `save_to` as a folder) |
+| `tags` | list | none | Export documents with any of these tags (needs `save_to` as a folder) |
 
 ### Delivery and lifecycle
 
@@ -609,6 +611,25 @@ without `save_to`.
 "env": {
     "REMARKABLE_EXPORT_DIRS": "/Users/me/Library/Mobile Documents/com~apple~CloudDocs/Projects"
 }
+```
+
+### Exporting a folder or tagged documents
+
+Instead of `document`, give `folder` (every document in it and its
+subfolders) and/or `tags` (documents with any of the tags; the whole library
+without `folder`), with `save_to` a folder inside `REMARKABLE_EXPORT_DIRS`.
+Subfolders are recreated under it and files are named after the documents
+(characters a file name cannot hold become `-`; two documents with the same
+name in one folder get the second's id appended). Each document is exported
+on its own, so one failure does not stop the rest: the response lists `saved`
+(each file's `saved_path`, `size`, `pages`, `sha256`, `status`, `warnings`)
+and `failed` (with the error, such as `file_exists`). `overwrite` works per
+file as above; `pages` is not available. At most 200 documents are exported
+in one call.
+
+```python
+remarkable_export(folder="/Classes/Lunar Theory/Worksheets", tags=["Graded"],
+                  save_to="/Users/me/Projects/Classes/Lunar Theory/Graded")
 ```
 
 These local writes are why the tool declares `readOnlyHint=false`.
