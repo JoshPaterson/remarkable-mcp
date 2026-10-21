@@ -103,6 +103,33 @@ cloud (2026-10-19):
 - **Concurrent edit.** A cover layer added while the tablet drew offline
   merged: both kept.
 
+## Text highlights (verified)
+
+The tablet's text highlights (made by selecting PDF text with the
+highlighter) are `SceneGlyphItemBlock`s (block type `0x03`) on a layer, each
+holding a `GlyphRange(start, length, text, color, rectangles, color_rgba)`.
+rmscene re-encodes them byte for byte. Verified on a Paper Pro (2026-10-21):
+
+- **One item per line.** The tablet cannot highlight across lines in one
+  stroke; a two-line selection is two items.
+- **`start`** is the offset of the text in the page's text as PyMuPDF's
+  `get_text()` gives it, plus one for every line break before it (the tablet
+  counts a line break as two characters). `length` is the text's length.
+  Matched on every highlight checked (OCR'd and typeset pages).
+- **`rectangles`** are in stroke units (x centered on the page, y from the
+  top). Matching the tablet within about 0.5pt: top halfway between
+  PyMuPDF's loose (default) and tight (`TEXT_ACCURATE_BBOXES`) character
+  boxes' tops, bottom at the tight box's bottom, left edge 0.16 x font size
+  (pt) before the loose box and right edge 0.10 x font size after it.
+  Rectangles from the loose box alone stand visibly too tall.
+- **Colors.** Yellow is stored as id 3 with `color_rgba` (0, 0, 0, 255); the
+  blue highlighter as id 9 with `color_rgba` (190, 234, 254, 255).
+- **Written by the MCP** under its own author id on Layer 1 (new ink file
+  as in "Page with no ink"), they show, can be erased, and match the tablet's
+  own. A wrong `start` still displayed normally.
+- **Undo after erase** re-creates the highlight as a new item under the
+  tablet's author (the MCP's item stays a tombstone).
+
 ## Edge cases
 
 - **Partial erase on the tablet** tombstones the stroke and adds the remaining
