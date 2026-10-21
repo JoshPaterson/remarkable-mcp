@@ -1591,7 +1591,6 @@ async def remarkable_status() -> str:
     - remarkable_status()
     </examples>
     """
-    import os
 
     from remarkable_mcp.api import (
         REMARKABLE_USE_LOCAL_DIR,
