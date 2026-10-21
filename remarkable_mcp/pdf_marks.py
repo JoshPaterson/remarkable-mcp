@@ -232,6 +232,8 @@ def for_export(pdf_bytes: bytes) -> bytes:
 
     drawn = []
     for mark in marks:
+        if mark.get("kind") == "text_highlight":
+            continue  # ink, drawn by the export's ink layer
         size = sizes[mark["pdf_page"]]
         mark = redraw(mark, size)
         if mark.get("leader"):
@@ -314,7 +316,7 @@ def build(base: bytes, marks: Sequence[Dict[str, Any]], embed: bool = True) -> b
             if page.rotation:
                 raise MarkError("Rotated PDF pages are not supported.")
             for part in (mark, mark.get("leader")):
-                if part:
+                if part and part.get("pdf"):
                     with pymupdf.open("pdf", base64.b64decode(part["pdf"])) as snippet:
                         page.show_pdf_page(_points(page.rect, part["box"]), snippet, 0)
         if embed:
@@ -1114,7 +1116,11 @@ def summarize(
     for key in ("shape", "text", "latex", "path", "format"):
         if key in mark:
             out[key] = mark[key]
-    if mark.get("color"):
+    if mark["kind"] == "text_highlight":
+        out["color"] = mark.get("color_name")
+        if cover_state:
+            out["state"] = cover_state
+    elif mark.get("color"):
         out["color"] = color_name(mark["color"], _palette(mark.get("shape")))
     if "from" in mark:
         out["from"], out["to"] = mark["from"], mark["to"]
@@ -1456,8 +1462,13 @@ def edit_marks(
     sizes: Sequence[Tuple[float, float]],
     color: Optional[str],
     obstacles: Optional[Callable[[int], Any]] = None,
+    locate: Optional[Callable[[int, str, int], List[Dict[str, Any]]]] = None,
 ) -> Dict[str, Any]:
     """Apply removals, then additions, to a copy of ``marks``.
+
+    A ``text_highlight`` mark is found on its page with ``locate(pdf_page,
+    text, occurrence)`` (see ``text_highlights.find_text``); it is written to
+    the page's ink later, so it is stored without a PDF snippet.
 
     ``page_map`` maps each tablet page (1-based position) to its PDF page
     index (``None`` for pages added on the tablet); ``sizes`` are the PDF's
@@ -1517,9 +1528,13 @@ def edit_marks(
         try:
             description = _description(request.get("description"))
             cover = _cover(request)
-            if "leader" in options and "near" not in options:
+            if "text_highlight" in options:
+                if cover:
+                    raise MarkError("A text highlight cannot have a cover; it can be erased.")
+                stored = _text_highlight(options, sizes[pdf_page], pdf_page, color, locate)
+            elif "leader" in options and "near" not in options:
                 raise MarkError("leader applies only to marks placed with near.")
-            if "near" in options:
+            elif "near" in options:
                 if obstacles is None:
                     raise MarkError("near is not available here.")
                 found = obstacles(pdf_page)
@@ -1548,6 +1563,50 @@ def edit_marks(
         "removed": removed,
         "notes": notes,
         "changed": bool(added or removed),
+    }
+
+
+def _text_highlight(options, size, pdf_page: int, color: Optional[str], locate) -> Dict[str, Any]:
+    """A text highlight mark from ``{"text_highlight": text, "occurrence",
+    "color", "layer"}``: the matched lines, to be written as tablet ink."""
+    from remarkable_mcp.text_highlights import COLORS, DEFAULT_COLOR, HighlightError
+
+    unknown = set(options) - {"text_highlight", "occurrence", "color", "layer"}
+    if unknown:
+        raise MarkError(f"text_highlight does not take: {', '.join(sorted(unknown))}.")
+    query = options["text_highlight"]
+    if not isinstance(query, str) or not query.strip():
+        raise MarkError("text_highlight must be the text to highlight.")
+    occurrence = options.get("occurrence", 1)
+    if isinstance(occurrence, bool) or not isinstance(occurrence, int) or occurrence < 1:
+        raise MarkError("occurrence must be 1 or more.")
+    name = options.get("color", color if color in COLORS else DEFAULT_COLOR)
+    if name not in COLORS:
+        raise MarkError(f"A text highlight's color is one of: {', '.join(COLORS)}.")
+    layer = options.get("layer")
+    if layer is not None and (not isinstance(layer, str) or not layer.strip()):
+        raise MarkError("layer must be a layer name.")
+    if locate is None:
+        raise MarkError("text_highlight is not available here.")
+    try:
+        parts = locate(pdf_page, query, occurrence)
+    except HighlightError as e:
+        raise MarkError(str(e)) from None
+    width, height = size
+    box = [
+        _round(min(p["rect"][0] for p in parts) / width),
+        _round(min(p["rect"][1] for p in parts) / height),
+        _round(max(p["rect"][2] for p in parts) / width),
+        _round(max(p["rect"][3] for p in parts) / height),
+    ]
+    request = {k: v for k, v in options.items() if k != "text_highlight"}
+    return {
+        "kind": "text_highlight",
+        "text": " ".join(p["text"] for p in parts),
+        "color_name": name,
+        "box": [min(max(v, 0.0), 1.0) for v in box],
+        "request": request,
+        "highlight": {"parts": parts, "layer": layer, "pending": True},
     }
 
 

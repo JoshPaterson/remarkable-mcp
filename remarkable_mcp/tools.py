@@ -2657,6 +2657,8 @@ def _mark_line(summary: dict) -> str:
     ]
     if style:
         line += f" [{', '.join(style)}]"
+    if summary.get("state"):
+        line += f" [{summary['state']}]"
     cover = summary.get("cover")
     if cover:
         state = f": {cover['state']}" if cover.get("state") else ""

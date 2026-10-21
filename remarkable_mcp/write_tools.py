@@ -1368,12 +1368,19 @@ def _mark_editor(
     def edit(pdf: bytes, content: dict, read_ink=None) -> dict:
         """``read_ink(page_id)`` returns a page's ink file (or None); it is
         needed to write marks' covers and report their state."""
-        from remarkable_mcp import cover_layers
+        from remarkable_mcp import cover_layers, text_highlights
         from remarkable_mcp.pages import content_page_ids
 
         base, marks = pdf_marks.load_state(pdf)
         page_map = pdf_page_map(content)
         page_ids = content_page_ids(content)
+
+        def locate(pdf_page: int, text: str, occurrence: int):
+            import pymupdf
+
+            with pymupdf.open(stream=base, filetype="pdf") as doc:
+                return text_highlights.find_text(doc[pdf_page], text, occurrence)
+
         result = pdf_marks.edit_marks(
             marks,
             add=add,
@@ -1383,6 +1390,7 @@ def _mark_editor(
             sizes=pdf_marks.page_sizes(base),
             color=color,
             obstacles=(lambda i: obstacles(i, page_map)) if obstacles else None,
+            locate=locate,
         )
         touched = {m["pdf_page"] for m in marks if m["id"] in result["removed"]}
         touched |= {m["pdf_page"] for m in result["marks"] if m["id"] in result["added"]}
@@ -1408,6 +1416,27 @@ def _mark_editor(
                 )
             except cover_layers.CoverError as e:
                 raise pdf_marks.MarkError(str(e)) from None
+        inks = [m.get("highlight") for m in marks + result["marks"]]
+        if build and result["changed"] and any(isinstance(h, dict) for h in inks):
+            if read_ink is None:
+                raise pdf_marks.MarkError("Text highlights cannot be written here.")
+            covered = result["ink"]
+            try:
+                result["ink"] = dict(
+                    covered,
+                    **text_highlights.write_mark_highlights(
+                        marks,
+                        result["marks"],
+                        result["removed"],
+                        page_ids=page_ids,
+                        page_map=page_map,
+                        sizes=pdf_marks.page_sizes(base),
+                        read_ink=lambda page_id: covered.get(page_id) or read_ink(page_id),
+                        author=cover_layers.author_uuid(),
+                    ),
+                )
+            except text_highlights.HighlightError as e:
+                raise pdf_marks.MarkError(str(e)) from None
         result["cover_states"], cover_notes = {}, []
         if read_ink is not None:
             written = result["ink"]
@@ -1416,6 +1445,14 @@ def _mark_editor(
                 page_ids=page_ids,
                 page_map=page_map,
                 read_ink=lambda page_id: written.get(page_id) or read_ink(page_id),
+            )
+            result["cover_states"].update(
+                text_highlights.mark_highlight_states(
+                    result["marks"],
+                    page_ids=page_ids,
+                    page_map=page_map,
+                    read_ink=lambda page_id: written.get(page_id) or read_ink(page_id),
+                )
             )
         result["notes"] = result["notes"] + cover_notes
         result["pdf"] = pdf_marks.build(base, result["marks"]) if result["changed"] else None
@@ -1509,7 +1546,41 @@ def _mark_layout(client, files: list, pdf: bytes, page: int, page_map: list) -> 
         "text_lines": lines,
         "ink": ink,
         "free": free_regions(ink + [line["region"] for line in lines] + marks),
+        "layers": _page_layer_list(client, files, page),
     }
+
+
+def _page_layer_list(client, files: list, page: int) -> list:
+    """A tablet page's layers, bottom first: ``{"name", "visible",
+    "selected"}``; empty when the page has no ink yet (Layer 1 is made with
+    the first ink)."""
+    from rmscene.scene_stream import SceneInfo
+
+    from remarkable_mcp import cover_layers
+    from remarkable_mcp.pages import content_page_ids
+
+    content_file = next((f for f in files if f["id"].endswith(".content")), None)
+    if content_file is None:
+        return []
+    content = json.loads(client._get_file(content_file["hash"], content_file["id"]))
+    page_ids = content_page_ids(content)
+    if not 1 <= page <= len(page_ids):
+        return []
+    rm = next((f for f in files if f["id"].endswith(f"/{page_ids[page - 1]}.rm")), None)
+    if rm is None:
+        return []
+    data = client._get_file(rm["hash"], rm["id"])
+    selected = None
+    for block in cover_layers._parse(data):
+        if isinstance(block, SceneInfo) and block.current_layer is not None:
+            selected = cover_layers._key(block.current_layer.value)
+    layers = cover_layers.page_layers(data)
+    if selected not in {layer["id"] for layer in layers} and layers:
+        selected = layers[0]["id"]
+    return [
+        {"name": layer["name"], "visible": layer["visible"], "selected": layer["id"] == selected}
+        for layer in layers
+    ]
 
 
 def _mark_response(target, result: dict, dry_run: bool) -> str:
@@ -3152,6 +3223,13 @@ def register_write_tools():
                   or data: URIs.
                 - graphic_file: path of such a file on the machine running this
                   server (up to 10 MB), with region
+                - text_highlight: text on the page to highlight as the tablet's
+                  own highlighter does (the user can erase it on the tablet);
+                  it may run over several lines. Options: color (a highlighter
+                  color, default yellow), occurrence (which match, default 1),
+                  layer (a layer name; a new one is added on top if the page has
+                  none; default the page's selected layer, as the tablet does).
+                  layout lists the page's layers. Not with at, region or near.
                 Instead of at or region, text, latex, check, cross and path marks
                 can take near [x, y]: the mark is put in the closest free space to
                 that point, clear of the user's ink, the printed text and other
