@@ -1715,6 +1715,139 @@ def _ocr_document(client, target) -> str:
     )
 
 
+MAX_INSERT_FILE_BYTES = 50 * 1024 * 1024
+
+
+def _new_pdf_pages(entry: dict, size) -> "Any":
+    """The pages an insert entry adds, as a PDF document: ``blank`` (a count),
+    ``markdown`` (rendered and fitted to ``size``) or ``pdf_file`` (a PDF on
+    this machine, all its pages)."""
+    import pymupdf
+
+    from remarkable_mcp.pdf_marks import MarkError
+
+    kinds = [k for k in ("blank", "markdown", "pdf_file") if k in entry]
+    if len(kinds) != 1:
+        raise MarkError('Each insert needs exactly one of "blank", "markdown" or "pdf_file".')
+    kind = kinds[0]
+    out = pymupdf.open()
+    if kind == "blank":
+        count = entry["blank"]
+        if count is True:
+            count = 1
+        if isinstance(count, bool) or not isinstance(count, int) or not 1 <= count <= 100:
+            raise MarkError("blank must be a number of pages from 1 to 100.")
+        for _ in range(count):
+            out.new_page(width=size[0], height=size[1])
+    elif kind == "markdown":
+        from remarkable_mcp.markdown_pdf import render_markdown_pdf
+
+        if not isinstance(entry["markdown"], str) or not entry["markdown"].strip():
+            raise MarkError("markdown must be non-empty text.")
+        rendered = pymupdf.open("pdf", render_markdown_pdf(entry["markdown"]))
+        for page in rendered:
+            new = out.new_page(width=size[0], height=size[1])
+            new.show_pdf_page(new.rect, rendered, page.number)
+    else:
+        from pathlib import Path
+
+        path = Path(str(entry["pdf_file"])).expanduser()
+        if not path.is_file():
+            raise MarkError(f"pdf_file not found: {path}")
+        if path.stat().st_size > MAX_INSERT_FILE_BYTES:
+            raise MarkError("pdf_file is larger than 50 MB.")
+        try:
+            source = pymupdf.open(path)
+        except Exception:
+            raise MarkError(f"pdf_file is not a readable PDF: {path}") from None
+        if not source.is_pdf or len(source) == 0:
+            raise MarkError(f"pdf_file is not a PDF with pages: {path}")
+        out.insert_pdf(source)
+    return out
+
+
+def _pages_editor(inserts: list, build: bool):
+    """``edit(pdf, content, pagedata)`` for ``replace_document_pdf`` that
+    inserts pages; marks, outline and OCR record move with their pages."""
+    import copy
+    import uuid
+
+    import pymupdf
+
+    from remarkable_mcp import cover_layers, pdf_marks
+    from remarkable_mcp.pages import content_page_ids, insert_pdf_pages, pdf_page_map
+
+    def edit(pdf: bytes, content: dict, pagedata) -> dict:
+        base, marks = pdf_marks.load_state(pdf)
+        outline = pdf_marks.load_outline(pdf)
+        ocr = pdf_marks.load_ocr(pdf)
+        with pymupdf.open(stream=pdf, filetype="pdf") as current:
+            embedded = pdf_marks.BASE_FILE in current.embfile_names()
+        content = copy.deepcopy(content)
+        templates = pagedata.split("\n") if pagedata is not None else None
+        page_count = len(pdf_page_map(content))
+        for entry in inserts:
+            after = entry.get("after") if isinstance(entry, dict) else None
+            if isinstance(after, bool) or not isinstance(after, int):
+                raise pdf_marks.MarkError('Each insert needs "after": a page number (0: first).')
+            if not 0 <= after <= page_count:
+                raise pdf_marks.MarkError(
+                    f"Page {after} does not exist; the document has {page_count}."
+                )
+        doc = pymupdf.open(stream=base, filetype="pdf")
+        author = str(cover_layers.author_uuid())
+        new_ids: list = []
+        marks = [dict(m) for m in marks]
+        for entry in sorted(inserts, key=lambda e: e["after"], reverse=True):
+            page_map = pdf_page_map(content)
+            earlier = [p for p in page_map[: entry["after"]] if p is not None]
+            later = [p for p in page_map[entry["after"] :] if p is not None]
+            near = earlier[-1] if earlier else (later[0] if later else 0)
+            size = (doc[near].rect.width, doc[near].rect.height) if len(doc) else (595, 842)
+            new = _new_pdf_pages(entry, size)
+            ids = [str(uuid.uuid4()) for _ in range(len(new))]
+            target = insert_pdf_pages(content, entry["after"], ids, author, templates)
+            doc.insert_pdf(new, start_at=target)
+            count = len(new)
+            for mark in marks:
+                if mark["pdf_page"] >= target:
+                    mark["pdf_page"] += count
+            if outline is not None:
+                outline = [
+                    (
+                        dict(e, pdf_page=e["pdf_page"] + count)
+                        if e["pdf_page"] is not None and e["pdf_page"] >= target
+                        else e
+                    )
+                    for e in outline
+                ]
+            if ocr:
+                ocr = dict(
+                    ocr,
+                    pdf_pages=[p + count if p >= target else p for p in ocr.get("pdf_pages", [])],
+                )
+            new_ids += ids
+        new_base = doc.tobytes(garbage=3, deflate=True)
+        doc.close()
+        if marks or outline is not None or embedded:
+            new_pdf = pdf_marks.build(new_base, marks, outline=outline, ocr=ocr)
+        elif ocr:
+            new_pdf = pdf_marks.record_ocr(new_base, ocr)
+        else:
+            new_pdf = new_base
+        order = content_page_ids(content)
+        inserted = sorted(order.index(i) + 1 for i in new_ids)
+        return {
+            "pdf": new_pdf if build else None,
+            "content": content,
+            "pagedata": "\n".join(templates) if templates is not None else None,
+            "inserted_pages": inserted,
+            "page_count": len(order),
+        }
+
+    return edit
+
+
 def _outline_editor(outline, build: bool):
     """``edit(pdf, content)`` for ``replace_document_pdf`` that sets a PDF's
     outline (None lists it, "original" restores the PDF's own)."""
@@ -3693,6 +3826,121 @@ def register_write_tools():
                         return make_error(
                             error_type="ocr_failed",
                             message=f"OCR failed: {e}",
+                            suggestion="Check that the document is a PDF and try again.",
+                        )
+
+                return await asyncio.to_thread(_impl)
+
+            @mcp.tool(annotations=WRITE_ANNOTATIONS)
+            async def remarkable_pdf_pages(
+                document: str,
+                insert: List[Dict[str, Any]],
+                dry_run: bool = False,
+            ):
+                """
+                <usecase>Insert new pages anywhere in a PDF document on the tablet:
+                blank pages, pages written in Markdown (e.g. feedback, an answer
+                key, worked solutions) or the pages of a PDF file.</usecase>
+                <instructions>
+                Each entry of insert puts pages after a tablet page:
+                {"after": N, ...} with N a tablet page number (0 puts them
+                first), and exactly one of
+                - "blank": a number of blank pages,
+                - "markdown": text rendered as pages (headings, lists, tables),
+                - "pdf_file": the path of a PDF on this machine (all its pages).
+                Page numbers in "after" refer to the document before this call,
+                so several inserts can be given at once. New blank and Markdown
+                pages take the size of the page before them.
+
+                The new pages are real PDF pages: they can be marked with
+                remarkable_mark_pdf and listed in the outline. Later pages move
+                down; the user's ink, marks, outline entries and OCR text stay
+                on their pages. dry_run=True returns where the pages would go
+                without writing. The tablet shows the pages after its next sync.
+
+                Cloud mode only. PDF documents only.
+                </instructions>
+                <parameters>
+                - document: Document name or path
+                - insert: List of {"after": N, "blank" | "markdown" | "pdf_file": ...}
+                - dry_run: Report the result without writing
+                </parameters>
+                <examples>
+                - remarkable_pdf_pages("Week 3 worksheet", insert=[
+                    {"after": 4, "markdown": "# Feedback\n\n- Q2: check the sign"}])
+                - remarkable_pdf_pages("Notes", insert=[{"after": 0, "blank": 1},
+                                                        {"after": 7, "blank": 2}])
+                - remarkable_pdf_pages("Book", insert=[
+                    {"after": 12, "pdf_file": "/Users/me/maps/plate-3.pdf"}])
+                </examples>
+                """
+                from remarkable_mcp.pdf_marks import MarkError
+
+                def invalid(message: str, suggestion: str) -> str:
+                    return make_error(
+                        error_type="invalid_parameter", message=message, suggestion=suggestion
+                    )
+
+                if not isinstance(insert, list) or not insert:
+                    return invalid(
+                        "insert must be a non-empty list of entries.",
+                        'Example: insert=[{"after": 2, "blank": 1}]',
+                    )
+
+                def _impl():
+                    error = _require_managed_write_mode()
+                    if error:
+                        return error
+                    client = get_rmapi()
+                    try:
+                        collection = client.get_meta_items()
+                        items_by_id = get_items_by_id(collection)
+                        target = _resolve_document(document, collection, items_by_id)
+                        if not target or target.is_folder:
+                            return make_error(
+                                error_type="document_not_found",
+                                message=f"PDF document not found: '{document}'",
+                                suggestion="Use remarkable_browse() to find the correct name.",
+                            )
+                        edit = _pages_editor(insert, build=not dry_run)
+                        if dry_run:
+                            pdf, content, files = client.read_document_pdf(target.ID)
+                            pagedata_file = next(
+                                (f for f in files if f["id"].endswith(".pagedata")), None
+                            )
+                            pagedata = (
+                                client._get_file(pagedata_file["hash"], pagedata_file["id"]).decode(
+                                    "utf-8"
+                                )
+                                if pagedata_file
+                                else None
+                            )
+                            result = edit(pdf, content, pagedata)
+                        else:
+                            result = client.replace_document_pdf(target.ID, edit, with_pages=True)
+                            _invalidate_client_cache(client)
+                        data = {
+                            "document": target.VissibleName,
+                            "inserted_pages": result["inserted_pages"],
+                            "page_count": result["page_count"],
+                            "transport": "cloud",
+                        }
+                        if dry_run:
+                            data["dry_run"] = True
+                            hint = "Dry run: nothing was written. Repeat without dry_run."
+                        else:
+                            hint = (
+                                f"Inserted {len(result['inserted_pages'])} page(s) into "
+                                f"'{target.VissibleName}'. The tablet shows them after its "
+                                "next sync."
+                            )
+                        return make_response(data, hint)
+                    except (MarkError, ValueError) as e:
+                        return invalid(str(e), "Fix the insert entries and try again.")
+                    except Exception as e:
+                        return make_error(
+                            error_type="insert_failed",
+                            message=f"Failed to insert pages: {e}",
                             suggestion="Check that the document is a PDF and try again.",
                         )
 
