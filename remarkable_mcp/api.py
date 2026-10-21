@@ -249,6 +249,12 @@ def get_rmapi():
     return _get_cloud_client()
 
 
+def fell_back_to_cloud() -> bool:
+    """True when a configured device transport was unreachable and get_rmapi()
+    returned the cloud client instead."""
+    return _fell_back_to_cloud
+
+
 def get_active_transport() -> str:
     """Return the transport actually in use ("cloud", "ssh", "usb-web", or "local-dir").
 
@@ -258,7 +264,7 @@ def get_active_transport() -> str:
     has been called, so callers should resolve the client first if they need an
     accurate post-fallback value.
     """
-    if _fell_back_to_cloud:
+    if fell_back_to_cloud():
         return "cloud"
     if REMARKABLE_USE_LOCAL_DIR:
         return "local-dir"

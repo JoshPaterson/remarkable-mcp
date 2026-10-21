@@ -79,8 +79,10 @@ _img_uri_to_doc: dict[str, tuple] = {}  # Map image URI template -> (client, doc
 
 
 def _is_ssh_mode() -> bool:
-    """Check if SSH transport is enabled (evaluated at runtime)."""
-    return os.environ.get("REMARKABLE_USE_SSH", "").lower() in ("1", "true", "yes")
+    """Check if the SSH transport is in use (False after a fallback to cloud)."""
+    from remarkable_mcp.api import get_active_transport
+
+    return get_active_transport() == "ssh"
 
 
 def _make_doc_resource(client, document):

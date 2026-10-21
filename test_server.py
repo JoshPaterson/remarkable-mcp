@@ -4360,6 +4360,50 @@ class TestCloudStartupFallback:
         finally:
             api.reset_client_cache()
 
+    @pytest.mark.parametrize("transport", ["ssh", "usb-web"])
+    def test_mode_checks_follow_cloud_fallback(self, monkeypatch, tmp_path, transport):
+        from remarkable_mcp import resources, write_tools
+
+        api, cloud = self._setup_cloud(monkeypatch, tmp_path, '{"devicetoken": "d"}')
+        use_ssh = transport == "ssh"
+        monkeypatch.setattr(api, "REMARKABLE_USE_SSH", use_ssh)
+        monkeypatch.setattr(api, "REMARKABLE_USE_USB_WEB", not use_ssh)
+        monkeypatch.setattr(api, "REMARKABLE_DISABLE_CLOUD_FALLBACK", False)
+        monkeypatch.delenv("REMARKABLE_USE_LOCAL_DIR", raising=False)
+        monkeypatch.delenv("REMARKABLE_LOCAL_DIR", raising=False)
+        monkeypatch.setenv("REMARKABLE_USE_SSH", "1" if use_ssh else "")
+        monkeypatch.setenv("REMARKABLE_USE_USB_WEB", "" if use_ssh else "1")
+        device = self._device_client(reachable=False)
+        monkeypatch.setattr("remarkable_mcp.ssh.create_ssh_client", lambda: device)
+        monkeypatch.setattr("remarkable_mcp.usb_web.create_usb_web_client", lambda: device)
+
+        api.reset_client_cache()
+        try:
+            assert write_tools._is_ssh_mode() is use_ssh
+            assert write_tools._is_usb_web_mode() is not use_ssh
+            assert resources._is_ssh_mode() is use_ssh
+            assert write_tools._is_cloud_mode() is False
+
+            assert api.get_rmapi() is cloud
+
+            assert write_tools._is_ssh_mode() is False
+            assert write_tools._is_usb_web_mode() is False
+            assert resources._is_ssh_mode() is False
+            assert write_tools._is_cloud_mode() is True
+        finally:
+            api.reset_client_cache()
+
+    def test_ssh_mode_defers_to_usb_web_like_get_rmapi(self, monkeypatch):
+        from remarkable_mcp import write_tools
+
+        monkeypatch.delenv("REMARKABLE_USE_LOCAL_DIR", raising=False)
+        monkeypatch.delenv("REMARKABLE_LOCAL_DIR", raising=False)
+        monkeypatch.setenv("REMARKABLE_USE_SSH", "1")
+        monkeypatch.setenv("REMARKABLE_USE_USB_WEB", "1")
+
+        assert write_tools._is_usb_web_mode() is True
+        assert write_tools._is_ssh_mode() is False
+
     def test_device_reachable_no_fallback(self, monkeypatch, tmp_path):
         api, cloud = self._setup_cloud(monkeypatch, tmp_path, '{"devicetoken": "d"}')
         monkeypatch.setattr(api, "REMARKABLE_USE_USB_WEB", True)
