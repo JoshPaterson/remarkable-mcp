@@ -135,7 +135,7 @@ async def test_ocr_writes_every_scanned_page_and_keeps_marks(cloud):
         assert "Scanned words" in doc[1].get_text() and "Scanned words" in doc[2].get_text()
         assert doc[0].get_text().startswith("Typed title")
     assert [m["id"] for m in pdf_marks.stored_marks(pdf)] == ["n"]
-    assert pdf_marks.load_ocr(pdf) == {"backend": "fake", "pdf_pages": [1, 2]}
+    assert pdf_marks.MarkedPdf.load(pdf).ocr == {"backend": "fake", "pdf_pages": [1, 2]}
 
     again = await _ocr(document="Worksheet")
     assert again["done"] and not again["changed"] and cloud.commits == 2
@@ -153,7 +153,19 @@ async def test_ocr_without_marks_does_not_embed_a_copy(cloud):
     with pymupdf.open(stream=pdf, filetype="pdf") as doc:
         assert pdf_marks.BASE_FILE not in doc.embfile_names()
     assert len(pdf) < size * 1.5
-    assert pdf_marks.load_ocr(pdf)["pdf_pages"] == [1, 2]
+    assert pdf_marks.MarkedPdf.load(pdf).ocr["pdf_pages"] == [1, 2]
+
+
+def test_ocr_only_pdf_exports_without_its_record():
+    pdf = pdf_marks.record_ocr(_book(), {"backend": "fake", "pdf_pages": [1]})
+    state = pdf_marks.MarkedPdf.load(pdf)
+    assert state.marks == [] and state.ocr == {"backend": "fake", "pdf_pages": [1]}
+    for out in (state.base, pdf_marks.for_export(pdf), pdf_marks.original_pdf(pdf)):
+        with pymupdf.open(stream=out, filetype="pdf") as doc:
+            assert doc.embfile_names() == [] and len(doc) == 4
+    assert pdf_marks.MarkedPdf.load(pdf).base == state.base
+    with pymupdf.open(stream=state.pdf(), filetype="pdf") as doc:
+        assert doc.embfile_names() == [pdf_marks.MARKS_FILE]
 
 
 async def test_folder_needs_check(cloud):

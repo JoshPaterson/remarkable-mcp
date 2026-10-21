@@ -22,6 +22,7 @@ no external Go binary required.
 """
 
 import asyncio
+import dataclasses
 import json
 import logging
 import os
@@ -1371,7 +1372,8 @@ def _mark_editor(
         from remarkable_mcp import mark_ink, rm_ink, text_highlights
         from remarkable_mcp.pages import content_page_ids
 
-        base, marks = pdf_marks.load_state(pdf)
+        state = pdf_marks.MarkedPdf.load(pdf)
+        base, marks = state.base, state.marks
         page_map = pdf_page_map(content)
         page_ids = content_page_ids(content)
         sizes = pdf_marks.page_sizes(base)
@@ -1431,14 +1433,7 @@ def _mark_editor(
             )
         result["notes"] = result["notes"] + cover_notes
         result["pdf"] = (
-            pdf_marks.build(
-                base,
-                result["marks"],
-                outline=pdf_marks.load_outline(pdf),
-                ocr=pdf_marks.load_ocr(pdf),
-            )
-            if result["changed"]
-            else None
+            dataclasses.replace(state, marks=result["marks"]).pdf() if result["changed"] else None
         )
         if not build:
             result["preview_pdf"], result["pdf"] = result["pdf"], None
@@ -1684,7 +1679,7 @@ def _ocr_document(client, target) -> str:
     from remarkable_mcp.pages import pdf_page_map
 
     pdf, content, _ = client.read_document_pdf(target.ID)
-    base, _ = pdf_marks.load_state(pdf)
+    base = pdf_marks.MarkedPdf.load(pdf).base
     found = pdf_ocr.pages_needing_ocr(base)
     page_map = pdf_page_map(content)
     name = target.VissibleName
@@ -1709,23 +1704,15 @@ def _ocr_document(client, target) -> str:
         )
 
     def edit(current: bytes, _content: dict) -> dict:
-        current_base, marks = pdf_marks.load_state(current)
-        if current_base != base:
+        state = pdf_marks.MarkedPdf.load(current)
+        if state.base != base:
             raise pdf_marks.MarkError(
                 f"'{name}' changed while it was being OCR'd; call again to OCR the new version."
             )
         new_base = pdf_ocr.with_text_layers(base, {i: pages[i] for i in found["scanned"]})
-        record = pdf_marks.load_ocr(current) or {"pdf_pages": []}
-        record = {
-            "backend": backend,
-            "pdf_pages": sorted(set(record.get("pdf_pages", [])) | set(found["scanned"])),
-        }
-        outline = pdf_marks.load_outline(current)
-        if marks or outline is not None:
-            new_pdf = pdf_marks.build(new_base, marks, outline=outline, ocr=record)
-        else:
-            new_pdf = pdf_marks.record_ocr(new_base, record)
-        return {"pdf": new_pdf}
+        done = (state.ocr or {}).get("pdf_pages", [])
+        record = {"backend": backend, "pdf_pages": sorted(set(done) | set(found["scanned"]))}
+        return {"pdf": dataclasses.replace(state, base=new_base, ocr=record).pdf()}
 
     client.replace_document_pdf(target.ID, edit)
     _invalidate_client_cache(client)
@@ -1807,11 +1794,8 @@ def _pages_editor(inserts: list, build: bool):
     from remarkable_mcp.pages import content_page_ids, insert_pdf_pages, pdf_page_map
 
     def edit(pdf: bytes, content: dict, pagedata) -> dict:
-        base, marks = pdf_marks.load_state(pdf)
-        outline = pdf_marks.load_outline(pdf)
-        ocr = pdf_marks.load_ocr(pdf)
-        with pymupdf.open(stream=pdf, filetype="pdf") as current:
-            embedded = pdf_marks.BASE_FILE in current.embfile_names()
+        state = pdf_marks.MarkedPdf.load(pdf)
+        marks, outline, ocr = state.marks, state.outline, state.ocr
         content = copy.deepcopy(content)
         templates = pagedata.split("\n") if pagedata is not None else None
         page_count = len(pdf_page_map(content))
@@ -1823,7 +1807,7 @@ def _pages_editor(inserts: list, build: bool):
                 raise pdf_marks.MarkError(
                     f"Page {after} does not exist; the document has {page_count}."
                 )
-        doc = pymupdf.open(stream=base, filetype="pdf")
+        doc = pymupdf.open(stream=state.base, filetype="pdf")
         author = str(rm_ink.author_uuid())
         new_ids: list = []
         marks = [dict(m) for m in marks]
@@ -1858,12 +1842,7 @@ def _pages_editor(inserts: list, build: bool):
             new_ids += ids
         new_base = doc.tobytes(garbage=3, deflate=True)
         doc.close()
-        if marks or outline is not None or embedded:
-            new_pdf = pdf_marks.build(new_base, marks, outline=outline, ocr=ocr)
-        elif ocr:
-            new_pdf = pdf_marks.record_ocr(new_base, ocr)
-        else:
-            new_pdf = new_base
+        new_pdf = pdf_marks.MarkedPdf(new_base, marks, outline, ocr).pdf()
         order = content_page_ids(content)
         inserted = sorted(order.index(i) + 1 for i in new_ids)
         return {
@@ -1884,8 +1863,8 @@ def _outline_editor(outline, build: bool):
     from remarkable_mcp.pages import pdf_page_map
 
     def edit(pdf: bytes, content: dict) -> dict:
-        base, marks = pdf_marks.load_state(pdf)
-        current = pdf_marks.load_outline(pdf)
+        state = pdf_marks.MarkedPdf.load(pdf)
+        base, current = state.base, state.outline
         page_map = pdf_page_map(content)
         if outline is None:
             new = current
@@ -1913,11 +1892,7 @@ def _outline_editor(outline, build: bool):
             "outline": listed,
             "source": "set with remarkable_pdf_outline" if new is not None else "the PDF's own",
             "changed": changed,
-            "pdf": (
-                pdf_marks.build(base, marks, outline=new, ocr=pdf_marks.load_ocr(pdf))
-                if changed and build
-                else None
-            ),
+            "pdf": dataclasses.replace(state, outline=new).pdf() if changed and build else None,
         }
 
     return edit
