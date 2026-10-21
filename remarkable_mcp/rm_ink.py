@@ -30,6 +30,8 @@ TREE_BLOCK, NODE_BLOCK, GLYPH_ITEM_BLOCK, GROUP_ITEM_BLOCK, LINE_BLOCK = (
 TEXT_BLOCK, PAGE_INFO_BLOCK, AUTHORS_BLOCK = 0x07, 0x0A, 0x09
 
 AUTHOR_FILE_NAME = "mcp-author"
+# Covers are white fineliner strokes.
+WHITE = 2
 
 Id = Tuple[int, int]
 
@@ -163,7 +165,8 @@ def _authors(blocks: list) -> Dict[int, uuid.UUID]:
     return {}
 
 
-def _number_in(blocks: list, author: Optional[uuid.UUID]) -> Optional[int]:
+def author_number_in(blocks: list, author: Optional[uuid.UUID]) -> Optional[int]:
+    """The file-local number of ``author`` in parsed ink blocks, if listed."""
     for number, value in _authors(blocks).items():
         if value == author:
             return number
@@ -172,7 +175,7 @@ def _number_in(blocks: list, author: Optional[uuid.UUID]) -> Optional[int]:
 
 def author_number(data: bytes, author: uuid.UUID) -> Optional[int]:
     """The file-local number of ``author`` in a page's ink, if listed."""
-    return _number_in(parse(data), author)
+    return author_number_in(parse(data), author)
 
 
 def with_author(data: bytes, author: uuid.UUID) -> Tuple[bytes, int]:
@@ -341,6 +344,51 @@ def item_states(data: Optional[bytes], item_ids: Iterable[Sequence[int]]) -> Dic
     return out
 
 
+def layer_roles(
+    blocks: list,
+    number: Optional[int],
+    cover_ids: Iterable[Sequence[int]] = (),
+    ink_ids: Iterable[Sequence[int]] = (),
+) -> Tuple[set, set]:
+    """``(cover layers, ink layers)``: the layers the MCP (author ``number``)
+    made that hold covers, and those that hold erasable ink or highlights.
+
+    A layer holding any of ``cover_ids`` (the stroke ids of covers, as stored
+    in marks) is a cover layer, and one holding any of ``ink_ids`` an ink
+    layer. Otherwise a layer's live MCP items decide: white fineliner strokes
+    make a cover layer, other strokes and highlights an ink layer. A layer
+    whose MCP items are all erased and not in the stored ids has no role.
+    """
+    from rmscene.scene_items import Pen
+    from rmscene.scene_stream import SceneGlyphItemBlock, SceneLineItemBlock
+
+    covers, inks = set(), set()
+    if number is None:
+        return covers, inks
+    stored_covers, stored_inks = id_set(cover_ids), id_set(ink_ids)
+    fineliners = {int(Pen.FINELINER_1.value), int(Pen.FINELINER_2.value)}
+    for block in blocks:
+        if not isinstance(block, (SceneLineItemBlock, SceneGlyphItemBlock)):
+            continue
+        layer = key(block.parent_id)
+        if layer[0] != number:
+            continue
+        item_id = key(block.item.item_id)
+        if item_id in stored_covers:
+            covers.add(layer)
+        elif item_id in stored_inks:
+            inks.add(layer)
+        elif block.item.value is not None and item_id[0] == number:
+            value = block.item.value
+            white_pen = (
+                isinstance(block, SceneLineItemBlock)
+                and int(value.color) == WHITE
+                and int(value.tool) in fineliners
+            )
+            (covers if white_pen else inks).add(layer)
+    return covers, inks - covers
+
+
 # --- Writing -----------------------------------------------------------------
 
 
@@ -350,16 +398,26 @@ class PageWriter:
     ``data`` is the page's ``.rm`` file, or None for a page without ink (a
     first ink file is made). The MCP's author is added to the file with its
     first new item or layer. ``data`` holds the file with the changes made.
+    ``covers`` and ``inks`` are the MCP's cover and ink layers (see
+    ``layer_roles``, given ``cover_ids`` and ``ink_ids``); erasable ink and
+    highlights never go on a cover layer, and covers never on an ink layer.
     """
 
-    def __init__(self, data: Optional[bytes], author: uuid.UUID):
+    def __init__(
+        self,
+        data: Optional[bytes],
+        author: uuid.UUID,
+        cover_ids: Iterable[Sequence[int]] = (),
+        ink_ids: Iterable[Sequence[int]] = (),
+    ):
         self.author = author
         self.data = first_page_rm(author) if data is None else data
         self._blocks = parse(self.data)
         self._layer_list = _layers(self._blocks)
-        self._number = _number_in(self._blocks, author)
+        self._number = author_number_in(self._blocks, author)
         self._authored = False
         self._counter = next_counter(self._blocks)
+        self.covers, self.inks = layer_roles(self._blocks, self._number, cover_ids, ink_ids)
 
     @property
     def number(self) -> Optional[int]:
@@ -390,15 +448,26 @@ class PageWriter:
         """The live layer the page's SceneInfo selects, or None."""
         return _selected(self._blocks, self._layer_list)
 
-    def find_layer(self, name: str, own: bool = False) -> Optional[Id]:
-        """A live layer named ``name`` (with ``own``, one the MCP made)."""
+    def find_layer(self, name: str, own: bool = False, exclude: Iterable[Id] = ()) -> Optional[Id]:
+        """A live layer named ``name`` that is not in ``exclude`` (with
+        ``own``, one the MCP made)."""
+        exclude = set(exclude)
         for layer in self._layer_list:
-            if layer["name"] != name:
+            if layer["name"] != name or layer["id"] in exclude:
                 continue
             if own and (self._number is None or layer["id"][0] != self._number):
                 continue
             return layer["id"]
         return None
+
+    def cover_layer(self, name: str, shown: bool) -> Id:
+        """The MCP's cover layer named ``name``, made at the bottom of the
+        page (shown or hidden as ``shown`` says) if it has none."""
+        layer = self.find_layer(name, own=True, exclude=self.inks)
+        if layer is None:
+            layer = self.add_layer(name, shown)
+        self.covers.add(layer)
+        return layer
 
     def add_layer(self, name: str, shown: bool, top: bool = False) -> Id:
         """A new layer named ``name`` at the bottom of the page (or with
@@ -458,12 +527,18 @@ class PageWriter:
     def ink_layer(self, name: Optional[str]) -> Id:
         """The layer to put erasable ink or highlights on: the layer named
         ``name`` (made on top if the page has none), else the selected layer,
-        else the first layer the MCP did not make."""
+        else the first layer the MCP did not make. Cover layers are never
+        used."""
         if name is not None:
-            found = self.find_layer(name)
-            return found if found is not None else self.add_layer(name, True, top=True)
+            layer = self.find_layer(name, exclude=self.covers)
+            if layer is None:
+                if self.find_layer(name) is not None:
+                    raise InkError(f"'{name}' is a cover layer; put the ink on another layer.")
+                layer = self.add_layer(name, True, top=True)
+            self.inks.add(layer)
+            return layer
         selected = self.selected_layer()
-        if selected is not None:
+        if selected is not None and selected not in self.covers:
             return selected
         own = [layer["id"] for layer in self._layer_list if layer["id"][0] != self._number]
         if not own:

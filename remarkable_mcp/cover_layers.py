@@ -29,7 +29,7 @@ PAD_PT = 1.5
 GAP_PT = 1.0
 POINT_STEP_PT = 10.0
 RASTER_PER_PT = 4
-WHITE = 2
+WHITE = rm_ink.WHITE
 
 Id = rm_ink.Id
 
@@ -150,9 +150,7 @@ def add_cover(
     """White strokes along ``rows`` on the MCP's layer ``name`` (made at the
     bottom, shown or hidden as ``shown`` says, if the MCP has not made it on
     this page); returns the layer and stroke ids."""
-    layer = page.find_layer(name, own=True)
-    if layer is None:
-        layer = page.add_layer(name, shown)
+    layer = page.cover_layer(name, shown)
     lines = [{"points": row, "width": STROKE_PT} for row in rows]
     return layer, page.add_lines(layer, lines, size, "fineliner", WHITE)
 
@@ -177,8 +175,15 @@ def cover_status(data: Optional[bytes], stroke_ids: Sequence[Sequence[int]]) -> 
     return HIDDEN if any(visible.get(p) for p in live_parents) else SHOWN
 
 
-def foreign_strokes_on_covers(data: Optional[bytes], author: Optional[uuid.UUID]) -> int:
-    """Live strokes by other authors (the user) on the MCP's cover layers.
+def foreign_strokes_on_covers(
+    data: Optional[bytes],
+    author: Optional[uuid.UUID],
+    cover_ids: Iterable[Sequence[int]] = (),
+    ink_ids: Iterable[Sequence[int]] = (),
+) -> int:
+    """Live strokes by other authors (the user) on the MCP's cover layers
+    (see ``rm_ink.layer_roles``, given the stored ``cover_ids`` and
+    ``ink_ids``).
 
     They hide with the marks while the cover layer is shown.
     """
@@ -186,16 +191,15 @@ def foreign_strokes_on_covers(data: Optional[bytes], author: Optional[uuid.UUID]
 
     if data is None or author is None:
         return 0
-    number = rm_ink.author_number(data, author)
-    if number is None:
-        return 0
-    ours = {layer["id"] for layer in rm_ink.page_layers(data) if layer["id"][0] == number}
+    blocks = rm_ink.parse(data)
+    number = rm_ink.author_number_in(blocks, author)
+    covers, _ = rm_ink.layer_roles(blocks, number, cover_ids, ink_ids)
     return sum(
         1
-        for block in rm_ink.parse(data)
+        for block in blocks
         if isinstance(block, SceneLineItemBlock)
         and block.item.value is not None
-        and rm_ink.key(block.parent_id) in ours
+        and rm_ink.key(block.parent_id) in covers
         and int(block.item.item_id.part1) != number
     )
 

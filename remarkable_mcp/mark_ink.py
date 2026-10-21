@@ -38,6 +38,17 @@ def has_ink(marks: Iterable[Dict[str, Any]]) -> bool:
     return any(isinstance(m.get(kind.key), dict) for m in marks for kind in KINDS)
 
 
+def _page_ids(marks: Iterable[Dict[str, Any]], pdf_page: int) -> Tuple[list, list]:
+    """``(cover ids, ink ids)`` stored in the marks on ``pdf_page``."""
+    covers: list = []
+    inks: list = []
+    for mark in marks:
+        if mark["pdf_page"] == pdf_page:
+            for kind, ids in _stored_ids(mark):
+                (covers if kind.key == "cover" else inks).extend(ids)
+    return covers, inks
+
+
 def _stored_ids(mark: Dict[str, Any]) -> List[Tuple[InkKind, list]]:
     out = []
     for kind in KINDS:
@@ -91,7 +102,7 @@ def write_marks(
             continue
         if data is not None and not rm_ink.is_v6(data):
             raise rm_ink.InkError(f"Page {page}'s ink is in an older format.")
-        writer = rm_ink.PageWriter(data, author)
+        writer = rm_ink.PageWriter(data, author, *_page_ids([*before, *after], pdf_page))
         writer.tombstone(job["remove"])
         for kind, mark in job["add"]:
             kind.add(writer, mark, sizes[pdf_page])
@@ -113,7 +124,7 @@ def mark_states(
 
     states: Dict[str, str] = {}
     pages: Dict[int, Optional[bytes]] = {}
-    covered = set()
+    covered: Dict[int, int] = {}
     for mark in marks:
         stored = _stored_ids(mark)
         if not stored:
@@ -126,11 +137,13 @@ def mark_states(
         for kind, ids in stored:
             states[mark["id"]] = kind.status(pages[page], ids)
             if kind.key == "cover":
-                covered.add(page)
+                covered[page] = mark["pdf_page"]
     notes = []
     author = rm_ink.known_author_uuid()
-    for page in sorted(covered):
-        count = cover_layers.foreign_strokes_on_covers(pages[page], author)
+    for page, pdf_page in sorted(covered.items()):
+        count = cover_layers.foreign_strokes_on_covers(
+            pages[page], author, *_page_ids(marks, pdf_page)
+        )
         if count:
             notes.append(
                 f"Page {page}: {count} of the user's strokes are on a cover layer and "

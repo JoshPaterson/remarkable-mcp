@@ -9,7 +9,7 @@ from rmscene import read_blocks
 from rmscene.scene_stream import SceneInfo, SceneLineItemBlock
 
 from remarkable_mcp import cover_layers as cl
-from remarkable_mcp import pdf_marks, rm_ink
+from remarkable_mcp import ink_marks, pdf_marks, rm_ink
 from remarkable_mcp.pdf_marks import MarkError
 from remarkable_mcp.strokes import build_line_block
 from test_mark_pdf import A4, FakeCloud, _mark_tool, cloud, original  # noqa: F401
@@ -132,6 +132,80 @@ def test_user_strokes_on_a_cover_layer_are_counted():
     )
     data += rm_ink.encode([block])
     assert cl.foreign_strokes_on_covers(data, AUTHOR) == 1
+
+
+def _user_stroke_on(data, layer):
+    data, _ = rm_ink.with_author(data, TABLET)
+    stroke = {"points": [[0.5, 0.5], [0.6, 0.5]], "color": "black"}
+    block = build_line_block(
+        rm_ink.crdt(layer), rm_ink.crdt((9, 900)), stroke, *(v / 0.3177 for v in A4)
+    )
+    return data + rm_ink.encode([block])
+
+
+def _select(data, layer):
+    """``data`` with its SceneInfo selecting ``layer``."""
+    import dataclasses
+
+    from rmscene.tagged_block_common import LwwValue
+
+    parts = [data[:43]]
+    for btype, raw in rm_ink.raw_blocks(data):
+        (block,) = _blocks(data[:43] + raw) or [None]
+        if isinstance(block, SceneInfo):
+            stamp = rm_ink.crdt((block.current_layer.timestamp.part1, 950))
+            block = dataclasses.replace(block, current_layer=LwwValue(stamp, rm_ink.crdt(layer)))
+            raw = rm_ink.encode([block])
+        parts.append(raw)
+    return b"".join(parts)
+
+
+def _erasable_ink_layer():
+    """A page with the MCP's erasable ink on its own layer, and its id."""
+    strokes = [{"points": [(100, 300), (200, 300)], "width": 1.5}]
+    data, (stroke,) = ink_marks.add_strokes(
+        None, AUTHOR, A4, strokes, "fineliner", "red", layer="Claude marks"
+    )
+    return data, rm_ink.item_states(data, [stroke])[tuple(stroke)][0]
+
+
+def test_user_strokes_on_an_ink_layer_are_not_counted_as_covered():
+    data, layer = _erasable_ink_layer()
+    data = _user_stroke_on(data, layer)
+    assert cl.foreign_strokes_on_covers(data, AUTHOR) == 0
+
+
+def test_cover_layers_are_known_from_stored_ids_after_their_ink_is_erased():
+    data, (placed,) = cl.edit_page(None, AUTHOR, A4, add=[{"layer": "Mark cover", "rows": _rows()}])
+    data = _user_stroke_on(rm_ink.tombstone(data, placed["strokes"]), placed["layer"])
+    assert cl.foreign_strokes_on_covers(data, AUTHOR) == 0
+    assert cl.foreign_strokes_on_covers(data, AUTHOR, placed["strokes"]) == 1
+
+
+def test_erasable_ink_skips_a_selected_cover_layer():
+    data, (placed,) = cl.edit_page(None, AUTHOR, A4, add=[{"layer": "Mark cover", "rows": _rows()}])
+    data = _select(data, placed["layer"])
+    assert rm_ink.selected_layer(data) == placed["layer"]
+    strokes = [{"points": [(100, 300), (200, 300)], "width": 1.5}]
+    data, (stroke,) = ink_marks.add_strokes(data, AUTHOR, A4, strokes, "fineliner", "red")
+    assert rm_ink.item_states(data, [stroke])[tuple(stroke)][0] == rm_ink.LAYER_1
+
+
+def test_ink_and_cover_layers_of_the_same_name_stay_apart():
+    data, layer = _erasable_ink_layer()
+    data, (placed,) = cl.edit_page(
+        data, AUTHOR, A4, add=[{"layer": "Claude marks", "rows": _rows()}]
+    )
+    assert placed["layer"] != layer
+    assert [x["name"] for x in rm_ink.page_layers(data)] == [
+        "Claude marks",
+        "Layer 1",
+        "Claude marks",
+    ]
+    data, _ = cl.edit_page(None, AUTHOR, A4, add=[{"layer": "Mark cover", "rows": _rows()}])
+    strokes = [{"points": [(100, 300), (200, 300)], "width": 1.5}]
+    with pytest.raises(rm_ink.InkError, match="cover layer"):
+        ink_marks.add_strokes(data, AUTHOR, A4, strokes, "fineliner", "red", layer="Mark cover")
 
 
 def test_shape_rows_cover_the_mark_not_its_box():
