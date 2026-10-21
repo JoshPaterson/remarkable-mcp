@@ -2364,7 +2364,7 @@ def _author_draw(
             ),
         )
 
-    from remarkable_mcp import notebooks as nb
+    from remarkable_mcp import rm_ink
     from remarkable_mcp import strokes as strokes_mod
 
     ssh_client = _get_ssh_client()
@@ -2407,11 +2407,11 @@ def _author_draw(
     rm_path = f"{XOCHITL_PATH}/{doc_uuid}/{page_id}.rm"
     original = _read_remote_bytes(ssh_client, rm_path)
     # A native notebook page that has never been drawn on (or a PDF/EPUB page
-    # with no annotation overlay yet) has no .rm file. Seed a blank drawable
-    # layer so the strokes have somewhere to land.
+    # with no annotation overlay yet) has no .rm file. Seed a first ink file
+    # (Layer 1, selected, no typed-text block) so the strokes have somewhere to land.
     page_existed = original is not None
     if not page_existed:
-        original = nb.blank_page_rm_bytes()
+        original = rm_ink.first_page_rm(rm_ink.author_uuid())
 
     try:
         geom = strokes_mod.page_geometry(original)

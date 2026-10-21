@@ -31,6 +31,15 @@ def isolate_blob_cache(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def isolate_config_dir(monkeypatch, tmp_path_factory):
+    """Point the config dir (the MCP's author id, OCR work) at a temp dir, so
+    tests that write ink never create or read the developer's own author id."""
+    monkeypatch.setattr(
+        "remarkable_mcp.api.REMARKABLE_CONFIG_DIR", tmp_path_factory.mktemp("config")
+    )
+
+
+@pytest.fixture(autouse=True)
 def restore_tool_registry():
     """Restore the server's registered tools after every test.
 

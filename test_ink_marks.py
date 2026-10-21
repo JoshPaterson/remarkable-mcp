@@ -225,3 +225,22 @@ def test_every_kind_of_ink_on_a_page_is_written_in_one_pass():
     assert ink_marks.ink_status(data, ids) == "erased on tablet"
     assert ink_marks.ink_status(data, hl["highlight"]["items"]) == "on tablet"
     assert ink_marks.ink_status(data, box["ink"]["items"]) == "on tablet"
+
+
+def test_canvas_strokes_use_the_mcp_author_and_the_shared_counter():
+    from pathlib import Path
+
+    from remarkable_mcp import strokes as strokes_mod
+
+    fixture = Path(__file__).parent / "fixtures" / "tablet" / "ink_writes"
+    # Two authors: the tablet's and another installation's.
+    page = (fixture / "tablet_page_with_cover.rm").read_bytes()
+    other = uuid.UUID("ffffffff-0000-4000-8000-000000000001")
+    page, _ = rm_ink.with_author(page, other)
+    counter = rm_ink.next_counter(rm_ink.parse(page))
+    stroke = {"points": [[0.1, 0.1], [0.2, 0.2]], "tool": "fineliner", "color": "black"}
+    data = strokes_mod.append_strokes(page, [stroke, stroke])
+    number = rm_ink.author_number(data, rm_ink.author_uuid())
+    assert number is not None and number != rm_ink.author_number(data, other)
+    new = [b.item.item_id for b in _lines(data)][-2:]
+    assert [(i.part1, i.part2) for i in new] == [(number, counter), (number, counter + 1)]

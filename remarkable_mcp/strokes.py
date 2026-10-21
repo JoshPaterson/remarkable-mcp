@@ -12,15 +12,16 @@ of the ``SceneInfo`` block and silently drops a few bytes, which can corrupt the
 page. Instead we:
 
 1. Parse the original bytes only to *discover* the target layer, paper size and
-   the highest CRDT id already in use (read-only).
-2. Serialize *only the new* ``SceneLineItemBlock``s with ``write_blocks``.
-3. Strip the 43-byte ``HEADER_V6`` prefix from that fresh serialization.
-4. Concatenate the headerless new-block bytes onto the *untouched* original
-   bytes.
+   the highest CRDT counter already in use (read-only).
+2. Add the MCP's author to the page's author table (the only block rewritten;
+   rmscene re-encodes it byte for byte), as ``rm_ink`` does for all its ink.
+3. Serialize *only the new* ``SceneLineItemBlock``s with ``write_blocks``, under
+   the MCP's author and the next counters, without the ``HEADER_V6`` prefix.
+4. Append them to the original blocks.
 
-The original bytes are preserved exactly as a prefix, so nothing the device
-wrote is ever rewritten. See ``test_server.py`` for the regression guard that
-asserts this property (and that a naive round-trip does *not* byte-match).
+Every other block the device wrote is kept byte for byte. See
+``test_server.py`` for the regression guard that asserts this property (and
+that a naive round-trip does *not* byte-match).
 
 Coordinate model
 ----------------
@@ -249,21 +250,6 @@ def find_target_layer(blocks: list) -> CrdtId:
     )
 
 
-def allocate_ids(blocks: list, count: int) -> list[CrdtId]:
-    """Allocate ``count`` fresh, monotonically-increasing CrdtIds.
-
-    Picks an id strictly greater (by ``part2``) than anything already present so
-    the new sequence items never collide with existing content.
-    """
-    max_id = CrdtId(0, 0)
-    for cid in rm_ink.iter_crdt_ids(blocks):
-        if (cid.part1, cid.part2) > (max_id.part1, max_id.part2):
-            max_id = cid
-    part1 = max_id.part1 if max_id.part1 else 0
-    base = max_id.part2
-    return [CrdtId(part1, base + 1 + i) for i in range(count)]
-
-
 def _map_point(nx: float, ny: float, pressure, width, paper_w: int, paper_h: int) -> Point:
     nx = min(1.0, max(0.0, float(nx)))
     ny = min(1.0, max(0.0, float(ny)))
@@ -338,25 +324,28 @@ def build_line_block(
     )
 
 
-def append_strokes(original_bytes: bytes, strokes: list[dict]) -> bytes:
+def append_strokes(original_bytes: bytes, strokes: list[dict], author=None) -> bytes:
     """Append ``strokes`` to an existing page, returning new raw ``.rm`` bytes.
 
-    The original bytes are preserved verbatim as a prefix of the result.
+    The strokes are written under ``author`` (default: this installation's
+    author id, see ``rm_ink.author_uuid``) with ids from the page's shared
+    counter. Every block of the original is kept unchanged except the author
+    table, which gains the author.
     """
     if not strokes:
         raise StrokeError("No strokes provided to write.")
 
-    blocks = list(read_blocks(io.BytesIO(original_bytes)))
-    layer_id = find_target_layer(blocks)
-    paper_w, paper_h = get_paper_size(blocks)
-    ids = allocate_ids(blocks, len(strokes))
-
-    new_blocks = [
-        build_line_block(layer_id, ids[i], stroke, paper_w, paper_h)
-        for i, stroke in enumerate(strokes)
-    ]
-    appended = rm_ink.encode(new_blocks)
-    return original_bytes + appended
+    page = rm_ink.PageWriter(original_bytes, author or rm_ink.author_uuid())
+    layer_id = find_target_layer(page.blocks)
+    paper_w, paper_h = get_paper_size(page.blocks)
+    ids = page.new_ids(len(strokes))
+    page.append(
+        [
+            build_line_block(layer_id, rm_ink.crdt(item_id), stroke, paper_w, paper_h)
+            for item_id, stroke in zip(ids, strokes)
+        ]
+    )
+    return page.data
 
 
 def page_geometry(original_bytes: bytes) -> dict:

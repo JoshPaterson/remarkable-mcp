@@ -440,6 +440,22 @@ class PageWriter:
 
         return _points_per_unit(_v6_paper_size(self._blocks))
 
+    @property
+    def blocks(self) -> list:
+        """The page's blocks, as parsed before items were appended."""
+        return self._blocks
+
+    def new_ids(self, count: int) -> List[Id]:
+        """``count`` fresh item ids under the MCP's author, from the page's
+        shared counter."""
+        number = self._ensure_author()
+        start = self._take(count)
+        return [(number, start + i) for i in range(count)]
+
+    def append(self, blocks: Sequence[Any]) -> None:
+        """Append new item blocks (with ids from ``new_ids``) to the page."""
+        self.data += encode(blocks)
+
     def layers(self) -> List[Dict[str, Any]]:
         """The page's live layers, bottom first (see ``page_layers``)."""
         return list(self._layer_list)

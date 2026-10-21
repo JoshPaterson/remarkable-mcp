@@ -6975,6 +6975,12 @@ class TestCanvasWrite:
             assert rm in writes
             assert (rm + ".bak") not in writes
             mock_restart.assert_called_once()
+            # It was seeded with a first ink file: no typed-text block.
+            from remarkable_mcp import rm_ink
+
+            seeded = writes[rm][: -len(b"NEW")]
+            assert rm_ink.is_v6(seeded) and rm_ink.selected_layer(seeded) == rm_ink.LAYER_1
+            assert rm_ink.TEXT_BLOCK not in [t for t, _ in rm_ink.raw_blocks(seeded)]
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("defer_restart", [False, True])
@@ -7336,7 +7342,12 @@ class TestNotebookBuilders:
         out = s.append_strokes(
             raw, [{"points": [[0.1, 0.1], [0.5, 0.5]], "tool": "fineliner", "color": "black"}]
         )
-        assert out.startswith(raw)
+        # Every block but the author table is kept unchanged, in order.
+        from remarkable_mcp import rm_ink
+
+        kept = [b for t, b in rm_ink.raw_blocks(raw) if t != rm_ink.AUTHORS_BLOCK]
+        after = [b for t, b in rm_ink.raw_blocks(out) if t != rm_ink.AUTHORS_BLOCK]
+        assert after[: len(kept)] == kept and len(after) == len(kept) + 1
 
     def test_next_page_idx_sequence(self):
         from remarkable_mcp import notebooks as nb
