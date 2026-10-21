@@ -146,7 +146,7 @@ def _item(name, item_id, parent, *, folder=False, tags=None, page_tags=None):
 
 def _library():
     return [
-        _item("Lunar Theory", "f-lunar", "", folder=True),
+        _item("Physics", "f-lunar", "", folder=True),
         _item("Worksheets", "f-ws", "f-lunar", folder=True),
         _item(
             "S0.2-06 Layers and tags test",
@@ -171,18 +171,18 @@ async def _call_with_library(name: str, arguments: dict):
 @pytest.mark.asyncio
 async def test_browse_tag_filter_lists_tagged_document_in_folder():
     data = await _call_with_library(
-        "remarkable_browse", {"path": "/Lunar Theory/Worksheets", "tags": ["test-doc"]}
+        "remarkable_browse", {"path": "/Physics/Worksheets", "tags": ["test-doc"]}
     )
 
     assert [d["name"] for d in data["documents"]] == ["S0.2-06 Layers and tags test"]
     assert data["documents"][0]["tags"] == ["test-doc"]
-    assert data["documents"][0]["path"] == "/Lunar Theory/Worksheets/S0.2-06 Layers and tags test"
+    assert data["documents"][0]["path"] == "/Physics/Worksheets/S0.2-06 Layers and tags test"
 
 
 @pytest.mark.asyncio
 async def test_browse_tag_filter_searches_subfolders():
     data = await _call_with_library(
-        "remarkable_browse", {"path": "/Lunar Theory", "tags": ["test-doc"]}
+        "remarkable_browse", {"path": "/Physics", "tags": ["test-doc"]}
     )
 
     assert data["recursive"] is True
@@ -192,7 +192,7 @@ async def test_browse_tag_filter_searches_subfolders():
 
 @pytest.mark.asyncio
 async def test_browse_without_tags_lists_tag_names():
-    data = await _call_with_library("remarkable_browse", {"path": "/Lunar Theory/Worksheets"})
+    data = await _call_with_library("remarkable_browse", {"path": "/Physics/Worksheets"})
 
     by_name = {d["name"]: d for d in data["documents"]}
     assert by_name["S0.2-06 Layers and tags test"]["tags"] == ["test-doc"]

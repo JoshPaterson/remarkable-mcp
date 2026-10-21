@@ -736,8 +736,8 @@ file as above; `pages` is not available. At most 200 documents are exported
 in one call.
 
 ```python
-remarkable_export(folder="/Classes/Lunar Theory/Worksheets", tags=["Graded"],
-                  save_to="/Users/me/Projects/Classes/Lunar Theory/Graded")
+remarkable_export(folder="/Classes/Physics/Worksheets", tags=["Graded"],
+                  save_to="/Users/me/Projects/Classes/Physics/Graded")
 ```
 
 These local writes are why the tool declares `readOnlyHint=false`.

@@ -3275,7 +3275,7 @@ async def remarkable_export(
     - remarkable_export("Lecture Notes", pages="3-5,9")
     - remarkable_export("Week 3 worksheet",
         save_to="/Users/me/Projects/Course/Worksheets/Week 3 - done.pdf")
-    - remarkable_export(folder="/Classes/Lunar Theory/Worksheets", tags=["Graded"],
+    - remarkable_export(folder="/Classes/Physics/Worksheets", tags=["Graded"],
         save_to="/Users/me/Projects/Course/Graded worksheets")
     </examples>
     """
