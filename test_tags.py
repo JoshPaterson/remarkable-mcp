@@ -181,9 +181,7 @@ async def test_browse_tag_filter_lists_tagged_document_in_folder():
 
 @pytest.mark.asyncio
 async def test_browse_tag_filter_searches_subfolders():
-    data = await _call_with_library(
-        "remarkable_browse", {"path": "/Physics", "tags": ["test-doc"]}
-    )
+    data = await _call_with_library("remarkable_browse", {"path": "/Physics", "tags": ["test-doc"]})
 
     assert data["recursive"] is True
     assert data["folders"] == []

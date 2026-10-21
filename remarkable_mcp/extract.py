@@ -2381,6 +2381,7 @@ def render_merged_page_from_document_zip(
     canvas_height: Optional[int] = None,
     layers: Optional[str] = None,
     dpi: Optional[float] = None,
+    underlay: bool = True,
 ) -> tuple[Optional[bytes], Optional[str]]:
     """Render a page with the PDF underlay composited with the annotation layer.
 
@@ -2398,6 +2399,8 @@ def render_merged_page_from_document_zip(
         canvas_height: Output canvas height (default: derived from PDF page)
         layers: Layer selection (see ``_v6_paths_from_blocks``)
         dpi: Output resolution when no canvas size is given (default 144)
+        underlay: False draws the annotations in the PDF page's frame on a
+            plain background, without the PDF page
 
     Returns:
         Tuple of (png_bytes, note) where note is an informational message
@@ -2420,6 +2423,7 @@ def render_merged_page_from_document_zip(
             canvas_height=canvas_height,
             layers=layers,
             dpi=dpi,
+            underlay=underlay,
         )
 
 
@@ -2431,6 +2435,7 @@ def render_merged_page_from_extracted_document(
     canvas_height: Optional[int] = None,
     layers: Optional[str] = None,
     dpi: Optional[float] = None,
+    underlay: bool = True,
 ) -> tuple[Optional[bytes], Optional[str]]:
     """Render a merged page from an already extracted document archive."""
     import io
@@ -2517,10 +2522,16 @@ def render_merged_page_from_extracted_document(
     out_w = canvas_width or int(round(pdf_w_pt * pixels_per_point))
     out_h = canvas_height or int(round(pdf_h_pt * pixels_per_point))
 
-    # 1. Rasterize the PDF page
-    pdf_png = _render_pdf_page_to_png(pdf_bytes, pdf_page_index, out_w, out_h)
-    if pdf_png is None:
-        return annotation_only("PDF rasterization failed")
+    # 1. Rasterize the PDF page, or a plain page of its size without it
+    if underlay:
+        pdf_png = _render_pdf_page_to_png(pdf_bytes, pdf_page_index, out_w, out_h)
+        if pdf_png is None:
+            return annotation_only("PDF rasterization failed")
+    else:
+        fill = _parse_hex_color(background_color or get_background_color())
+        plain = io.BytesIO()
+        PILImage.new("RGBA", (out_w, out_h), fill).save(plain, format="PNG")
+        pdf_png = plain.getvalue()
 
     # 2. Render annotation layer to SVG, then to PNG with transparent background
     ann_svg_path = None
@@ -2588,7 +2599,8 @@ def render_merged_page_from_extracted_document(
                 else None
             )
 
-        composite = composite.convert("RGB")
+        if underlay or composite.getextrema()[3][0] == 255:
+            composite = composite.convert("RGB")
         buf = io.BytesIO()
         composite.save(buf, format="PNG")
         return buf.getvalue(), merged_note
