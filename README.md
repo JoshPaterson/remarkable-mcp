@@ -673,17 +673,23 @@ Or set the environment variable:
 
 ### Available Write Tools
 
+Folder parameters are named `folder`. Earlier names still work but are no
+longer shown in the tool schemas: `parent` (mkdir), `dest_folder` (move),
+`parent_folder` (upload, markdown_to_pdf), and `check` (pdf_ocr, now
+`dry_run`). `defer_restart` and `remarkable_refresh` exist in SSH mode only;
+other modes leave them out of the schemas and ignore `defer_restart`.
+
 | Tool | Description |
 |------|-------------|
-| `remarkable_upload(file_path \| file_content, parent_folder, document_name, defer_restart, file_format)` | Upload a PDF or EPUB from a local path or from base64 contents (cloud, SSH, and USB web; USB web preserves the name but ignores `parent_folder`) |
-| `remarkable_markdown_to_pdf(markdown, document_name, parent_folder, defer_restart, outline)` | Render Markdown as a paginated PDF and upload it; its headings become the table of contents the tablet shows (cloud, SSH, and USB web) |
-| `remarkable_mkdir(folder_name, parent, defer_restart)` | Create a new folder (cloud and SSH) |
-| `remarkable_move(document, dest_folder, defer_restart)` | Move a document or folder, or a list of them in one write (cloud and SSH) |
+| `remarkable_upload(file_path \| file_content, folder, document_name, defer_restart, file_format)` | Upload a PDF or EPUB from a local path or from base64 contents (cloud, SSH, and USB web; USB web preserves the name but ignores `folder`) |
+| `remarkable_markdown_to_pdf(markdown, document_name, folder, defer_restart, outline)` | Render Markdown as a paginated PDF and upload it; its headings become the table of contents the tablet shows (cloud, SSH, and USB web) |
+| `remarkable_mkdir(folder_name, folder, defer_restart)` | Create a new folder (cloud and SSH) |
+| `remarkable_move(document, folder, defer_restart)` | Move a document or folder, or a list of them in one write (cloud and SSH) |
 | `remarkable_rename(document, new_name, renames, defer_restart)` | Rename a document or folder, or several with `renames={old: new}` in one write (cloud and SSH) |
 | `remarkable_tag(document, add, remove, rename, page, defer_restart)` | Add, rename or remove document tags, or a page's tags with `page`; `document` may be a list, changed together in one write (cloud and SSH) |
 | `remarkable_mark_pdf(document, add, remove, clear, color, dry_run, layout_page)` | Add or remove marks (text, shapes, highlights, freeform paths, LaTeX equations, and SVG, PDF, PNG or JPEG graphics) on a PDF's pages, e.g. to grade a worksheet or annotate a paper; `dry_run` previews, `layout_page` returns text and ink positions (the old name `layout` still works). Placement, cover and erasable rules are in the `remarkable://help/marks` resource (**cloud only**) |
 | `remarkable_pdf_outline(document, outline, dry_run)` | List, set or remove a PDF's outline, the table of contents the tablet shows, e.g. chapters for a book without one (**cloud only**) |
-| `remarkable_pdf_ocr(document, folder, tags, check)` | Write OCR text into a PDF's scanned pages so they can be read, searched and highlighted; `check=True` lists which PDFs need it (**cloud only**) |
+| `remarkable_pdf_ocr(document, folder, tags, dry_run)` | Write OCR text into a PDF's scanned pages so they can be read, searched and highlighted; `dry_run=True` lists which PDFs need it (**cloud only**) |
 | `remarkable_pdf_pages(document, insert, dry_run)` | Insert blank, Markdown or PDF-file pages anywhere in a PDF; ink, marks, outline and OCR text stay on their pages (**cloud only**) |
 | `remarkable_delete(document, defer_restart, permanent)` | Move a document/folder (or a list, with one confirmation) to Trash; SSH can permanently remove it with `permanent=True` |
 | `remarkable_refresh()` | Safely restart `xochitl` once to apply pending writes made with `defer_restart=True`; no-op after this process has confirmed a clean state — **SSH only** |
@@ -718,20 +724,20 @@ Or set the environment variable:
 
 ```python
 # Upload a PDF
-remarkable_upload("paper.pdf", parent_folder="/Research")
+remarkable_upload("paper.pdf", folder="/Research")
 
 # Upload base64 contents when the file isn't on the server's machine
-remarkable_upload(file_content=pdf_base64, document_name="Week 3", parent_folder="/Course")
+remarkable_upload(file_content=pdf_base64, document_name="Week 3", folder="/Course")
 
 # Render Markdown and upload the PDF without creating a local file
 remarkable_markdown_to_pdf(
     "# Meeting Notes\n\n- Follow up with Sam",
     document_name="Meeting Notes",
-    parent_folder="/Research",
+    folder="/Research",
 )
 
 # Create a folder
-remarkable_mkdir("2024 Archive", parent="/Archive")
+remarkable_mkdir("2024 Archive", folder="/Archive")
 
 # Move a document
 remarkable_move("Meeting Notes", "/Archive/2024 Archive")
@@ -784,8 +790,8 @@ remarkable_delete("Disposable Test", permanent=True)
 
 # Bulk import (SSH): defer the restart on each write, then refresh once.
 # One xochitl restart for the whole batch instead of one per upload.
-remarkable_upload("a.pdf", parent_folder="/Research", defer_restart=True)
-remarkable_upload("b.pdf", parent_folder="/Research", defer_restart=True)
+remarkable_upload("a.pdf", folder="/Research", defer_restart=True)
+remarkable_upload("b.pdf", folder="/Research", defer_restart=True)
 remarkable_refresh()
 
 # Author native ink and notebooks (SSH only)

@@ -1021,7 +1021,7 @@ def _cloud_mkdir(folder_name: str, parent: str) -> str:
     client = get_rmapi()
     collection = client.get_meta_items()
     items_by_id = get_items_by_id(collection)
-    parent_id, error = lookup_folder(parent, collection, items_by_id, param="parent")
+    parent_id, error = lookup_folder(parent, collection, items_by_id, param="folder")
     if error:
         return error
     doc = client.create_folder(folder_name, parent_id)
@@ -1908,7 +1908,7 @@ def _move_many(
     if error:
         return error
     dest_id, error = lookup_folder(
-        dest_folder, collection, items_by_id, param="dest_folder", note="Nothing was changed."
+        dest_folder, collection, items_by_id, param="folder", note="Nothing was changed."
     )
     if error:
         return error
@@ -2625,7 +2625,7 @@ def register_write_tools():
                     collection = client.get_meta_items()
                     items_by_id = get_items_by_id(collection)
                     parent_id, error = lookup_folder(
-                        parent_folder, collection, items_by_id, param="parent_folder"
+                        parent_folder, collection, items_by_id, param="folder"
                     )
                     if error:
                         return error
@@ -2665,7 +2665,7 @@ def register_write_tools():
                     }
                     if parent_folder != "/":
                         result["note"] = (
-                            "USB web ignores parent_folder. The tablet web "
+                            "USB web ignores folder. The tablet web "
                             "service chooses the destination folder. Use SSH or "
                             "cloud mode for explicit folder placement."
                         )
@@ -2682,7 +2682,7 @@ def register_write_tools():
 
                 # Resolve parent folder
                 parent_id, error = lookup_folder(
-                    parent_folder, collection, items_by_id, param="parent_folder"
+                    parent_folder, collection, items_by_id, param="folder"
                 )
                 if error:
                     return error
@@ -2775,12 +2775,13 @@ def register_write_tools():
 
     async def _upload_tool(
         file_path: Optional[str] = None,
-        parent_folder: str = "/",
+        folder: str = "/",
         document_name: Optional[str] = None,
         defer_restart: bool = False,
         file_content: Optional[str] = None,
         file_format: str = "pdf",
         trash_source_after_upload: bool = False,
+        parent_folder: Optional[str] = None,
     ) -> str:
         """
         <usecase>Upload a PDF or EPUB file to the reMarkable tablet.</usecase>
@@ -2795,10 +2796,10 @@ def register_write_tools():
           file_path for anything larger. Requires document_name.
 
         Works in all three transports:
-        - Cloud: uploaded via the sync protocol; supports parent_folder + document_name
-        - SSH: transferred over SSH, metadata created; supports parent_folder + document_name
+        - Cloud: uploaded via the sync protocol; supports folder + document_name
+        - SSH: transferred over SSH, metadata created; supports folder + document_name
         - USB web: uploaded via POST /upload. The multipart filename carries
-          document_name, parent_folder is ignored, and the tablet web service
+          document_name, folder is ignored, and the tablet web service
           chooses the destination folder.
 
         The result also reports source ("path" or "content") and size_bytes.
@@ -2807,7 +2808,7 @@ def register_write_tools():
         </instructions>
         <parameters>
         - file_path: Absolute path to the local PDF or EPUB file
-        - parent_folder: Destination folder path on tablet (default: root "/").
+        - folder: Destination folder path on tablet (default: root "/").
           Honored in cloud and SSH modes; ignored by the USB web interface.
         - document_name: Display name on tablet (default: filename without
           extension). Required with file_content. Honored in every mode; USB web
@@ -2826,10 +2827,10 @@ def register_write_tools():
         </parameters>
         <examples>
         - remarkable_upload("/tmp/paper.pdf")
-        - remarkable_upload("/tmp/book.epub", parent_folder="/Books")
+        - remarkable_upload("/tmp/book.epub", folder="/Books")
         - remarkable_upload("/tmp/report.pdf", document_name="Q4 Report")
         - remarkable_upload(file_content="JVBERi0xLjQK...", document_name="Notes",
-          parent_folder="/Course")
+          folder="/Course")
         - # batch import: defer every upload, refresh once at the end
           remarkable_upload("/tmp/a.pdf", defer_restart=True)
           remarkable_upload("/tmp/b.pdf", defer_restart=True)
@@ -2838,6 +2839,11 @@ def register_write_tools():
         """
         import tempfile
 
+        parent_folder, error = resolve_alias(
+            folder, parent_folder, "folder", "parent_folder", default="/"
+        )
+        if error:
+            return error
         if (file_path is None) == (file_content is None):
             return invalid_param(
                 "Give exactly one of file_path or file_content.",
@@ -2912,21 +2918,23 @@ def register_write_tools():
 
         async def remarkable_upload(
             file_path: Optional[str] = None,
-            parent_folder: str = "/",
+            folder: str = "/",
             document_name: Optional[str] = None,
             defer_restart: bool = False,
             file_content: Optional[str] = None,
             file_format: str = "pdf",
             trash_source_after_upload: bool = False,
+            parent_folder: SkipJsonSchema[Optional[str]] = None,
         ) -> str:
             return await _upload_tool(
                 file_path,
-                parent_folder,
+                folder,
                 document_name,
                 defer_restart,
                 file_content,
                 file_format,
                 trash_source_after_upload,
+                parent_folder,
             )
 
         # Docstrings may or may not keep their indentation (Python 3.13 strips
@@ -2954,14 +2962,21 @@ def register_write_tools():
 
         async def remarkable_upload(
             file_path: Optional[str] = None,
-            parent_folder: str = "/",
+            folder: str = "/",
             document_name: Optional[str] = None,
             defer_restart: bool = False,
             file_content: Optional[str] = None,
             file_format: str = "pdf",
+            parent_folder: SkipJsonSchema[Optional[str]] = None,
         ) -> str:
             return await _upload_tool(
-                file_path, parent_folder, document_name, defer_restart, file_content, file_format
+                file_path,
+                folder,
+                document_name,
+                defer_restart,
+                file_content,
+                file_format,
+                parent_folder=parent_folder,
             )
 
         remarkable_upload.__doc__ = upload_doc
@@ -2973,9 +2988,10 @@ def register_write_tools():
     async def remarkable_markdown_to_pdf(
         markdown: str,
         document_name: str = "Markdown",
-        parent_folder: str = "/",
+        folder: str = "/",
         defer_restart: bool = False,
         outline: bool = True,
+        parent_folder: SkipJsonSchema[Optional[str]] = None,
     ) -> str:
         """
         <usecase>Render Markdown text as a PDF and upload it to the reMarkable tablet.</usecase>
@@ -2988,17 +3004,17 @@ def register_write_tools():
         headings become the PDF's table of contents, which the tablet shows.
 
         Works in all three transports:
-        - Cloud: sync upload with parent_folder and document_name
-        - SSH: filesystem upload with parent_folder and document_name
+        - Cloud: sync upload with folder and document_name
+        - SSH: filesystem upload with folder and document_name
         - USB web: upload whose multipart filename is document_name + ".pdf";
-          parent_folder is ignored and the tablet web service chooses the folder.
+          folder is ignored and the tablet web service chooses the folder.
 
         Requires write mode (the default; disabled with --read-only).
         </instructions>
         <parameters>
         - markdown: Markdown source text. Must not be empty.
         - document_name: Display name on the tablet (default: "Markdown").
-        - parent_folder: Destination folder (default: root "/"). USB web ignores
+        - folder: Destination folder (default: root "/"). USB web ignores
           this parameter because its upload endpoint has no folder argument.
         - defer_restart: SSH only. When True, skip the xochitl restart and call
           remarkable_refresh() once after the batch. Forwarded exactly like
@@ -3010,7 +3026,7 @@ def register_write_tools():
         - remarkable_markdown_to_pdf(
             "# Q4 Report\\n\\nRevenue increased **20%**.",
             document_name="Q4 Report",
-            parent_folder="/Reports",
+            folder="/Reports",
           )
         - remarkable_markdown_to_pdf(
             "# Batch item", document_name="Item 1", defer_restart=True
@@ -3020,6 +3036,11 @@ def register_write_tools():
         """
         from remarkable_mcp.markdown_pdf import render_markdown_pdf
 
+        parent_folder, error = resolve_alias(
+            folder, parent_folder, "folder", "parent_folder", default="/"
+        )
+        if error:
+            return error
         try:
             pdf_bytes = await asyncio.to_thread(render_markdown_pdf, markdown, outline)
         except Exception as e:
@@ -3042,8 +3063,9 @@ def register_write_tools():
         @mcp.tool(annotations=MKDIR_ANNOTATIONS)
         async def remarkable_mkdir(
             folder_name: str,
-            parent: str = "/",
+            folder: str = "/",
             defer_restart: bool = False,
+            parent: SkipJsonSchema[Optional[str]] = None,
         ) -> str:
             """
             <usecase>Create a new folder on the reMarkable tablet.</usecase>
@@ -3057,16 +3079,20 @@ def register_write_tools():
             </instructions>
             <parameters>
             - folder_name: Name of the new folder
-            - parent: Parent folder path (default: root "/")
+            - folder: Folder to create it in (default: root "/")
             - defer_restart: SSH only. Skip the xochitl restart so a batch of
               writes can refresh once via remarkable_refresh() instead of once
               per write. Sets "refresh_pending": true. Ignored in cloud mode.
             </parameters>
             <examples>
             - remarkable_mkdir("Projects")
-            - remarkable_mkdir("2024", parent="/Archive")
+            - remarkable_mkdir("2024", folder="/Archive")
             </examples>
             """
+
+            parent, error = resolve_alias(folder, parent, "folder", "parent", default="/")
+            if error:
+                return error
 
             def _impl() -> str:
                 error = _require_managed_write_mode()
@@ -3083,7 +3109,7 @@ def register_write_tools():
 
                     # Resolve parent
                     parent_id, error = lookup_folder(
-                        parent, collection, items_by_id, param="parent"
+                        parent, collection, items_by_id, param="folder"
                     )
                     if error:
                         return error
@@ -3148,8 +3174,9 @@ def register_write_tools():
         @mcp.tool(annotations=MOVE_ANNOTATIONS)
         async def remarkable_move(
             document: Union[str, List[str]],
-            dest_folder: str,
+            folder: Optional[str] = None,
             defer_restart: bool = False,
+            dest_folder: SkipJsonSchema[Optional[str]] = None,
         ) -> str:
             """
             <usecase>Move a document or folder to a different location.</usecase>
@@ -3164,7 +3191,7 @@ def register_write_tools():
             </instructions>
             <parameters>
             - document: Name or path of the document/folder to move, or a list
-            - dest_folder: Destination folder path (use "/" for root)
+            - folder: Destination folder path, required (use "/" for root)
             - defer_restart: SSH only. Skip the xochitl restart so a batch of
               writes can refresh once via remarkable_refresh() instead of once
               per write. Sets "refresh_pending": true. Ignored in cloud mode.
@@ -3178,6 +3205,14 @@ def register_write_tools():
             names = _document_names(document)
             if names is None:
                 return _invalid_document_list()
+            dest_folder, error = resolve_alias(folder, dest_folder, "folder", "dest_folder")
+            if error:
+                return error
+            if not isinstance(dest_folder, str):
+                return invalid_param(
+                    "folder: give the destination folder.",
+                    'Example: remarkable_move("Notes", folder="/Archive"); "/" is the root.',
+                )
 
             def _impl() -> str:
                 error = _require_managed_write_mode()
@@ -3563,7 +3598,8 @@ def register_write_tools():
                 document: Optional[str] = None,
                 folder: Optional[str] = None,
                 tags: Optional[List[str]] = None,
-                check: bool = False,
+                dry_run: bool = False,
+                check: SkipJsonSchema[Optional[bool]] = None,
             ):
                 """
                 <usecase>Make scanned PDF pages readable and searchable: OCR them
@@ -3577,11 +3613,11 @@ def register_write_tools():
                 read, searched and highlighted. The OCR text lives in the
                 document; later reads need no OCR.
 
-                - check=True only reports: for document, or for every PDF in
+                - dry_run=True only reports: for document, or for every PDF in
                   folder (and its subfolders) and/or with any of tags, the
                   tablet pages that have no text but are scanned. Nothing
                   changes.
-                - With document (and check False) it OCRs that PDF: all of its
+                - With document (and no dry_run) it OCRs that PDF: all of its
                   scanned pages, never part of them. Pages that already have
                   text are never changed, so a PDF that has text on every page
                   has nothing to do. A long book takes several minutes: each
@@ -3596,25 +3632,30 @@ def register_write_tools():
                 </instructions>
                 <parameters>
                 - document: Document name or path
-                - folder: With check, every PDF in this folder and its subfolders
-                - tags: With check, PDFs with any of these tags
-                - check: Only report which pages need OCR
+                - folder: With dry_run, every PDF in this folder and its subfolders
+                - tags: With dry_run, PDFs with any of these tags
+                - dry_run: Only report which pages need OCR
                 </parameters>
                 <examples>
-                - remarkable_pdf_ocr(folder="/Books", check=True)
+                - remarkable_pdf_ocr(folder="/Books", dry_run=True)
                 - remarkable_pdf_ocr("Erewhon")  # repeat until it says done
                 </examples>
                 """
                 from remarkable_mcp import pdf_ocr
                 from remarkable_mcp.pdf_marks import MarkError
 
-                if not check and (folder is not None or tags is not None):
+                dry_run, error = resolve_alias(dry_run, check, "dry_run", "check", default=False)
+                if error:
+                    return error
+                if not dry_run and (folder is not None or tags is not None):
                     return invalid_param(
-                        "folder and tags only work with check=True.",
+                        "folder: folder and tags only work with dry_run=True.",
                         "OCR one document at a time: remarkable_pdf_ocr(document).",
                     )
                 if document is None and folder is None and tags is None:
-                    return invalid_param("Give a document, or folder/tags with check=True.", "")
+                    return invalid_param(
+                        "document: give a document, or folder/tags with dry_run=True.", ""
+                    )
                 if tags is not None and (
                     not isinstance(tags, list) or not all(isinstance(t, str) for t in tags)
                 ):
@@ -3628,7 +3669,7 @@ def register_write_tools():
                     return _ocr_check(client, collection, items_by_id, document, folder, tags)
 
                 return await _cloud_pdf_call(
-                    None if check else document,
+                    None if dry_run else document,
                     run,
                     failed="ocr_failed",
                     failure="OCR failed",
@@ -3959,3 +4000,49 @@ def register_write_tools():
     # cloud/USB clients have no equivalent, so the tool is hidden there.
     if _is_ssh_mode():
         mcp.tool(annotations=WRITE_ANNOTATIONS)(remarkable_refresh)
+    else:
+        _hide_ssh_only_options(mcp)
+
+
+# Options that only change anything over SSH, where each write restarts xochitl.
+SSH_ONLY_PARAMETERS = ("defer_restart",)
+SSH_ONLY_TERMS = ("defer_restart", "remarkable_refresh")
+
+
+def _strip_ssh_only_bullets(description: str) -> str:
+    """``description`` without the "- " bullets (with their more indented
+    continuation lines) that mention an SSH-only option."""
+    lines = description.split("\n")
+    kept = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        text = line.lstrip()
+        if not text.startswith("- "):
+            kept.append(line)
+            i += 1
+            continue
+        indent = len(line) - len(text)
+        end = i + 1
+        while end < len(lines):
+            following = lines[end]
+            if not following.strip() or len(following) - len(following.lstrip()) <= indent:
+                break
+            end += 1
+        block = lines[i:end]
+        if not any(term in part for part in block for term in SSH_ONLY_TERMS):
+            kept.extend(block)
+        i = end
+    return "\n".join(kept)
+
+
+def _hide_ssh_only_options(server) -> None:
+    """Leave SSH-only options out of the write tools' schemas and
+    descriptions. Calls that still pass them are accepted and ignored."""
+    for tool in server._tool_manager.list_tools():
+        properties = (tool.parameters or {}).get("properties", {})
+        if not any(name in properties for name in SSH_ONLY_PARAMETERS):
+            continue
+        for name in SSH_ONLY_PARAMETERS:
+            properties.pop(name, None)
+        tool.description = _strip_ssh_only_bullets(tool.description or "")
