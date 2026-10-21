@@ -150,15 +150,15 @@ class TestMCPServerInitialization:
 
     @pytest.mark.asyncio
     async def test_tools_count(self):
-        """Cloud default: 7 read/export tools + always-on canvas + 11 write tools.
+        """Cloud default: 8 read/export tools + always-on canvas + 11 write tools.
 
         ``remarkable_author`` is SSH-only and therefore hidden in cloud mode, and
         ``remarkable_mark_pdf``, ``remarkable_pdf_outline``, ``remarkable_pdf_ocr``
         and ``remarkable_pdf_pages`` are cloud-only, so the default cloud surface
-        is 19 tools.
+        is 20 tools.
         """
         tools = await _list_tools()
-        assert len(tools) == 19, f"Expected 19 tools, got {len(tools)}"
+        assert len(tools) == 20, f"Expected 20 tools, got {len(tools)}"
 
     @pytest.mark.asyncio
     async def test_tool_schemas(self):
@@ -1622,7 +1622,7 @@ class TestE2E:
         """Test that server can list all tools (e2e)."""
         tools = await _list_tools()
 
-        assert len(tools) == 19
+        assert len(tools) == 20
 
         # Check each tool has required properties and starts with remarkable_
         for tool in tools:
@@ -6992,9 +6992,12 @@ class TestCLIFlags:
     def test_read_only_instructions_do_not_advertise_markdown_writeback(self):
         from remarkable_mcp.server import _build_instructions
 
+        reads = {"remarkable_read", "remarkable_browse", "remarkable_image", "remarkable_export"}
+        tools = [t for t in mcp._tool_manager.list_tools() if t.name in reads]
         with patch.dict(os.environ, {"REMARKABLE_READ_ONLY": "1"}):
-            instructions = _build_instructions()
+            instructions = _build_instructions(tools)
         assert "remarkable_markdown_to_pdf" not in instructions
+        assert "read-only" in instructions
 
     def test_http_preserves_explicit_ssh_key(self):
         from remarkable_mcp import cli

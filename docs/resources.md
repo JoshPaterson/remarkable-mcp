@@ -11,6 +11,7 @@ Documents in your reMarkable library are automatically registered as MCP resourc
 | `remarkableimg:///` | PNG page images (notebooks) | All modes |
 | `remarkablesvg:///` | SVG page images (notebooks) | All modes |
 | `remarkableexport:///` | Temporary generated PDF/Markdown exports | All modes |
+| `remarkable://help/marks` | Mark placement, cover and erasable rules | Cloud write mode |
 
 ## Text Resources (`remarkable:///`)
 
@@ -162,6 +163,15 @@ Export resources are intentionally ephemeral:
 
 They are generated from tablet data but never written back to the tablet. Fetch and
 save a resource if it needs to outlive the server-managed lifecycle.
+
+## Help Resources
+
+`remarkable://help/marks` (Markdown, registered with `remarkable_mark_pdf` in
+cloud write mode) holds the details the tool's description points to: placing
+marks with `at`, `region` and `near`, leader lines, covers, erasable marks,
+text highlights and color notes.
+
+---
 
 ## How Resources Are Registered
 

@@ -39,6 +39,7 @@ from typing import Annotated, Any, Dict, List, Optional, Union
 from mcp.server.mcpserver import Context, Elicit, ElicitationResult, Resolve
 from mcp.types import ToolAnnotations
 from pydantic import BaseModel, Field
+from pydantic.json_schema import SkipJsonSchema
 
 from remarkable_mcp.api import (
     get_items_by_id,
@@ -48,7 +49,7 @@ from remarkable_mcp.capabilities import client_supports_elicitation
 from remarkable_mcp.lookup import display_path, lookup_folder, scoped_items
 from remarkable_mcp.lookup import lookup as lookup_item
 from remarkable_mcp.pages import content_page_ids, tablet_page
-from remarkable_mcp.responses import invalid_param, make_error, make_response
+from remarkable_mcp.responses import invalid_param, make_error, make_response, resolve_alias
 from remarkable_mcp.ssh import XOCHITL_PATH, Document, SSHClient
 from remarkable_mcp.ssh_reliability import (
     SSHExecutionUnknownError,
@@ -1342,60 +1343,12 @@ def _mark_preview_images(client, files: list, pdf: bytes, pages: list) -> list:
 
 
 def _mark_layout(client, files: list, pdf: bytes, page: int, page_map: list) -> dict:
-    """The original PDF's text lines, the user's ink and the free space on a
-    tablet page."""
-    from remarkable_mcp.extract import page_ink_regions
-    from remarkable_mcp.pdf_marks import (
-        MarkError,
-        free_regions,
-        original_pdf,
-        stored_marks,
-        text_lines,
-    )
+    """``page_layout.page_layout`` for a cloud document's index ``files``."""
+    from remarkable_mcp.page_layout import page_layout
+    from remarkable_mcp.pdf_marks import original_pdf
 
-    if not 1 <= page <= len(page_map):
-        raise MarkError(f"Page {page} does not exist; the document has {len(page_map)}.")
-    pdf_page = page_map[page - 1]
-    base = original_pdf(pdf)
-    with _document_dir(client, files, base) as root:
-        ink = page_ink_regions(root, page)
-    lines = text_lines(base, pdf_page) if pdf_page is not None else []
-    marks = [m["box"] for m in stored_marks(pdf) if m.get("pdf_page") == pdf_page]
-    return {
-        "page": page,
-        "text_lines": lines,
-        "ink": ink,
-        "free": free_regions(ink + [line["region"] for line in lines] + marks),
-        "layers": _page_layer_list(client, files, page),
-    }
-
-
-def _page_layer_list(client, files: list, page: int) -> list:
-    """A tablet page's layers, bottom first: ``{"name", "visible",
-    "selected"}``; empty when the page has no ink yet (Layer 1 is made with
-    the first ink)."""
-    from remarkable_mcp import rm_ink
-    from remarkable_mcp.pages import content_page_ids
-
-    content_file = next((f for f in files if f["id"].endswith(".content")), None)
-    if content_file is None:
-        return []
-    content = json.loads(client._get_file(content_file["hash"], content_file["id"]))
-    page_ids = content_page_ids(content)
-    if not 1 <= page <= len(page_ids):
-        return []
-    rm = next((f for f in files if f["id"].endswith(f"/{page_ids[page - 1]}.rm")), None)
-    if rm is None:
-        return []
-    data = client._get_file(rm["hash"], rm["id"])
-    layers = rm_ink.page_layers(data)
-    selected = rm_ink.selected_layer(data)
-    if selected is None and layers:
-        selected = layers[0]["id"]
-    return [
-        {"name": layer["name"], "visible": layer["visible"], "selected": layer["id"] == selected}
-        for layer in layers
-    ]
+    with _document_dir(client, files, original_pdf(pdf)) as root:
+        return page_layout(root, pdf, page, page_map)
 
 
 def _mark_response(target, result: dict, dry_run: bool) -> str:
@@ -3433,6 +3386,9 @@ def register_write_tools():
             return await _dispatch("tag", _impl, defer_restart)
 
         if _is_cloud_mode():
+            from remarkable_mcp.help import register_marks_help
+
+            register_marks_help(mcp)
 
             @mcp.tool(annotations=WRITE_ANNOTATIONS)
             async def remarkable_mark_pdf(
@@ -3442,7 +3398,8 @@ def register_write_tools():
                 clear: bool = False,
                 color: Optional[str] = None,
                 dry_run: bool = False,
-                layout: Optional[int] = None,
+                layout_page: Optional[int] = None,
+                layout: SkipJsonSchema[Optional[int]] = None,
             ):
                 """
                 <usecase>Add or remove marks on the pages of a PDF document: text,
@@ -3453,120 +3410,60 @@ def register_write_tools():
                 Marks are drawn into the document's PDF, under the user's ink,
                 which is not changed. Each mark has an id; removing a mark
                 rebuilds the PDF without it, so outdated marks can be replaced
-                cleanly. With no changes requested it lists the current marks.
-                Marks cannot be erased on the tablet, only with this tool (or
-                hidden there, with a cover; see below).
+                cleanly. With no changes requested it lists the current marks
+                (remarkable_read lists them too).
 
                 Positions are fractions of the page (0-1 from the top-left): a
                 point is [x, y] and a region is [left, top, right, bottom], the
-                same regions remarkable_image takes and layout, remarkable_read
-                and this tool's listing return, so they can be passed straight
-                back. Sizes and widths are in points. Before marking a
-                page, call with layout=<page> for the positions of the PDF's text
-                lines and of the user's ink on it, and look at the page with
+                same regions remarkable_image takes and listings return. Sizes
+                and widths are in points. Before marking a page, call with
+                layout_page=<page> for the positions of the PDF's text lines,
+                the user's ink and free space, and look at the page with
                 remarkable_image. Place marks beside the user's ink rather than
                 on it, and use dry_run=True to check the result: it returns
                 images of the changed pages without writing anything.
 
-                Name marks after what they mark (e.g. "q3", "q3-note", "intro-hl")
-                so they can be found and replaced later. Listings give each mark's
-                content, color, position and style (size, bold, anchor, width
-                and so on), so it can be re-created exactly. Any mark can take a
-                description (up to 200 characters) saying what it is and why,
-                for later sessions; it is shown when marks are listed and by
-                remarkable_read. Describe path marks, which are otherwise only
-                path data, e.g. "gold star: neat, complete working".
+                Each mark in `add` has a `page` (1-based tablet page), an
+                optional `id` (name it after what it marks, e.g. "q3",
+                "q3-note"), an optional `description` (up to 200 characters,
+                shown in listings; describe path marks) and exactly one of:
+                - text: string ("\\n" starts a new line); options size (default
+                  11), bold, italic, underline, border
+                - shape: "check" or "cross" (at or region; option size);
+                  "circle", "box" or "highlight" (region); "line" or "arrow"
+                  (from [x, y], to [x, y]; option dot). Options width, opacity
+                - path: SVG path data for any other shape, scaled into region
+                  or to size points at at; options width, fill, opacity
+                - latex: LaTeX math, e.g. "\\frac{a}{b}"; options size
+                  (default 12), border
+                - graphic: SVG markup, or base64 one-page PDF, PNG or JPEG (up
+                  to 2 MB), with region
+                - graphic_file: path of such a file on this machine (up to
+                  10 MB), with region
+                - text_highlight: printed text on the page to highlight with
+                  the tablet's own highlighter; options occurrence, layer
+                Place a mark with at [x, y] (option anchor: top-left, top,
+                top-right, left, center, right, bottom-left, bottom or
+                bottom-right), with region, or with near [x, y]: the closest
+                free space to that point, and "leader": true draws a line back
+                to it. Use near with a leader on pages full of writing.
 
-                Any mark can take "cover": true so the user can hide it on the
-                tablet: white ink goes over it on a "Mark cover" layer at the
-                bottom of the page, made hidden, and showing that layer hides
-                the mark. A layer name instead of true (e.g. "Answer key")
-                makes a group the user hides separately; "covered": true makes
-                a new layer shown, so its marks start hidden (e.g. answers to
-                reveal later). Listings give each covered mark's layer and
-                state: hidden on tablet, shown on tablet, or cover erased on
-                tablet. Treat marks the user has hidden as dismissed. Removing
-                a mark removes its cover.
+                Every mark but graphics takes a color: #RRGGBB or a tablet
+                color. Pen colors: black, gray, white, blue, red, green,
+                yellow, cyan, magenta. Highlighter colors (highlights):
+                yellow, blue, pink, orange, green, gray. The default is black,
+                and yellow for highlights. Pick colors for the task: when
+                grading, green for check marks and full scores, red for X
+                marks, notes about mistakes and partial scores.
 
-                Each mark in `add` has a `page` (1-based), an optional `id`, and
-                exactly one of:
-                - text: string ("\n" starts a new line); at, or region to wrap
-                  within; options size (default 11), bold, italic, underline,
-                  border (a rounded box with a white background)
-                - shape: "check" or "cross" with at (option size) or region;
-                  "circle", "box" or "highlight" with region, stretched to fill
-                  it; "line" or "arrow" with from [x, y] and to [x, y].
-                  Options: width (line width), opacity, dot (a dot at the to
-                  end of a line or arrow)
-                - path: SVG path data for any other shape, in any units. With
-                  region it is scaled to fit, centered, keeping its aspect
-                  (stretch: true fills the region instead); with at it is
-                  scaled so its larger side is size points (default 12).
-                  E.g. "M 0 10 L 5 0 L 10 10" is a caret. Options: width
-                  (stays in points), fill (a color), opacity. Several subpaths
-                  (each starting with M) share one style; for drawings with
-                  several colors or text, or output from other tools, use
-                  graphic.
-                - latex: LaTeX math, e.g. "\\frac{a}{b} = \\sqrt{2}"; at, or
-                  region to scale into; options size (default 12), border
-                - graphic: content rendered elsewhere: SVG markup, or base64 PDF
-                  (one page), PNG or JPEG (up to 2 MB); with region, scaled to
-                  fit at its top-left. SVG may only reference its own elements
-                  or data: URIs.
-                - graphic_file: path of such a file on the machine running this
-                  server (up to 10 MB), with region
-                Text, shape (including highlight) and path marks can take
-                "erasable": true: they are written as tablet ink instead of
-                into the PDF, so the user can erase, move or recolor them on the
-                tablet, and their colors match in every app. Text is drawn in a
-                single-stroke font (bold is a thicker line); shapes, paths and
-                leaders with a pen, highlights with the highlighter. Named
-                colors only (pen colors; highlighter colors for highlights), no
-                fill or opacity; option layer as for text_highlight. Listings
-                give their state: on tablet, partly erased or erased on tablet.
-                - text_highlight: text on the page to highlight as the tablet's
-                  own highlighter does (the user can erase it on the tablet);
-                  it may run over several lines. Options: color (a highlighter
-                  color, default yellow), occurrence (which match, default 1),
-                  layer (a layer name; a new one is added on top if the page has
-                  none; default the page's selected layer, as the tablet does).
-                  layout lists the page's layers. Not with at, region or near.
-                Instead of at or region, text, latex, check, cross and path marks
-                can take near [x, y]: the mark is put in the closest free space to
-                that point, clear of the user's ink, the printed text and other
-                marks, and "leader": true draws a thin line from the mark to the
-                point, ending in a dot; it is drawn only when the mark cannot sit
-                beside the point; positions giving a diagonal leader are
-                preferred. It starts at the middle of the note's top or bottom
-                for a point above or below the note, otherwise
-                just past the end that faces the point, at the text's top,
-                middle or baseline, so it never crosses the note (a bordered
-                note's leader starts at its border). Use near, with a leader, on
-                pages full of writing; give the point of what the mark is about,
-                at its edge (such as the end of an answer) rather than its
-                middle. A leader never crosses the user's handwriting or other
-                marks, and crosses printed text only when nothing else reaches
-                the point; if no place fits, the tool says so: shorten the note
-                or make it smaller.
-                Marks placed with `at` take an optional anchor: the point of the
-                mark placed at `at`: top-left, top, top-right, left, center,
-                right, bottom-left, bottom or bottom-right. Default center for
-                check and cross, top-left otherwise. Use anchor "left" with at
-                at the right end of a text line's middle to put a note beside it.
-                Every mark but graphics takes a color: #RRGGBB or one of the
-                tablet's colors. Pen colors (all marks but highlights): black,
-                gray, white, blue, red, green, yellow, cyan, magenta.
-                Highlighter colors (highlights): yellow, blue, pink, orange,
-                green, gray. The default is black, and yellow for highlights.
-                Named colors are tuned to look right on the tablet's screen; PDF
-                exports (remarkable_export) re-draw them in the desktop and
-                browser apps' colors.
-                Highlights darken like the tablet's highlighter: the color shows
-                on the paper and text under it stays dark.
-
-                Pick colors for the task. When grading, for example, use green
-                for check marks and full scores, and red for X marks, notes about
-                mistakes and partial scores.
+                Marks in the PDF can be removed only with this tool. So that
+                the user can dismiss marks on the tablet, a mark can take
+                "cover": true (white ink on a hidden layer that hides the mark
+                when shown) or, for text, shape and path marks, "erasable":
+                true (written as tablet ink the user can erase); text_highlight
+                marks are tablet ink too. Read the resource
+                remarkable://help/marks for near and leader placement, covers,
+                erasable marks, text highlights and listing states.
 
                 Removals run before additions, so a mark can be replaced in one
                 call by removing its id and adding a new mark with that id.
@@ -3585,13 +3482,13 @@ def register_write_tools():
                   or #RRGGBB
                 - dry_run: Return preview images of the changed pages without
                   writing
-                - layout: Tablet page number; the response adds that page's text
-                  lines (from the PDF before marks), each with its region, the
-                  regions of the user's ink, and free: the largest empty regions
-                  (clear of ink, text and marks), largest first. Not combined
-                  with a write; use it alone or with dry_run.
+                - layout_page: Tablet page number; the response adds that
+                  page's layout as remarkable_page_layout gives it (text lines,
+                  ink, free regions, layers). Not combined with a write; use it
+                  alone or with dry_run.
                 </parameters>
                 <examples>
+                - remarkable_mark_pdf("Worksheet", layout_page=1)  # where to place marks
                 - remarkable_mark_pdf("Worksheet", color="red", add=[
                     {"page": 1, "id": "score", "text": "3/4", "at": [0.8, 0.06],
                      "size": 24, "bold": true},
@@ -3599,29 +3496,14 @@ def register_write_tools():
                      "color": "green"},
                     {"page": 1, "id": "q3", "shape": "cross", "at": [0.38, 0.33]},
                     {"page": 1, "id": "q3-note", "text": "Orange is secondary.",
-                     "at": [0.41, 0.33], "anchor": "left", "size": 9}],
+                     "near": [0.6, 0.33], "leader": true, "size": 9}],
                   dry_run=True)
                 - remarkable_mark_pdf("Paper", add=[
-                    {"page": 3, "id": "key-claim", "shape": "highlight",
-                     "region": [0.12, 0.41, 0.88, 0.43]},
-                    {"page": 3, "id": "key-claim-note", "text": "Compare with Fig. 2",
-                     "at": [0.9, 0.42], "anchor": "right", "size": 8}])
-                - remarkable_mark_pdf("Notes", add=[
-                    {"page": 2, "id": "formula",
-                     "latex": "x = \\frac{-b \\pm \\sqrt{b^2-4ac}}{2a}",
-                     "at": [0.45, 0.52]},
-                    {"page": 2, "id": "formula-arrow", "shape": "arrow",
-                     "from": [0.44, 0.53], "to": [0.36, 0.53]},
-                    {"page": 2, "id": "brace", "path":
-                     "M 0 0 C 8 0 4 20 10 20 C 4 20 8 40 0 40",
-                     "region": [0.8, 0.3, 0.83, 0.38]}])
+                    {"page": 3, "id": "key-claim", "text_highlight":
+                     "the effect doubles", "color": "pink"}])
                 - remarkable_mark_pdf("Worksheet", remove=["q3", "q3-note"], add=[
                     {"page": 1, "id": "q3", "shape": "check", "at": [0.38, 0.33],
                      "color": "green"}])  # the answer was revised
-                - remarkable_mark_pdf("Worksheet", color="red", add=[
-                    {"page": 2, "id": "q4-note", "text": "check the sign",
-                     "near": [0.62, 0.41], "leader": true, "size": 9}])
-                - remarkable_mark_pdf("Worksheet", layout=1)  # where to place marks
                 - remarkable_mark_pdf("Worksheet")  # list marks
                 - remarkable_mark_pdf("Worksheet", clear=True)
                 </examples>
@@ -3630,10 +3512,15 @@ def register_write_tools():
 
                 adds, removes = add or [], _as_list(remove)
                 writing = bool(adds or removes or clear) and not dry_run
-                if layout is not None and writing:
+                layout_page, error = resolve_alias(
+                    layout_page, layout, "layout_page", "layout", default=None
+                )
+                if error:
+                    return error
+                if layout_page is not None and writing:
                     return invalid_param(
-                        "layout cannot be combined with a write.",
-                        "Call with layout alone (or with dry_run=True) first, then write.",
+                        "layout_page cannot be combined with a write.",
+                        "Call with layout_page alone (or with dry_run=True) first, then write.",
                     )
 
                 def run(client, target):
@@ -3649,9 +3536,9 @@ def register_write_tools():
                         return _mark_response(target, result, dry_run=False)
                     pdf, content, files = client.read_document_pdf(target.ID)
                     result = edit(pdf, content, client.ink_reader(target.ID, files))
-                    if layout is not None:
+                    if layout_page is not None:
                         result["layout"] = _mark_layout(
-                            client, files, pdf, layout, result["page_map"]
+                            client, files, pdf, layout_page, result["page_map"]
                         )
                     response = _mark_response(target, result, dry_run=dry_run)
                     preview = result.get("preview_pdf")

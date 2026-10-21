@@ -48,3 +48,17 @@ def is_error_response(text: str) -> bool:
     except ValueError:
         return False
     return isinstance(data, dict) and "_error" in data
+
+
+def resolve_alias(value, alias, name: str, alias_name: str, default=None):
+    """``(value, None)`` for a parameter that also has a deprecated alias:
+    the alias's value when only it is given, or ``(None, error)`` when both
+    are given with different values. ``default`` is the parameter's default."""
+    if alias is None:
+        return value, None
+    if value != default and value != alias:
+        return None, invalid_param(
+            f"{alias_name}: give {name} or its old name {alias_name}, not both.",
+            f"Use {name}.",
+        )
+    return alias, None

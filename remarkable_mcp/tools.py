@@ -131,6 +131,11 @@ IMAGE_ANNOTATIONS = ToolAnnotations(
     **_BASE_ANNOTATIONS,
 )
 
+LAYOUT_ANNOTATIONS = ToolAnnotations(
+    title="Get reMarkable Page Layout",
+    **_BASE_ANNOTATIONS,
+)
+
 EXPORT_ANNOTATIONS = ToolAnnotations(
     title="Export reMarkable Document",
     read_only_hint=False,
@@ -1495,6 +1500,85 @@ async def remarkable_search(
             message=str(e),
             suggestion="Check remarkable_status() to verify your connection.",
         )
+
+
+def _archive_layout(archive: bytes, pdf: Optional[bytes], page: int) -> dict:
+    """``page_layout.page_layout`` for a downloaded document archive."""
+    from remarkable_mcp.page_layout import page_layout
+
+    page_map = _archive_page_map(archive)
+    with tempfile.TemporaryDirectory(prefix="remarkable-layout-") as tmp:
+        root = Path(tmp)
+        with zipfile.ZipFile(io.BytesIO(archive)) as zf:
+            zf.extractall(root)
+        return page_layout(root, pdf, page, page_map)
+
+
+@mcp.tool(annotations=LAYOUT_ANNOTATIONS)
+async def remarkable_page_layout(document: str, page: int = 1) -> str:
+    """
+    <usecase>Find where things are on a page: the PDF's text lines, the user's
+    handwriting, marks and free space.</usecase>
+    <instructions>
+    Returns regions on one tablet page as page fractions [left, top, right,
+    bottom], the frame remarkable_image's region uses:
+    - text_lines: the PDF's printed lines (before marks), each with its text
+    - ink: boxes around the user's handwriting on visible layers (roughly a
+      word or a line each)
+    - free: the largest empty regions, clear of ink, text and marks
+    - layers: the page's layers, bottom first
+    Pass an ink box to remarkable_image(document, page, region=...) to read
+    that writing, or place marks in free space with remarkable_mark_pdf.
+    Notebooks have ink but no text lines. Never changes the tablet.
+    </instructions>
+    <parameters>
+    - document: Document name or path
+    - page: Tablet page number (default: 1)
+    </parameters>
+    <examples>
+    - remarkable_page_layout("Week 3 worksheet", page=2)
+    </examples>
+    """
+    from remarkable_mcp.pdf_marks import MarkError
+
+    try:
+        client = await run_blocking(get_rmapi)
+        collection = await run_blocking(client.get_meta_items)
+        items_by_id = get_items_by_id(collection)
+        target_doc, error = lookup(
+            client, document, kind="document", collection=collection, items_by_id=items_by_id
+        )
+        if error:
+            return error
+        archive = await run_blocking(client.download, target_doc)
+        if _is_pdf_payload(archive):
+            return make_error(
+                error_type="layout_not_available",
+                message="This transport returned only the PDF, without the tablet's page files.",
+                suggestion="Use remarkable_image to look at the page instead.",
+            )
+        pdf = None
+        if await run_blocking(get_file_type, client, target_doc) == "pdf":
+            pdf = await run_blocking(download_raw_file, client, target_doc, "pdf")
+        layout = await run_blocking(_archive_layout, archive, pdf, page)
+    except MarkError as e:
+        return invalid_param(f"page: {e}", "Pages are numbered from 1.")
+    except Exception as e:
+        return make_error(
+            error_type="layout_failed",
+            message=f"Failed to read the page layout: {e}",
+            suggestion="Check remarkable_status() and try again.",
+        )
+    data = {
+        "document": target_doc.VissibleName,
+        "path": _apply_root_filter(get_item_path(target_doc, items_by_id)),
+        **layout,
+    }
+    hint = (
+        f"Page {page}: {len(layout['text_lines'])} text lines, {len(layout['ink'])} ink "
+        "regions. Crop to a region with remarkable_image(document, page, region=...)."
+    )
+    return make_response(data, hint)
 
 
 @mcp.tool(annotations=STATUS_ANNOTATIONS)
@@ -3026,9 +3110,10 @@ async def remarkable_export(
     tags: Optional[List[str]] = None,
 ):
     """
-    <usecase>Export one reMarkable document as a reusable PDF or Markdown file.</usecase>
+    <usecase>Export reMarkable documents as PDF or Markdown files: one document (or
+    some of its pages), or every document in a folder or with given tags.</usecase>
     <instructions>
-    Exports a single document without modifying the tablet or its library.
+    Exports without modifying the tablet or its library.
 
     The generated file is written to a server-managed temporary directory and
     returned as an MCP ResourceLink. The tool response stays small: it never embeds

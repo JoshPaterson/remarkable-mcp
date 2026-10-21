@@ -13,7 +13,8 @@ This document describes the read and render tools. Write tools are listed in the
 | [`remarkable_recent`](#remarkable_recent) | Get recently modified documents |
 | [`remarkable_status`](#remarkable_status) | Check connection status |
 | [`remarkable_image`](#remarkable_image) | Get page images (PNG or SVG) |
-| [`remarkable_export`](#remarkable_export) | Export one document as PDF or Markdown |
+| [`remarkable_page_layout`](#remarkable_page_layout) | Find text lines, ink and free space on a page |
+| [`remarkable_export`](#remarkable_export) | Export documents as PDF or Markdown |
 
 These tools never modify tablet content and return structured next-step hints.
 `remarkable_export` additionally creates a bounded temporary file on the MCP server
@@ -569,6 +570,35 @@ used when configured; otherwise OCR runs locally with Tesseract.
   that export. SVG and explicit `render_merged=False` require the unavailable
   rmdoc annotation layer and return clear errors.
 - RGBA colors (8-digit hex) allow transparency control
+
+---
+
+## remarkable_page_layout
+
+**Find where things are on one tablet page.**
+
+### Parameters
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `document` | string | required | Document name or path |
+| `page` | int | 1 | Tablet page number |
+
+### Response Format
+
+Regions are page fractions `[left, top, right, bottom]`, the frame
+`remarkable_image`'s `region` takes:
+
+- `text_lines`: the PDF's printed lines (before marks), each with `text` and
+  `region`; empty for notebooks
+- `ink`: boxes around the user's handwriting on visible layers, roughly a word
+  or a line each (ink the MCP wrote, such as covers, is left out)
+- `free`: the largest empty regions, clear of ink, text and marks
+- `layers`: the page's layers, bottom first, with `visible` and `selected`
+
+Works in every transport and in read-only mode. `remarkable_mark_pdf`'s
+`layout_page` returns the same layout. Marks and a PDF's outline are listed by
+`remarkable_read` (`marks` and `outline` in its response).
 
 ---
 
