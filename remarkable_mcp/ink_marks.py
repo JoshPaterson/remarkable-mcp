@@ -302,19 +302,33 @@ def add_strokes(
 ) -> Tuple[bytes, List[List[int]]]:
     """``data`` (None: the page has no ink) with ``strokes`` (points in page
     points) written with ``tool`` in ``color``; returns the file and ids."""
+    page = rm_ink.PageWriter(data, author)
+    ids = _write_strokes(page, size, strokes, tool, color, layer)
+    return page.data, ids
+
+
+def _write_strokes(
+    page: rm_ink.PageWriter,
+    size: Tuple[float, float],
+    strokes: Sequence[Dict[str, Any]],
+    tool: str,
+    color: str,
+    layer: Optional[str],
+) -> List[List[int]]:
     from remarkable_mcp.text_highlights import COLORS
 
     if tool == HIGHLIGHTER:
         color_id, rgba = COLORS[color]
     else:
         color_id, rgba = PEN_COLORS[color], None
-    page = rm_ink.PageWriter(data, author)
     lines = [
-        {"points": [[x / size[0], y / size[1]] for x, y in s["points"]], "width": s["width"]}
-        for s in strokes
+        {
+            "points": [[x / size[0], y / size[1]] for x, y in stroke["points"]],
+            "width": stroke["width"],
+        }
+        for stroke in strokes
     ]
-    ids = page.add_lines(page.ink_layer(layer), lines, size, tool, color_id, rgba)
-    return page.data, ids
+    return page.add_lines(page.ink_layer(layer), lines, size, tool, color_id, rgba)
 
 
 def ink_status(data: Optional[bytes], item_ids: Iterable[Sequence[int]]) -> str:
@@ -330,92 +344,26 @@ def ink_status(data: Optional[bytes], item_ids: Iterable[Sequence[int]]) -> str:
     return "partly erased on tablet" if erased else "on tablet"
 
 
-def write_mark_ink(
-    before: Sequence[Dict[str, Any]],
-    after: Sequence[Dict[str, Any]],
-    removed: Iterable[str],
-    *,
-    page_ids: Sequence[str],
-    page_map: Sequence[Optional[int]],
-    sizes: Sequence[Tuple[float, float]],
-    read_ink,
-    author: uuid.UUID,
-) -> Dict[str, bytes]:
-    """Write new erasable marks to their pages' ink (dropping their PDF
-    snippets) and delete removed ones'. Returns changed ink files by page id."""
-    from remarkable_mcp.pdf_marks import tablet_page
-
-    removed = set(removed)
-    jobs: Dict[int, Dict[str, list]] = {}
-    for mark in before:
-        ink = mark.get("ink")
-        if mark["id"] in removed and isinstance(ink, dict) and ink.get("items"):
-            jobs.setdefault(mark["pdf_page"], {"remove": [], "add": []})["remove"] += ink["items"]
-    for mark in after:
-        ink = mark.get("ink")
-        if isinstance(ink, dict) and ink.get("pending"):
-            jobs.setdefault(mark["pdf_page"], {"remove": [], "add": []})["add"].append(mark)
-    changed: Dict[str, bytes] = {}
-    for pdf_page, job in jobs.items():
-        page = tablet_page(pdf_page, page_map)
-        if page is None or page > len(page_ids):
-            continue
-        page_id = page_ids[page - 1]
-        data = read_ink(page_id)
-        if data is not None and not rm_ink.is_v6(data):
-            raise InkError(f"Page {page}'s ink is in an older format.")
-        if data is not None and job["remove"]:
-            data = rm_ink.tombstone(data, job["remove"])
-        for mark in job["add"]:
-            size = sizes[pdf_page]
-            ink = mark["ink"]
-            items: List[List[int]] = []
-            if ink["tool"] == HIGHLIGHTER:
-                strokes = highlight_strokes(mark["box"], size)
-            else:
-                strokes = part_strokes(mark, size)
-                if mark.get("leader"):
-                    strokes += part_strokes(mark["leader"], size)
-            data, ids = add_strokes(
-                data, author, size, strokes, ink["tool"], ink["color"], ink.get("layer")
-            )
-            items += ids
-            mark["ink"] = {
-                "tool": ink["tool"],
-                "color": ink["color"],
-                "layer": ink.get("layer"),
-                "items": items,
-            }
-            mark.pop("pdf", None)
-            if mark.get("leader"):
-                mark["leader"].pop("pdf", None)
-        changed[page_id] = data
-    return changed
-
-
-def mark_ink_states(
-    marks: Sequence[Dict[str, Any]],
-    *,
-    page_ids: Sequence[str],
-    page_map: Sequence[Optional[int]],
-    read_ink,
-) -> Dict[str, str]:
-    """Each erasable mark's state on the tablet (``ink_status``)."""
-    from remarkable_mcp.pdf_marks import tablet_page
-
-    states: Dict[str, str] = {}
-    pages: Dict[int, Optional[bytes]] = {}
-    for mark in marks:
-        ink = mark.get("ink")
-        if not isinstance(ink, dict) or not ink.get("items"):
-            continue
-        page = tablet_page(mark["pdf_page"], page_map)
-        if page is None or page > len(page_ids):
-            continue
-        if page not in pages:
-            pages[page] = read_ink(page_ids[page - 1])
-        states[mark["id"]] = ink_status(pages[page], ink["items"])
-    return states
+def add_mark_ink(page: rm_ink.PageWriter, mark: Dict[str, Any], size) -> None:
+    """Write a pending erasable mark (on a page of ``size`` points), store its
+    item ids in the mark and drop its PDF snippets."""
+    ink = mark["ink"]
+    if ink["tool"] == HIGHLIGHTER:
+        strokes = highlight_strokes(mark["box"], size)
+    else:
+        strokes = part_strokes(mark, size)
+        if mark.get("leader"):
+            strokes += part_strokes(mark["leader"], size)
+    ids = _write_strokes(page, size, strokes, ink["tool"], ink["color"], ink.get("layer"))
+    mark["ink"] = {
+        "tool": ink["tool"],
+        "color": ink["color"],
+        "layer": ink.get("layer"),
+        "items": ids,
+    }
+    mark.pop("pdf", None)
+    if mark.get("leader"):
+        mark["leader"].pop("pdf", None)
 
 
 def erasable_request(

@@ -184,3 +184,44 @@ def test_dots_are_drawn_as_small_filled_circles():
     assert len(dot) == 1
     xs = [p[0] for p in dot[0]["points"]]
     assert max(xs) - min(xs) > 0.5  # a real loop, not a single point
+
+
+def _write(before, after, removed, pages):
+    from remarkable_mcp import mark_ink
+
+    return mark_ink.write_marks(
+        before,
+        after,
+        removed,
+        page_ids=["page-a"],
+        page_map=[0],
+        sizes=[A4],
+        read_ink=pages.get,
+        author=AUTHOR,
+    )
+
+
+def test_removing_ink_from_a_page_without_ink_writes_nothing():
+    gone = {"id": "n", "pdf_page": 0, "ink": {"tool": "fineliner", "items": [[2, 50]]}}
+    hl = {"id": "h", "pdf_page": 0, "highlight": {"items": [[2, 60]]}}
+    assert _write([gone, hl], [], ["n", "h"], {}) == {}
+
+
+def test_every_kind_of_ink_on_a_page_is_written_in_one_pass():
+    strokes = [{"points": [(100, 300), (200, 300)], "width": 1.5}]
+    page, ids = ink_marks.add_strokes(None, AUTHOR, A4, strokes, "fineliner", "red")
+    old = {"id": "old", "pdf_page": 0, "ink": {"tool": "fineliner", "color": "red", "items": ids}}
+    parts = [{"start": 0, "length": 5, "text": "hello", "rect": (100, 200, 140, 212)}]
+    hl = {
+        "id": "hl",
+        "pdf_page": 0,
+        "color_name": "blue",
+        "highlight": {"parts": parts, "layer": None, "pending": True},
+    }
+    box = {"id": "box", "pdf_page": 0, "box": [0.1, 0.5, 0.3, 0.52]}
+    box["ink"] = {"pending": True, "tool": "highlighter", "color": "yellow", "layer": None}
+    changed = _write([old], [hl, box], ["old"], {"page-a": page})
+    data = changed["page-a"]
+    assert ink_marks.ink_status(data, ids) == "erased on tablet"
+    assert ink_marks.ink_status(data, hl["highlight"]["items"]) == "on tablet"
+    assert ink_marks.ink_status(data, box["ink"]["items"]) == "on tablet"

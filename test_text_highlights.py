@@ -8,7 +8,7 @@ import pytest
 from rmscene import read_blocks
 from rmscene.scene_stream import SceneGlyphItemBlock
 
-from remarkable_mcp import pdf_marks, rm_ink
+from remarkable_mcp import ink_marks, pdf_marks, rm_ink
 from remarkable_mcp import text_highlights as th
 from test_mark_pdf import A4, CONTENT, FakeCloud, _mark_tool  # noqa: F401
 
@@ -67,15 +67,15 @@ def test_highlights_go_on_the_selected_layer_or_a_named_one():
         234,
         254,
     )
-    assert th.highlight_status(data, ids) == "on tablet"
+    assert ink_marks.ink_status(data, ids) == "on tablet"
 
     data, more = th.add_highlights(data, AUTHOR, A4, parts, "yellow", layer="Claude highlights")
     names = [layer["name"] for layer in rm_ink.page_layers(data)]
     assert names == ["Layer 1", "Claude highlights"]
 
     data = rm_ink.tombstone(data, ids)
-    assert th.highlight_status(data, ids) == "erased on tablet"
-    assert th.highlight_status(data, more) == "on tablet"
+    assert ink_marks.ink_status(data, ids) == "erased on tablet"
+    assert ink_marks.ink_status(data, more) == "on tablet"
 
 
 @pytest.fixture

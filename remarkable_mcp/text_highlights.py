@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import re
 import uuid
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from remarkable_mcp import rm_ink
 
@@ -116,94 +116,11 @@ def add_highlights(
     return page.data, ids
 
 
-def highlight_status(data: Optional[bytes], item_ids: Iterable[Sequence[int]]) -> str:
-    """ "on tablet", "erased on tablet" (all items erased), "partly erased on
-    tablet" or "missing"."""
-    states = rm_ink.item_states(data, item_ids)
-    if not states:
-        return "missing"
-    live = sum(1 for _, alive in states.values() if alive)
-    erased = len(states) - live
-    if not live:
-        return "erased on tablet"
-    return "partly erased on tablet" if erased else "on tablet"
-
-
-# --- Text highlight marks --------------------------------------------------
-
-
-def write_mark_highlights(
-    before: Sequence[Dict[str, Any]],
-    after: Sequence[Dict[str, Any]],
-    removed: Iterable[str],
-    *,
-    page_ids: Sequence[str],
-    page_map: Sequence[Optional[int]],
-    sizes: Sequence[Tuple[float, float]],
-    read_ink,
-    author: uuid.UUID,
-) -> Dict[str, bytes]:
-    """Write new text highlight marks to their pages' ink and delete those of
-    removed marks; pending marks in ``after`` get their item ids. Returns the
-    changed ink files by page id."""
-    from remarkable_mcp.pdf_marks import tablet_page
-
-    removed = set(removed)
-    jobs: Dict[int, Dict[str, list]] = {}
-    for mark in before:
-        ink = mark.get("highlight")
-        if mark["id"] in removed and isinstance(ink, dict) and ink.get("items"):
-            jobs.setdefault(mark["pdf_page"], {"remove": [], "add": []})["remove"] += ink["items"]
-    for mark in after:
-        ink = mark.get("highlight")
-        if isinstance(ink, dict) and ink.get("pending"):
-            jobs.setdefault(mark["pdf_page"], {"remove": [], "add": []})["add"].append(mark)
-    changed: Dict[str, bytes] = {}
-    for pdf_page, job in jobs.items():
-        page = tablet_page(pdf_page, page_map)
-        if page is None or page > len(page_ids):
-            continue
-        page_id = page_ids[page - 1]
-        data = read_ink(page_id)
-        if data is not None and not rm_ink.is_v6(data):
-            raise HighlightError(f"Page {page}'s ink is in an older format.")
-        if data is not None and job["remove"]:
-            data = rm_ink.tombstone(data, job["remove"])
-        for mark in job["add"]:
-            ink = mark["highlight"]
-            data, ids = add_highlights(
-                data,
-                author,
-                sizes[pdf_page],
-                ink["parts"],
-                mark["color_name"],
-                ink.get("layer"),
-            )
-            mark["highlight"] = {"layer": ink.get("layer"), "items": ids}
-        changed[page_id] = data
-    return changed
-
-
-def mark_highlight_states(
-    marks: Sequence[Dict[str, Any]],
-    *,
-    page_ids: Sequence[str],
-    page_map: Sequence[Optional[int]],
-    read_ink,
-) -> Dict[str, str]:
-    """Each text highlight mark's state on the tablet (``highlight_status``)."""
-    from remarkable_mcp.pdf_marks import tablet_page
-
-    states: Dict[str, str] = {}
-    pages: Dict[int, Optional[bytes]] = {}
-    for mark in marks:
-        ink = mark.get("highlight")
-        if not isinstance(ink, dict) or not ink.get("items"):
-            continue
-        page = tablet_page(mark["pdf_page"], page_map)
-        if page is None or page > len(page_ids):
-            continue
-        if page not in pages:
-            pages[page] = read_ink(page_ids[page - 1])
-        states[mark["id"]] = highlight_status(pages[page], ink["items"])
-    return states
+def add_mark_highlight(page: rm_ink.PageWriter, mark: Dict[str, Any], size) -> None:
+    """Write a pending text highlight mark (on a page of ``size`` points) and
+    store its item ids in the mark."""
+    ink = mark["highlight"]
+    color_id, rgba = COLORS[mark["color_name"]]
+    layer = page.ink_layer(ink.get("layer"))
+    ids = page.add_glyphs(layer, ink["parts"], size, color_id, rgba)
+    mark["highlight"] = {"layer": ink.get("layer"), "items": ids}

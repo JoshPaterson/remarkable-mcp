@@ -1368,12 +1368,13 @@ def _mark_editor(
     def edit(pdf: bytes, content: dict, read_ink=None) -> dict:
         """``read_ink(page_id)`` returns a page's ink file (or None); it is
         needed to write marks' covers and report their state."""
-        from remarkable_mcp import cover_layers, ink_marks, rm_ink, text_highlights
+        from remarkable_mcp import mark_ink, rm_ink, text_highlights
         from remarkable_mcp.pages import content_page_ids
 
         base, marks = pdf_marks.load_state(pdf)
         page_map = pdf_page_map(content)
         page_ids = content_page_ids(content)
+        sizes = pdf_marks.page_sizes(base)
 
         def locate(pdf_page: int, text: str, occurrence: int):
             import pymupdf
@@ -1387,7 +1388,7 @@ def _mark_editor(
             remove=remove,
             clear=clear,
             page_map=page_map,
-            sizes=pdf_marks.page_sizes(base),
+            sizes=sizes,
             color=color,
             obstacles=(lambda i: obstacles(i, page_map)) if obstacles else None,
             locate=locate,
@@ -1399,89 +1400,34 @@ def _mark_editor(
             p for p in (pdf_marks.tablet_page(i, page_map) for i in touched) if p
         )
         result["ink"] = {}
-        covers = [m.get("cover") for m in marks + result["marks"]]
-        if build and result["changed"] and any(isinstance(c, dict) for c in covers):
+        if build and result["changed"] and mark_ink.has_ink(marks + result["marks"]):
             if read_ink is None:
-                raise pdf_marks.MarkError("Covers cannot be written here.")
+                raise pdf_marks.MarkError(
+                    "Covers, text highlights and erasable marks cannot be written here."
+                )
             try:
-                result["ink"] = cover_layers.write_mark_covers(
+                result["ink"] = mark_ink.write_marks(
                     marks,
                     result["marks"],
                     result["removed"],
                     page_ids=page_ids,
                     page_map=page_map,
-                    sizes=pdf_marks.page_sizes(base),
+                    sizes=sizes,
                     read_ink=read_ink,
                     author=rm_ink.author_uuid(),
-                )
-            except rm_ink.InkError as e:
-                raise pdf_marks.MarkError(str(e)) from None
-        inks = [m.get("highlight") for m in marks + result["marks"]]
-        if build and result["changed"] and any(isinstance(h, dict) for h in inks):
-            if read_ink is None:
-                raise pdf_marks.MarkError("Text highlights cannot be written here.")
-            covered = result["ink"]
-            try:
-                result["ink"] = dict(
-                    covered,
-                    **text_highlights.write_mark_highlights(
-                        marks,
-                        result["marks"],
-                        result["removed"],
-                        page_ids=page_ids,
-                        page_map=page_map,
-                        sizes=pdf_marks.page_sizes(base),
-                        read_ink=lambda page_id: covered.get(page_id) or read_ink(page_id),
-                        author=rm_ink.author_uuid(),
-                    ),
-                )
-            except rm_ink.InkError as e:
-                raise pdf_marks.MarkError(str(e)) from None
-        inks = [m.get("ink") for m in marks + result["marks"]]
-        if build and result["changed"] and any(isinstance(i, dict) for i in inks):
-            if read_ink is None:
-                raise pdf_marks.MarkError("Erasable marks cannot be written here.")
-            written_so_far = result["ink"]
-            try:
-                result["ink"] = dict(
-                    written_so_far,
-                    **ink_marks.write_mark_ink(
-                        marks,
-                        result["marks"],
-                        result["removed"],
-                        page_ids=page_ids,
-                        page_map=page_map,
-                        sizes=pdf_marks.page_sizes(base),
-                        read_ink=lambda page_id: written_so_far.get(page_id) or read_ink(page_id),
-                        author=rm_ink.author_uuid(),
-                    ),
                 )
             except rm_ink.InkError as e:
                 raise pdf_marks.MarkError(str(e)) from None
         result["cover_states"], cover_notes = {}, []
         if read_ink is not None:
             written = result["ink"]
-            result["cover_states"], cover_notes = cover_layers.mark_cover_states(
+            result["cover_states"], cover_notes = mark_ink.mark_states(
                 result["marks"],
                 page_ids=page_ids,
                 page_map=page_map,
-                read_ink=lambda page_id: written.get(page_id) or read_ink(page_id),
-            )
-            result["cover_states"].update(
-                ink_marks.mark_ink_states(
-                    result["marks"],
-                    page_ids=page_ids,
-                    page_map=page_map,
-                    read_ink=lambda page_id: written.get(page_id) or read_ink(page_id),
-                )
-            )
-            result["cover_states"].update(
-                text_highlights.mark_highlight_states(
-                    result["marks"],
-                    page_ids=page_ids,
-                    page_map=page_map,
-                    read_ink=lambda page_id: written.get(page_id) or read_ink(page_id),
-                )
+                read_ink=lambda page_id: (
+                    written[page_id] if page_id in written else read_ink(page_id)
+                ),
             )
         result["notes"] = result["notes"] + cover_notes
         result["pdf"] = (
@@ -1499,18 +1445,6 @@ def _mark_editor(
         return result
 
     return edit
-
-
-def _ink_reader(client, doc_id: str, files: list):
-    """``read_ink(page_id)``: a page's ``.rm`` file from a document's index
-    ``files``, or None when the page has no ink."""
-    by_id = {entry["id"]: entry for entry in files}
-
-    def read_ink(page_id: str) -> Optional[bytes]:
-        entry = by_id.get(f"{doc_id}/{page_id}.rm")
-        return None if entry is None else client._get_file(entry["hash"], entry["id"])
-
-    return read_ink
 
 
 @contextmanager
@@ -4115,7 +4049,7 @@ def register_write_tools():
                                 _invalidate_client_cache(client)
                             return _mark_response(target, result, dry_run=False)
                         pdf, content, files = client.read_document_pdf(target.ID)
-                        result = edit(pdf, content, _ink_reader(client, target.ID, files))
+                        result = edit(pdf, content, client.ink_reader(target.ID, files))
                         if layout is not None:
                             result["layout"] = _mark_layout(
                                 client, files, pdf, layout, result["page_map"]

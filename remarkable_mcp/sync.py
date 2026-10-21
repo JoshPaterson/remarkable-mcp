@@ -1057,6 +1057,17 @@ class RemarkableClient:
             raise CloudWriteError(f"Document {doc_id} is not a PDF document.")
         return files, pdf_file, content
 
+    def ink_reader(self, doc_id: str, files: list):
+        """``read_ink(page_id)``: a page's ``.rm`` file from a document's index
+        ``files``, or None when the page has no ink."""
+        by_id = {f["id"]: f for f in files}
+
+        def read_ink(page_id: str) -> Optional[bytes]:
+            entry = by_id.get(f"{doc_id}/{page_id}.rm")
+            return None if entry is None else self._get_file(entry["hash"], entry["id"])
+
+        return read_ink
+
     def replace_document_pdf(
         self, doc_id: str, edit: "Any", with_ink: bool = False, with_pages: bool = False
     ) -> Any:
@@ -1088,10 +1099,7 @@ class RemarkableClient:
             files, pdf_file, content = self._pdf_document_files(entry)
             pdf = self._get_file(pdf_file["hash"], pdf_file["id"])
             by_id = {f["id"]: f for f in files}
-
-            def read_ink(page_id: str) -> Optional[bytes]:
-                entry = by_id.get(f"{doc_id}/{page_id}.rm")
-                return None if entry is None else self._get_file(entry["hash"], entry["id"])
+            read_ink = self.ink_reader(doc_id, files)
 
             pagedata_file = next((f for f in files if f["id"] == f"{doc_id}.pagedata"), None)
             if with_pages:

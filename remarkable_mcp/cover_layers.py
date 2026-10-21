@@ -132,18 +132,29 @@ def edit_page(
     page = rm_ink.PageWriter(data, author)
     page.tombstone(remove)
     placed: List[Dict[str, Any]] = []
-    layers: Dict[str, Id] = {}
     for request in add:
-        name = request["layer"]
-        if name not in layers:
-            found = page.find_layer(name, own=True)
-            if found is None:
-                found = page.add_layer(name, bool(request.get("shown")))
-            layers[name] = found
-        rows = [{"points": row, "width": STROKE_PT} for row in request["rows"]]
-        ids = page.add_lines(layers[name], rows, size, "fineliner", WHITE)
-        placed.append({"layer": layers[name], "strokes": ids})
+        layer, ids = add_cover(
+            page, request["layer"], request["rows"], bool(request.get("shown")), size
+        )
+        placed.append({"layer": layer, "strokes": ids})
     return page.data, placed
+
+
+def add_cover(
+    page: rm_ink.PageWriter,
+    name: str,
+    rows: Sequence[Sequence[Sequence[float]]],
+    shown: bool,
+    size: Tuple[float, float],
+) -> Tuple[Id, List[List[int]]]:
+    """White strokes along ``rows`` on the MCP's layer ``name`` (made at the
+    bottom, shown or hidden as ``shown`` says, if the MCP has not made it on
+    this page); returns the layer and stroke ids."""
+    layer = page.find_layer(name, own=True)
+    if layer is None:
+        layer = page.add_layer(name, shown)
+    lines = [{"points": row, "width": STROKE_PT} for row in rows]
+    return layer, page.add_lines(layer, lines, size, "fineliner", WHITE)
 
 
 # --- Reading covers ----------------------------------------------------------
@@ -203,94 +214,9 @@ def mark_rows(mark: Dict[str, Any], size: Tuple[float, float]) -> List[List[List
     return rows
 
 
-def write_mark_covers(
-    before: Sequence[Dict[str, Any]],
-    after: Sequence[Dict[str, Any]],
-    removed: Iterable[str],
-    *,
-    page_ids: Sequence[str],
-    page_map: Sequence[Optional[int]],
-    sizes: Sequence[Tuple[float, float]],
-    read_ink,
-    author: uuid.UUID,
-) -> Dict[str, bytes]:
-    """Write the covers of new marks and delete those of removed ones.
-
-    ``before`` and ``after`` are the mark lists around an edit; marks in
-    ``after`` whose cover is pending get their stroke ids. ``read_ink(page_id)``
-    returns a page's ``.rm`` file or None. Returns the changed files by page id.
-    """
-    from remarkable_mcp.pdf_marks import tablet_page
-
-    removed = set(removed)
-    jobs: Dict[int, Dict[str, list]] = {}
-    for mark in before:
-        cover = mark.get("cover")
-        if mark["id"] in removed and isinstance(cover, dict) and cover.get("strokes"):
-            jobs.setdefault(mark["pdf_page"], {"remove": [], "add": []})["remove"] += cover[
-                "strokes"
-            ]
-    for mark in after:
-        cover = mark.get("cover")
-        if isinstance(cover, dict) and cover.get("pending"):
-            jobs.setdefault(mark["pdf_page"], {"remove": [], "add": []})["add"].append(mark)
-    changed: Dict[str, bytes] = {}
-    for pdf_page, job in jobs.items():
-        page = tablet_page(pdf_page, page_map)
-        if page is None or page > len(page_ids):
-            continue
-        page_id = page_ids[page - 1]
-        data = read_ink(page_id)
-        if data is not None and not rm_ink.is_v6(data):
-            raise CoverError(f"Page {page}'s ink is in an older format that cannot be covered.")
-        requests = [
-            {
-                "layer": m["cover"]["layer"],
-                "rows": mark_rows(m, sizes[pdf_page]),
-                "shown": m["cover"]["shown"],
-            }
-            for m in job["add"]
-        ]
-        new, placed = edit_page(data, author, sizes[pdf_page], add=requests, remove=job["remove"])
-        for mark, result in zip(job["add"], placed):
-            mark["cover"] = {
-                "layer": mark["cover"]["layer"],
-                "strokes": [list(s) for s in result["strokes"]],
-            }
-        changed[page_id] = new
-    return changed
-
-
-def mark_cover_states(
-    marks: Sequence[Dict[str, Any]],
-    *,
-    page_ids: Sequence[str],
-    page_map: Sequence[Optional[int]],
-    read_ink,
-) -> Tuple[Dict[str, str], List[str]]:
-    """``(states, notes)``: each covered mark's state on the tablet (see
-    ``cover_status``), and notes about the user's strokes on cover layers."""
-    from remarkable_mcp.pdf_marks import tablet_page
-
-    states: Dict[str, str] = {}
-    pages: Dict[int, Optional[bytes]] = {}
-    for mark in marks:
-        cover = mark.get("cover")
-        if not isinstance(cover, dict) or not cover.get("strokes"):
-            continue
-        page = tablet_page(mark["pdf_page"], page_map)
-        if page is None or page > len(page_ids):
-            continue
-        if page not in pages:
-            pages[page] = read_ink(page_ids[page - 1])
-        states[mark["id"]] = cover_status(pages[page], cover["strokes"])
-    notes = []
-    author = rm_ink.known_author_uuid()
-    for page, data in sorted(pages.items()):
-        count = foreign_strokes_on_covers(data, author)
-        if count:
-            notes.append(
-                f"Page {page}: {count} of the user's strokes are on a cover layer and "
-                "hide with the marks while it is shown."
-            )
-    return states, notes
+def add_mark_cover(page: rm_ink.PageWriter, mark: Dict[str, Any], size) -> None:
+    """Write the pending cover of ``mark`` (on a page of ``size`` points) and
+    store its stroke ids in the mark."""
+    cover = mark["cover"]
+    _, ids = add_cover(page, cover["layer"], mark_rows(mark, size), cover["shown"], size)
+    mark["cover"] = {"layer": cover["layer"], "strokes": ids}

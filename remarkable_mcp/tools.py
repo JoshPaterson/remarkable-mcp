@@ -2694,7 +2694,7 @@ def _mark_summaries(marks: list, archive: bytes) -> list:
         except Exception:
             content = None
     page_map = pdf_page_map(content) if content else []
-    states = _mark_cover_states(marks, archive, content, page_map)
+    states = _mark_ink_states(marks, archive, content, page_map)
     summaries = []
     for mark in marks:
         page = tablet_page(mark["pdf_page"], page_map) if page_map else mark["pdf_page"] + 1
@@ -2702,12 +2702,12 @@ def _mark_summaries(marks: list, archive: bytes) -> list:
     return summaries
 
 
-def _mark_cover_states(marks: list, archive: bytes, content, page_map: list) -> dict:
-    """The state on the tablet of each covered mark, read from the archive's ink."""
-    from remarkable_mcp.cover_layers import mark_cover_states
+def _mark_ink_states(marks: list, archive: bytes, content, page_map: list) -> dict:
+    """The state on the tablet of each mark's ink, read from the archive's ink."""
+    from remarkable_mcp.mark_ink import has_ink, mark_states
     from remarkable_mcp.pages import content_page_ids
 
-    if not content or not any(isinstance(m.get("cover"), dict) for m in marks):
+    if not content or not has_ink(marks):
         return {}
     try:
         with zipfile.ZipFile(io.BytesIO(archive)) as zf:
@@ -2716,7 +2716,7 @@ def _mark_cover_states(marks: list, archive: bytes, content, page_map: list) -> 
                 for name in zf.namelist()
                 if name.endswith(".rm")
             }
-        states, _ = mark_cover_states(
+        states, _ = mark_states(
             marks,
             page_ids=content_page_ids(content),
             page_map=page_map,
