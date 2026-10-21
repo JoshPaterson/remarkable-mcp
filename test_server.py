@@ -6,6 +6,7 @@ Focused handler tests call MCPServer directly. Dual-era protocol behavior is
 covered through SDK v2's first-class in-memory Client in test_mcp_v2.py.
 """
 
+import io
 import json
 import os
 import sys
@@ -4642,6 +4643,81 @@ class TestSSHCacheConcurrency:
             release_preload.set()
             assert preload.result(timeout=2) == {"doc-1": "pdf"}
             assert upload.result(timeout=2) is None
+
+
+class TestSSHDownload:
+    XOCHITL = "/home/root/.local/share/remarkable/xochitl"
+
+    def _client(self, listing, files):
+        from remarkable_mcp.ssh import SSHClient
+
+        client = SSHClient()
+        commands = []
+
+        def fake_command(command, timeout=30):
+            commands.append(command)
+            return listing
+
+        def fake_download(remote_path, timeout=60):
+            if remote_path not in files:
+                raise RuntimeError("cat: No such file")
+            return files[remote_path]
+
+        client._ssh_command = fake_command
+        client._scp_download = fake_download
+        return client, commands
+
+    def _doc(self):
+        from remarkable_mcp.ssh import Document
+
+        return Document(id="doc-1", hash="doc-1", name="One", doc_type="DocumentType")
+
+    def test_download_lists_files_in_one_command(self):
+        page = f"{self.XOCHITL}/doc-1/page-1.rm"
+        content = f"{self.XOCHITL}/doc-1.content"
+        client, commands = self._client(
+            f"{page}\n{content}\n", {page: b"rm", content: b'{"fileType": "notebook"}'}
+        )
+        try:
+            with zipfile.ZipFile(io.BytesIO(client.download(self._doc()))) as zf:
+                assert sorted(zf.namelist()) == ["doc-1.content", "page-1.rm"]
+            assert len(commands) == 1
+            assert "doc-1.pdf" in commands[0] and "doc-1.epub" in commands[0]
+        finally:
+            client.close()
+
+    def test_failed_file_fetch_raises(self):
+        page = f"{self.XOCHITL}/doc-1/page-1.rm"
+        content = f"{self.XOCHITL}/doc-1.content"
+        client, _ = self._client(f"{page}\n{content}\n", {content: b"{}"})
+        try:
+            with pytest.raises(RuntimeError, match="page-1.rm"):
+                client.download(self._doc())
+        finally:
+            client.close()
+
+    def test_document_without_files_raises(self):
+        client, _ = self._client("", {})
+        try:
+            with pytest.raises(RuntimeError, match="No files found"):
+                client.download(self._doc())
+        finally:
+            client.close()
+
+    def test_failed_listing_raises(self):
+        from remarkable_mcp.ssh import SSHClient
+
+        client = SSHClient()
+
+        def failing(command, timeout=30):
+            raise OSError("connection reset")
+
+        client._ssh_command = failing
+        try:
+            with pytest.raises(RuntimeError, match="Failed to list files"):
+                client.download(self._doc())
+        finally:
+            client.close()
 
 
 class TestOperationDispatcher:

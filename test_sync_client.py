@@ -254,3 +254,35 @@ def test_device_registration(monkeypatch):
     monkeypatch.setattr(sync, "_issue_request", lambda *a, **k: Response(400))
     with pytest.raises(RuntimeError, match="Registration failed"):
         sync.register_device("used")
+
+
+@pytest.mark.parametrize("workers", ["1", "4"])
+def test_failed_blob_fetch_raises_instead_of_partial_zip(monkeypatch, workers):
+    monkeypatch.setenv("REMARKABLE_SYNC_WORKERS", workers)
+    index = b"3\nh-content:0:d.content:0:2\nh-page:0:d/p.rm:0:2\n"
+    blobs = {"doc-hash": index, "h-content": b"{}"}
+
+    def get_file(file_hash, file_name):
+        if file_hash not in blobs:
+            raise requests.HTTPError("404 Not Found")
+        return blobs[file_hash]
+
+    client = RemarkableClient(user_token="u")
+    client._get_file = get_file
+    doc = sync.Document(id="d", hash="doc-hash", name="Doc", doc_type="DocumentType")
+
+    with pytest.raises(RuntimeError, match=r"d/p\.rm of 'Doc'"):
+        client.download(doc)
+
+
+def test_failed_index_fetch_raises():
+    client = RemarkableClient(user_token="u")
+
+    def get_file(file_hash, file_name):
+        raise requests.ConnectionError("offline")
+
+    client._get_file = get_file
+    doc = sync.Document(id="d", hash="doc-hash", name="Doc", doc_type="DocumentType")
+
+    with pytest.raises(RuntimeError, match="file index of 'Doc'"):
+        client.download(doc)

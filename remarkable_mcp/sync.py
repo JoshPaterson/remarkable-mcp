@@ -660,11 +660,19 @@ class RemarkableClient:
         content-addressed cache when present) so multi-page documents render
         without paying a sequential round-trip per page. The zip is assembled
         in the original blob order for deterministic output.
+
+        Raises RuntimeError when the index or any blob cannot be fetched, so a
+        failed fetch never yields a partial document.
         """
         import io
         import zipfile
 
-        blob_content = self._get_file(doc.hash, f"{doc.id}.docSchema")
+        try:
+            blob_content = self._get_file(doc.hash, f"{doc.id}.docSchema")
+        except Exception as e:
+            raise RuntimeError(
+                f"Failed to download the file index of '{doc.name}' ({doc.id}): {e}"
+            ) from e
         blob_entries = self._parse_index(blob_content)
 
         contents: List[Optional[bytes]] = [None] * len(blob_entries)
@@ -672,8 +680,10 @@ class RemarkableClient:
         def fetch(index: int, entry: Dict[str, Any]) -> None:
             try:
                 contents[index] = self._get_file(entry["hash"], entry["id"])
-            except Exception:
-                contents[index] = None
+            except Exception as e:
+                raise RuntimeError(
+                    f"Failed to download {entry['id']} of '{doc.name}' ({doc.id}): {e}"
+                ) from e
 
         workers = _get_sync_workers()
         if workers > 1 and len(blob_entries) > 1:

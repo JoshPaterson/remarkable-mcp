@@ -869,35 +869,34 @@ class SSHClient:
         Creates a zip archive with the same structure as the cloud API.
         Includes the document folder contents, .content metadata, and
         any associated PDF/EPUB file for merged rendering support.
+
+        A failed file listing or file fetch raises (SSH transport errors
+        unchanged, anything else as RuntimeError), and a document with no files
+        on the tablet raises RuntimeError, so a failed fetch never yields an
+        empty or partial document.
         """
         if not self.in_dispatcher_thread():
             return self.run_operation("document-download", lambda: self.download(doc))
         doc_path = f"{XOCHITL_PATH}/{doc.id}"
 
-        # List files in the document folder
+        # One command lists the document folder plus the .content file and any
+        # PDF/EPUB source used for merged rendering.
+        sidecars = " ".join(
+            f"'{XOCHITL_PATH}/{doc.id}.{ext}'" for ext in ("content", "pdf", "epub")
+        )
         try:
-            output = self._ssh_command(f"find '{doc_path}' -type f 2>/dev/null || true")
-        except Exception:
-            output = ""
+            output = self._ssh_command(
+                f"find '{doc_path}' -type f 2>/dev/null; "
+                f'for f in {sidecars}; do [ -f "$f" ] && echo "$f"; done; true'
+            )
+        except SSHReliabilityError:
+            raise
+        except Exception as e:
+            raise RuntimeError(f"Failed to list files of '{doc.name}' ({doc.id}): {e}") from e
 
         file_list = [f.strip() for f in output.strip().split("\n") if f.strip()]
-
-        # Also include the .content file if it exists
-        content_file = f"{XOCHITL_PATH}/{doc.id}.content"
-        try:
-            self._ssh_command(f"test -f '{content_file}' && echo exists")
-            file_list.append(content_file)
-        except Exception:
-            pass
-
-        # Include the associated PDF or EPUB file for merged rendering
-        for ext in ("pdf", "epub"):
-            raw_file = f"{XOCHITL_PATH}/{doc.id}.{ext}"
-            try:
-                self._ssh_command(f"test -f '{raw_file}' && echo exists")
-                file_list.append(raw_file)
-            except Exception:
-                pass
+        if not file_list:
+            raise RuntimeError(f"No files found on the tablet for '{doc.name}' ({doc.id}).")
 
         # Create zip archive. This archive is an internal transport container that
         # is extracted in-memory by the caller and never written to disk, so we use
@@ -907,15 +906,18 @@ class SSHClient:
             for remote_path in file_list:
                 try:
                     content = self._scp_download(remote_path)
-                    # Use relative path in zip
-                    rel_path = os.path.basename(remote_path)
-                    if "/" in remote_path.replace(f"{XOCHITL_PATH}/{doc.id}", ""):
-                        # Preserve subdirectory structure
-                        rel_path = remote_path.replace(f"{XOCHITL_PATH}/{doc.id}/", "")
-                    zf.writestr(rel_path, content)
+                except SSHReliabilityError:
+                    raise
                 except Exception as e:
-                    logger.debug(f"Failed to download {remote_path}: {e}")
-                    continue
+                    raise RuntimeError(
+                        f"Failed to download {remote_path} of '{doc.name}' ({doc.id}): {e}"
+                    ) from e
+                # Use relative path in zip
+                rel_path = os.path.basename(remote_path)
+                if "/" in remote_path.replace(f"{XOCHITL_PATH}/{doc.id}", ""):
+                    # Preserve subdirectory structure
+                    rel_path = remote_path.replace(f"{XOCHITL_PATH}/{doc.id}/", "")
+                zf.writestr(rel_path, content)
 
         zip_buffer.seek(0)
         return zip_buffer.read()
