@@ -24,13 +24,25 @@ class InkKind:
     key: str
     ids: str
     add: Callable[[rm_ink.PageWriter, Dict[str, Any], Tuple[float, float]], None]
-    status: Callable[[Optional[bytes], Sequence[Sequence[int]]], str]
+    status: Callable[[Optional[bytes], Sequence[Sequence[int]], Dict[str, Any]], str]
 
 
 KINDS = (
-    InkKind("cover", "strokes", cover_layers.add_mark_cover, cover_layers.cover_status),
-    InkKind("highlight", "items", text_highlights.add_mark_highlight, ink_marks.ink_status),
-    InkKind("ink", "items", ink_marks.add_mark_ink, ink_marks.ink_status),
+    InkKind(
+        "cover",
+        "strokes",
+        cover_layers.add_mark_cover,
+        lambda data, ids, _mark: cover_layers.cover_status(data, ids),
+    ),
+    InkKind(
+        "highlight", "items", text_highlights.add_mark_highlight, text_highlights.highlight_status
+    ),
+    InkKind(
+        "ink",
+        "items",
+        ink_marks.add_mark_ink,
+        lambda data, ids, _mark: ink_marks.ink_status(data, ids),
+    ),
 )
 
 
@@ -132,7 +144,7 @@ def mark_states(
         if page not in pages:
             pages[page] = read_ink(page_ids[page - 1])
         for kind, ids in stored:
-            states[mark["id"]] = kind.status(pages[page], ids)
+            states[mark["id"]] = kind.status(pages[page], ids, mark)
             if kind.key == "cover":
                 covered[page] = mark["pdf_page"]
     notes = []

@@ -1321,6 +1321,17 @@ def _mark_editor(
                 ),
             )
         result["notes"] = result["notes"] + cover_notes
+        if read_ink is not None and result["removed"]:
+            gone = [m for m in marks if m["id"] in result["removed"]]
+            removed_states, _ = mark_ink.mark_states(
+                gone, page_ids=page_ids, page_map=page_map, read_ink=read_ink
+            )
+            result["notes"] += [
+                f"{mark_id}: the user restored its highlight on the tablet, where it is "
+                "now the tablet's own ink; it stays until erased on the tablet."
+                for mark_id, state in removed_states.items()
+                if state == text_highlights.RESTORED
+            ]
         result["pdf"] = (
             dataclasses.replace(state, marks=result["marks"]).pdf() if result["changed"] else None
         )
