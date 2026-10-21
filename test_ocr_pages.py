@@ -131,3 +131,23 @@ def test_tesseract_found_outside_path(monkeypatch, tmp_path):
     monkeypatch.setattr(extract, "TESSERACT_LOCATIONS", ("/missing", str(program)))
 
     assert extract.tesseract_module().pytesseract.tesseract_cmd == str(program)
+
+
+def test_tesseract_words_are_put_in_reading_order():
+    words = [
+        ("WRONG", (300, 12, 380, 40)),
+        ("CHECK", (10, 60, 80, 90)),
+        ("ANSWER", (10, 10, 100, 40)),
+        ("TWO", (160, 62, 220, 92)),
+        ("FORTY", (120, 8, 200, 38)),
+        ("STEP", (90, 58, 150, 88)),
+    ]
+    assert [text for text, _ in extract._rows(words)] == [
+        "ANSWER FORTY WRONG",
+        "CHECK STEP TWO",
+    ]
+
+
+def test_ocr_image_keeps_the_writings_proportions():
+    svg = '<svg viewBox="-10 5 400 100" width="400" height="100"></svg>'
+    assert extract._ocr_image_size(svg, (2106, 2808)) == (2106, 526)

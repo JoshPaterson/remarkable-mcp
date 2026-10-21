@@ -3371,12 +3371,28 @@ def extract_handwriting_ocr(
     return (result, "tesseract")
 
 
+def _ocr_image_size(svg: str, size: Tuple[int, int]) -> Tuple[int, int]:
+    """The largest size within ``size`` with the SVG's proportions, so writing
+    is not stretched for OCR."""
+    import re
+
+    match = re.search(r'viewBox="[-\d.]+ [-\d.]+ ([\d.]+) ([\d.]+)"', svg)
+    if not match:
+        return size
+    width, height = float(match.group(1)), float(match.group(2))
+    if width <= 0 or height <= 0:
+        return size
+    scale = min(size[0] / width, size[1] / height)
+    return max(1, int(width * scale)), max(1, int(height * scale))
+
+
 def _ocr_page_images(
     rm_file: Path, size: Tuple[int, int]
 ) -> Optional[Tuple[bytes, List[Tuple[str, bytes]]]]:
     """``(page_png, [(layer_name, layer_png)])`` for OCR.
 
-    The page shows its visible layers on white. When it has several visible
+    The page shows its visible layers on white, cropped to the writing and
+    scaled to fit ``size`` without stretching. When it has several visible
     layers, each is also rendered alone, transparent, in the same frame, so an
     OCR line's box can be matched to the layers that drew it.
     """
@@ -3387,7 +3403,8 @@ def _ocr_page_images(
         try:
             if not _rm_to_svg(rm_file, tmp_svg):
                 return None
-            png = _svg_string_to_png(tmp_svg.read_text(), size[0], size[1], "#FFFFFF")
+            svg = tmp_svg.read_text()
+            png = _svg_string_to_png(svg, *_ocr_image_size(svg, size), "#FFFFFF")
         finally:
             tmp_svg.unlink(missing_ok=True)
         return (png, []) if png is not None else None
@@ -3398,6 +3415,7 @@ def _ocr_page_images(
     svg = _svg_from_paths(text_elements + paths, frame)
     if svg is None:
         return None
+    size = _ocr_image_size(svg, size)
     png = _svg_string_to_png(svg, size[0], size[1], "#FFFFFF")
     if png is None:
         return None
@@ -3642,22 +3660,38 @@ def _tesseract_lines(png: bytes) -> List[OcrLine]:
         left, top = data["left"][i], data["top"][i]
         box = (left, top, left + data["width"][i], top + data["height"][i])
         grouped.setdefault(key, []).append((word, box))
+    return _rows([word for words in grouped.values() for word in words])
+
+
+def _rows(words: List[OcrLine]) -> List[OcrLine]:
+    """Words joined into lines in reading order: words whose heights overlap
+    by half of the shorter share a row, rows run top to bottom and each row
+    left to right. Tesseract's sparse-text mode finds words but not their
+    order."""
+    rows: List[List[OcrLine]] = []
+    for word in sorted(words, key=lambda w: (w[1][1] + w[1][3]) / 2):
+        _, (_, top, _, bottom) = word
+        for row in rows:
+            row_top = min(b[1] for _, b in row)
+            row_bottom = max(b[3] for _, b in row)
+            overlap = min(bottom, row_bottom) - max(top, row_top)
+            if overlap >= 0.5 * min(bottom - top, row_bottom - row_top):
+                row.append(word)
+                break
+        else:
+            rows.append([word])
     lines: List[OcrLine] = []
-    for words in grouped.values():
-        boxes = [box for _, box in words]
-        text = " ".join(word for word, _ in words)
-        lines.append(
-            (
-                text,
-                (
-                    min(b[0] for b in boxes),
-                    min(b[1] for b in boxes),
-                    max(b[2] for b in boxes),
-                    max(b[3] for b in boxes),
-                ),
-            )
+    for row in rows:
+        row.sort(key=lambda w: w[1][0])
+        boxes = [box for _, box in row]
+        box = (
+            min(b[0] for b in boxes),
+            min(b[1] for b in boxes),
+            max(b[2] for b in boxes),
+            max(b[3] for b in boxes),
         )
-    return lines
+        lines.append((" ".join(text for text, _ in row), box))
+    return sorted(lines, key=lambda line: line[1][1])
 
 
 def _ocr_tesseract(rm_files: List[Path]) -> Optional[List[Optional[List[Dict[str, Any]]]]]:
