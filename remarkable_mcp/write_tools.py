@@ -1037,77 +1037,6 @@ def _cloud_mkdir(folder_name: str, parent: str) -> str:
     )
 
 
-def _cloud_move(document: str, dest_folder: str) -> str:
-    """Move a document or folder to another folder in the cloud."""
-    client = get_rmapi()
-    collection = client.get_meta_items()
-    items_by_id = get_items_by_id(collection)
-
-    target, error = lookup(client, document, collection=collection, items_by_id=items_by_id)
-    if error:
-        return error
-
-    dest_id, error = lookup_folder(dest_folder, collection, items_by_id, param="dest_folder")
-    if error:
-        return error
-
-    # Prevent moving a folder into itself or one of its descendants
-    if target.is_folder:
-        if dest_id == target.ID:
-            return make_error(
-                error_type="invalid_move",
-                message="Cannot move a folder into itself",
-                suggestion="Choose a different destination folder.",
-            )
-        check_id = dest_id
-        while check_id and check_id in items_by_id:
-            if check_id == target.ID:
-                return make_error(
-                    error_type="invalid_move",
-                    message="Cannot move a folder into one of its subfolders",
-                    suggestion="Choose a destination that is not inside the folder being moved.",
-                )
-            check_id = getattr(items_by_id[check_id], "Parent", "")
-
-    old_path = display_path(target, items_by_id)
-    client.move(target.ID, dest_id)
-    _invalidate_client_cache(client)
-    return make_response(
-        {
-            "moved": True,
-            "name": target.VissibleName,
-            "from": old_path,
-            "to": dest_folder,
-            "transport": "cloud",
-        },
-        "Document moved in the reMarkable cloud. Use remarkable_browse() to verify.",
-    )
-
-
-def _cloud_rename(document: str, new_name: str) -> str:
-    """Rename a document or folder in the cloud."""
-    client = get_rmapi()
-    collection = client.get_meta_items()
-    items_by_id = get_items_by_id(collection)
-
-    target, error = lookup(client, document, collection=collection, items_by_id=items_by_id)
-    if error:
-        return error
-
-    old_name = target.VissibleName
-    client.rename(target.ID, new_name)
-    _invalidate_client_cache(client)
-    return make_response(
-        {
-            "renamed": True,
-            "old_name": old_name,
-            "new_name": new_name,
-            "transport": "cloud",
-        },
-        "Document renamed in the reMarkable cloud. Use remarkable_browse() to verify.",
-    )
-
-
 def _as_list(value) -> list:
     """A tool argument given as one name or a list of names, as a list."""
     if value is None:
@@ -1874,31 +1803,6 @@ def _outline_response(target, result: dict, dry_run: bool) -> str:
     return make_response(data, hint)
 
 
-def _cloud_delete(document: str) -> str:
-    """Move a document or folder to the cloud trash (recoverable on-device)."""
-    client = get_rmapi()
-    collection = client.get_meta_items()
-    items_by_id = get_items_by_id(collection)
-
-    target, error = lookup(client, document, collection=collection, items_by_id=items_by_id)
-    if error:
-        return error
-
-    doc_path = display_path(target, items_by_id)
-    client.delete(target.ID)
-    _invalidate_client_cache(client)
-    return make_response(
-        {
-            "deleted": True,
-            "name": target.VissibleName,
-            "path": doc_path,
-            "type": "folder" if target.is_folder else "document",
-            "transport": "cloud",
-        },
-        "Moved to the trash on your reMarkable (recoverable from the device's Trash).",
-    )
-
-
 def _describe_documents(document) -> str:
     """``'Name'``, or ``3 items ('A', 'B', 'C')`` for a list."""
     if isinstance(document, str):
@@ -2013,8 +1917,38 @@ def _trash_metadata(metadata: dict) -> None:
         metadata["version"] = 1
 
 
-def _move_many(client, names: List[str], dest_folder: str, cloud: bool, defer_restart: bool):
-    """Move several documents or folders into one folder in one write."""
+def _write_reply(data: dict, cloud: bool, restarted: bool, done: str, verify: str = "") -> str:
+    """A move, rename or delete success reply. Every reply names its
+    ``transport``; SSH replies add ``refresh_pending``."""
+    verify = verify or "Use remarkable_browse() to verify."
+    if cloud:
+        return make_response(dict(data, transport="cloud"), f"{done} {verify}")
+    return make_response(
+        dict(data, transport="ssh", refresh_pending=not restarted),
+        _write_result_message(restarted, done, verify),
+    )
+
+
+def _update_metadata(client, cloud: bool, changes: list, defer_restart: bool) -> bool:
+    """Apply ``[(target, apply)]`` to each target's metadata in one write;
+    returns whether xochitl restarted (always True in cloud mode)."""
+    if cloud:
+        client.update_documents_metadata({target.ID: apply for target, apply in changes})
+        _invalidate_client_cache(client)
+        return True
+    return _ssh_update_metadata(client, changes, defer_restart)
+
+
+def _move_many(
+    client,
+    names: List[str],
+    dest_folder: str,
+    cloud: bool,
+    defer_restart: bool,
+    single: bool = False,
+):
+    """Move documents or folders into one folder in one write. ``single``
+    gives the one-document reply shape."""
     collection = client.get_meta_items()
     items_by_id = get_items_by_id(collection)
     targets, error = _resolve_targets(names, collection, items_by_id)
@@ -2034,27 +1968,24 @@ def _move_many(client, names: List[str], dest_folder: str, cloud: bool, defer_re
     def apply(metadata: dict) -> None:
         metadata["parent"] = dest_id
 
+    restarted = _update_metadata(client, cloud, [(t, apply) for t in targets], defer_restart)
+    if not cloud:
+        for target in targets:
+            target.parent = dest_id
+            target.last_modified = datetime.now()
+            _update_deferred_ssh_cache(client, restarted, document=target)
+    if single:
+        data = {"moved": True, **moved[0], "to": dest_folder}
+        return _write_reply(data, cloud, restarted, "Document moved.")
     data = {"moved": moved, "to": dest_folder, "count": len(targets)}
-    if cloud:
-        client.update_documents_metadata({t.ID: apply for t in targets})
-        _invalidate_client_cache(client)
-        return make_response(
-            dict(data, transport="cloud"),
-            f"Moved {len(targets)} items in the reMarkable cloud in one change.",
-        )
-    restarted = _ssh_update_metadata(client, [(t, apply) for t in targets], defer_restart)
-    for target in targets:
-        target.parent = dest_id
-        target.last_modified = datetime.now()
-        _update_deferred_ssh_cache(client, restarted, document=target)
-    return make_response(
-        dict(data, refresh_pending=not restarted),
-        _write_result_message(restarted, f"Moved {len(targets)} items."),
-    )
+    return _write_reply(data, cloud, restarted, f"Moved {len(targets)} items in one change.")
 
 
-def _rename_many(client, renames: Dict[str, str], cloud: bool, defer_restart: bool):
-    """Rename several documents or folders in one write."""
+def _rename_many(
+    client, renames: Dict[str, str], cloud: bool, defer_restart: bool, single: bool = False
+):
+    """Rename documents or folders in one write. ``single`` gives the
+    one-document reply shape."""
     collection = client.get_meta_items()
     items_by_id = get_items_by_id(collection)
     targets, error = _resolve_targets(list(renames), collection, items_by_id)
@@ -2077,28 +2008,30 @@ def _rename_many(client, renames: Dict[str, str], cloud: bool, defer_restart: bo
 
         return apply
 
+    changes = [(t, apply_for(t)) for t in targets]
+    restarted = _update_metadata(client, cloud, changes, defer_restart)
+    if not cloud:
+        for target in targets:
+            target.name = new_names[target.ID]
+            target.last_modified = datetime.now()
+            _update_deferred_ssh_cache(client, restarted, document=target)
+    if single:
+        return _write_reply({"renamed": True, **renamed[0]}, cloud, restarted, "Document renamed.")
     data = {"renamed": renamed, "count": len(targets)}
-    if cloud:
-        client.update_documents_metadata({t.ID: apply_for(t) for t in targets})
-        _invalidate_client_cache(client)
-        return make_response(
-            dict(data, transport="cloud"),
-            f"Renamed {len(targets)} items in the reMarkable cloud in one change.",
-        )
-    restarted = _ssh_update_metadata(client, [(t, apply_for(t)) for t in targets], defer_restart)
-    for target in targets:
-        target.name = new_names[target.ID]
-        target.last_modified = datetime.now()
-        _update_deferred_ssh_cache(client, restarted, document=target)
-    return make_response(
-        dict(data, refresh_pending=not restarted),
-        _write_result_message(restarted, f"Renamed {len(targets)} items."),
-    )
+    return _write_reply(data, cloud, restarted, f"Renamed {len(targets)} items in one change.")
 
 
-def _delete_many(client, names: List[str], cloud: bool, permanent: bool, defer_restart: bool):
-    """Move several documents or folders to the trash (or, over SSH with
-    ``permanent``, remove them) in one write."""
+def _delete_many(
+    client,
+    names: List[str],
+    cloud: bool,
+    permanent: bool,
+    defer_restart: bool,
+    single: bool = False,
+):
+    """Move documents or folders to the trash (or, over SSH with
+    ``permanent``, remove them) in one write. ``single`` gives the
+    one-document reply shape."""
     collection = client.get_meta_items()
     items_by_id = get_items_by_id(collection)
     targets, error = _resolve_targets(names, collection, items_by_id)
@@ -2112,15 +2045,6 @@ def _delete_many(client, names: List[str], cloud: bool, permanent: bool, defer_r
         }
         for t in targets
     ]
-    data = {"deleted": deleted, "count": len(targets)}
-    if cloud:
-        client.update_documents_metadata({t.ID: _trash_metadata for t in targets})
-        _invalidate_client_cache(client)
-        return make_response(
-            dict(data, transport="cloud"),
-            f"Moved {len(targets)} items to the trash on your reMarkable "
-            "(recoverable from the device's Trash).",
-        )
     if permanent:
         for target in targets:
             if target.is_folder and any(item.Parent == target.ID for item in collection):
@@ -2136,17 +2060,96 @@ def _delete_many(client, names: List[str], cloud: bool, permanent: bool, defer_r
             _permanently_delete_ssh_entry(client, target.ID)
         restarted = _maybe_restart_xochitl(client, defer_restart)
     else:
-        restarted = _ssh_update_metadata(
-            client, [(t, _trash_metadata) for t in targets], defer_restart
-        )
-    for target in targets:
-        _update_deferred_ssh_cache(client, restarted, remove_id=target.ID)
-        _clear_document_extraction_cache(target.ID)
-    done = "permanently deleted" if permanent else "moved to Trash"
-    return make_response(
-        dict(data, permanent=permanent, refresh_pending=not restarted),
-        _write_result_message(restarted, f"{len(targets)} items {done}."),
+        changes = [(t, _trash_metadata) for t in targets]
+        restarted = _update_metadata(client, cloud, changes, defer_restart)
+    if not cloud:
+        for target in targets:
+            _update_deferred_ssh_cache(client, restarted, remove_id=target.ID)
+            _clear_document_extraction_cache(target.ID)
+    where = "permanently deleted" if permanent else "moved to Trash"
+    verify = (
+        "It will no longer appear in the active library."
+        if permanent
+        else "It stays recoverable from the device's Trash."
     )
+    if single:
+        data = {"deleted": True, **deleted[0], "permanent": permanent}
+        return _write_reply(data, cloud, restarted, f"Document {where}.", verify)
+    data = {"deleted": deleted, "count": len(targets), "permanent": permanent}
+    return _write_reply(data, cloud, restarted, f"{len(targets)} items {where}.", verify)
+
+
+def _permanent_delete_error() -> Optional[str]:
+    """The error for ``permanent=True`` in cloud mode, else None."""
+    if not _is_cloud_mode():
+        return None
+    return make_error(
+        error_type="permanent_delete_unsupported",
+        message="Permanent deletion is not supported in cloud mode.",
+        suggestion=(
+            "Delete normally to move the item to Trash, then empty "
+            "Trash from a reMarkable app or tablet."
+        ),
+    )
+
+
+async def _dispatch(operation: str, impl, defer_restart: bool = False):
+    """Run ``impl`` in a worker thread; over SSH through the SSH operation
+    queue, which serializes writes and shares one xochitl refresh."""
+    if _is_ssh_mode():
+        ssh_client = _get_ssh_client()
+        if isinstance(ssh_client, SSHClient):
+            return await _run_ssh_tool_operation(
+                ssh_client, operation, impl, defer_restart=defer_restart
+            )
+    return await asyncio.to_thread(impl)
+
+
+def _replace_pdf(client, doc_id: str, edit, **options) -> dict:
+    """``client.replace_document_pdf`` that drops the cached library when the
+    document changed."""
+    result = client.replace_document_pdf(doc_id, edit, **options)
+    if result.get("changed", True):
+        _invalidate_client_cache(client)
+    return result
+
+
+async def _cloud_pdf_call(
+    document: Optional[str],
+    run,
+    *,
+    failed: str,
+    failure: str,
+    invalid_errors: tuple,
+    invalid_hint: str,
+):
+    """Run ``run(client, target)`` in a worker thread for a cloud-only PDF
+    tool, with ``target`` the PDF named ``document`` (None when no document
+    is given). ``invalid_errors`` become ``invalid_parameter`` errors; other
+    failures become a ``failed`` error reading ``failure: <reason>``."""
+
+    def _impl():
+        error = _require_managed_write_mode()
+        if error:
+            return error
+        client = get_rmapi()
+        try:
+            target = None
+            if document is not None:
+                target, error = lookup(client, document, kind="pdf")
+                if error:
+                    return error
+            return run(client, target)
+        except invalid_errors as e:
+            return invalid_param(str(e), invalid_hint)
+        except Exception as e:
+            return make_error(
+                error_type=failed,
+                message=f"{failure}: {e}",
+                suggestion="Check that the document is a PDF and try again.",
+            )
+
+    return await asyncio.to_thread(_impl)
 
 
 class _DeleteConfirmation(BaseModel):
@@ -2624,15 +2627,7 @@ def register_write_tools():
                 return _author_create_document(name, text, folder, defer_restart)
             raise AssertionError(f"Validated author method is unsupported: {method}")
 
-        ssh_client = _get_ssh_client()
-        if isinstance(ssh_client, SSHClient):
-            return await _run_ssh_tool_operation(
-                ssh_client,
-                f"author-{method}",
-                _impl,
-                defer_restart=defer_restart,
-            )
-        return await asyncio.to_thread(_impl)
+        return await _dispatch(f"author-{method}", _impl, defer_restart)
 
     # Native ink/notebook authoring is SSH-only today (cloud/USB-web write-back
     # is not implemented yet), so only expose the tool in SSH mode rather than
@@ -2818,21 +2813,12 @@ def register_write_tools():
                     suggestion=f"Check {transport} connection and try again.",
                 )
 
-        if _is_ssh_mode():
-            ssh_client = _get_ssh_client()
-            if isinstance(ssh_client, SSHClient):
-                return await _run_ssh_tool_operation(
-                    ssh_client,
-                    "upload",
-                    _impl,
-                    defer_restart=defer_restart,
-                )
-        if _is_usb_web_mode():
+        if _is_usb_web_mode() and not _is_ssh_mode():
             usb_client = get_rmapi()
             run_operation = getattr(type(usb_client), "run_operation_async", None)
             if callable(run_operation):
                 return await run_operation(usb_client, "upload", _impl)
-        return await asyncio.to_thread(_impl)
+        return await _dispatch("upload", _impl, defer_restart)
 
     async def _upload_tool(
         file_path: Optional[str] = None,
@@ -3189,6 +3175,7 @@ def register_write_tools():
                             "folder_name": folder_name,
                             "uuid": doc_uuid,
                             "parent": parent,
+                            "transport": "ssh",
                             "refresh_pending": not restarted,
                         },
                         _write_result_message(restarted, "Folder created."),
@@ -3203,16 +3190,7 @@ def register_write_tools():
                         suggestion="Check SSH connection and try again.",
                     )
 
-            if _is_ssh_mode():
-                ssh_client = _get_ssh_client()
-                if isinstance(ssh_client, SSHClient):
-                    return await _run_ssh_tool_operation(
-                        ssh_client,
-                        "mkdir",
-                        _impl,
-                        defer_restart=defer_restart,
-                    )
-            return await asyncio.to_thread(_impl)
+            return await _dispatch("mkdir", _impl, defer_restart)
 
         @mcp.tool(annotations=MOVE_ANNOTATIONS)
         async def remarkable_move(
@@ -3253,107 +3231,15 @@ def register_write_tools():
                 if error:
                     return error
 
-                if not isinstance(document, str):
-                    return _run_batch(
-                        "move",
-                        lambda client, cloud: _move_many(
-                            client, names, dest_folder, cloud, defer_restart
-                        ),
-                    )
-                if _is_cloud_mode():
-                    return _cloud_move(document, dest_folder)
+                single = isinstance(document, str)
+                return _run_batch(
+                    "move",
+                    lambda client, cloud: _move_many(
+                        client, names, dest_folder, cloud, defer_restart, single=single
+                    ),
+                )
 
-                try:
-                    ssh_client = _get_ssh_client()
-                    collection = ssh_client.get_meta_items()
-                    items_by_id = get_items_by_id(collection)
-
-                    # Find the document
-                    target, error = lookup(
-                        ssh_client, document, collection=collection, items_by_id=items_by_id
-                    )
-                    if error:
-                        return error
-
-                    # Find the destination folder
-                    dest_id, error = lookup_folder(
-                        dest_folder, collection, items_by_id, param="dest_folder"
-                    )
-                    if error:
-                        return error
-
-                    # Prevent moving a folder into itself or a descendant
-                    if target.is_folder:
-                        if dest_id == target.ID:
-                            return make_error(
-                                error_type="invalid_move",
-                                message="Cannot move a folder into itself",
-                                suggestion="Choose a different destination folder.",
-                            )
-                        # Walk up from dest to check for cycles
-                        check_id = dest_id
-                        while check_id and check_id in items_by_id:
-                            if check_id == target.ID:
-                                return make_error(
-                                    error_type="invalid_move",
-                                    message="Cannot move a folder into one of its subfolders",
-                                    suggestion=(
-                                        "Choose a destination that is not inside the folder "
-                                        "being moved."
-                                    ),
-                                )
-                            parent_item = items_by_id[check_id]
-                            check_id = parent_item.Parent if hasattr(parent_item, "Parent") else ""
-
-                    # Read existing metadata
-                    meta_content = ssh_client._scp_download(f"{XOCHITL_PATH}/{target.ID}.metadata")
-                    metadata = json.loads(meta_content.decode("utf-8"))
-
-                    old_path = display_path(target, items_by_id)
-
-                    # Update parent
-                    metadata["parent"] = dest_id
-                    metadata["lastModified"] = str(int(time.time() * 1000))
-                    metadata["metadatamodified"] = True
-                    _write_metadata(ssh_client, target.ID, metadata)
-
-                    # Restart xochitl (unless deferred for a batch)
-                    restarted = _maybe_restart_xochitl(ssh_client, defer_restart)
-
-                    target.parent = dest_id
-                    target.last_modified = datetime.now()
-                    _update_deferred_ssh_cache(ssh_client, restarted, document=target)
-
-                    return make_response(
-                        {
-                            "moved": True,
-                            "name": target.VissibleName,
-                            "from": old_path,
-                            "to": dest_folder,
-                            "refresh_pending": not restarted,
-                        },
-                        _write_result_message(restarted, "Document moved."),
-                    )
-
-                except SSHReliabilityError:
-                    raise
-                except Exception as e:
-                    return make_error(
-                        error_type="move_failed",
-                        message=f"Failed to move document: {e}",
-                        suggestion="Check SSH connection and try again.",
-                    )
-
-            if _is_ssh_mode():
-                ssh_client = _get_ssh_client()
-                if isinstance(ssh_client, SSHClient):
-                    return await _run_ssh_tool_operation(
-                        ssh_client,
-                        "move",
-                        _impl,
-                        defer_restart=defer_restart,
-                    )
-            return await asyncio.to_thread(_impl)
+            return await _dispatch("move", _impl, defer_restart)
 
         @mcp.tool(annotations=RENAME_ANNOTATIONS)
         async def remarkable_rename(
@@ -3406,74 +3292,15 @@ def register_write_tools():
                 if error:
                     return error
 
-                if renames is not None:
-                    return _run_batch(
-                        "rename",
-                        lambda client, cloud: _rename_many(client, renames, cloud, defer_restart),
-                    )
-                if _is_cloud_mode():
-                    return _cloud_rename(document, new_name)
+                batch = renames if renames is not None else {document: new_name}
+                return _run_batch(
+                    "rename",
+                    lambda client, cloud: _rename_many(
+                        client, batch, cloud, defer_restart, single=renames is None
+                    ),
+                )
 
-                try:
-                    ssh_client = _get_ssh_client()
-                    collection = ssh_client.get_meta_items()
-                    items_by_id = get_items_by_id(collection)
-
-                    # Find the document
-                    target, error = lookup(
-                        ssh_client, document, collection=collection, items_by_id=items_by_id
-                    )
-                    if error:
-                        return error
-
-                    # Read existing metadata
-                    meta_content = ssh_client._scp_download(f"{XOCHITL_PATH}/{target.ID}.metadata")
-                    metadata = json.loads(meta_content.decode("utf-8"))
-
-                    old_name = metadata.get("visibleName", target.VissibleName)
-
-                    # Update name
-                    metadata["visibleName"] = new_name
-                    metadata["lastModified"] = str(int(time.time() * 1000))
-                    metadata["metadatamodified"] = True
-                    _write_metadata(ssh_client, target.ID, metadata)
-
-                    # Restart xochitl (unless deferred for a batch)
-                    restarted = _maybe_restart_xochitl(ssh_client, defer_restart)
-
-                    target.name = new_name
-                    target.last_modified = datetime.now()
-                    _update_deferred_ssh_cache(ssh_client, restarted, document=target)
-
-                    return make_response(
-                        {
-                            "renamed": True,
-                            "old_name": old_name,
-                            "new_name": new_name,
-                            "refresh_pending": not restarted,
-                        },
-                        _write_result_message(restarted, "Document renamed."),
-                    )
-
-                except SSHReliabilityError:
-                    raise
-                except Exception as e:
-                    return make_error(
-                        error_type="rename_failed",
-                        message=f"Failed to rename document: {e}",
-                        suggestion="Check SSH connection and try again.",
-                    )
-
-            if _is_ssh_mode():
-                ssh_client = _get_ssh_client()
-                if isinstance(ssh_client, SSHClient):
-                    return await _run_ssh_tool_operation(
-                        ssh_client,
-                        "rename",
-                        _impl,
-                        defer_restart=defer_restart,
-                    )
-            return await asyncio.to_thread(_impl)
+            return await _dispatch("rename", _impl, defer_restart)
 
         @mcp.tool(annotations=WRITE_ANNOTATIONS)
         async def remarkable_tag(
@@ -3603,16 +3430,7 @@ def register_write_tools():
                         suggestion="Check the connection and try again.",
                     )
 
-            if _is_ssh_mode():
-                ssh_client = _get_ssh_client()
-                if isinstance(ssh_client, SSHClient):
-                    return await _run_ssh_tool_operation(
-                        ssh_client,
-                        "tag",
-                        _impl,
-                        defer_restart=defer_restart,
-                    )
-            return await asyncio.to_thread(_impl)
+            return await _dispatch("tag", _impl, defer_restart)
 
         if _is_cloud_mode():
 
@@ -3818,61 +3636,40 @@ def register_write_tools():
                         "Call with layout alone (or with dry_run=True) first, then write.",
                     )
 
-                def _impl():
-                    error = _require_managed_write_mode()
-                    if error:
-                        return error
-                    client = get_rmapi()
-                    try:
-                        collection = client.get_meta_items()
-                        items_by_id = get_items_by_id(collection)
-                        target, error = lookup(
-                            client,
-                            document,
-                            kind="pdf",
-                            collection=collection,
-                            items_by_id=items_by_id,
+                def run(client, target):
+                    obstacles = None
+                    if any(isinstance(m, dict) and "near" in m for m in adds):
+                        near_pdf, _, near_files = client.read_document_pdf(target.ID)
+                        obstacles = _page_obstacles(client, near_files, near_pdf)
+                    edit = _mark_editor(
+                        adds, removes, clear, color, build=writing, obstacles=obstacles
+                    )
+                    if writing:
+                        result = _replace_pdf(client, target.ID, edit, with_ink=True)
+                        return _mark_response(target, result, dry_run=False)
+                    pdf, content, files = client.read_document_pdf(target.ID)
+                    result = edit(pdf, content, client.ink_reader(target.ID, files))
+                    if layout is not None:
+                        result["layout"] = _mark_layout(
+                            client, files, pdf, layout, result["page_map"]
                         )
-                        if error:
-                            return error
-                        obstacles = None
-                        if any(isinstance(m, dict) and "near" in m for m in adds):
-                            near_pdf, _, near_files = client.read_document_pdf(target.ID)
-                            obstacles = _page_obstacles(client, near_files, near_pdf)
-                        edit = _mark_editor(
-                            adds, removes, clear, color, build=writing, obstacles=obstacles
-                        )
-                        if writing:
-                            result = client.replace_document_pdf(target.ID, edit, with_ink=True)
-                            if result["changed"]:
-                                _invalidate_client_cache(client)
-                            return _mark_response(target, result, dry_run=False)
-                        pdf, content, files = client.read_document_pdf(target.ID)
-                        result = edit(pdf, content, client.ink_reader(target.ID, files))
-                        if layout is not None:
-                            result["layout"] = _mark_layout(
-                                client, files, pdf, layout, result["page_map"]
-                            )
-                        response = _mark_response(target, result, dry_run=dry_run)
-                        preview = result.get("preview_pdf")
-                        if not dry_run or not preview:
-                            return response
-                        from mcp.types import TextContent
+                    response = _mark_response(target, result, dry_run=dry_run)
+                    preview = result.get("preview_pdf")
+                    if not dry_run or not preview:
+                        return response
+                    from mcp.types import TextContent
 
-                        images = _mark_preview_images(
-                            client, files, preview, result["touched_pages"]
-                        )
-                        return [TextContent(type="text", text=response), *images]
-                    except MarkError as e:
-                        return invalid_param(str(e), "Fix the mark and try again.")
-                    except Exception as e:
-                        return make_error(
-                            error_type="mark_failed",
-                            message=f"Failed to change marks: {e}",
-                            suggestion="Check that the document is a PDF and try again.",
-                        )
+                    images = _mark_preview_images(client, files, preview, result["touched_pages"])
+                    return [TextContent(type="text", text=response), *images]
 
-                return await asyncio.to_thread(_impl)
+                return await _cloud_pdf_call(
+                    document,
+                    run,
+                    failed="mark_failed",
+                    failure="Failed to change marks",
+                    invalid_errors=(MarkError,),
+                    invalid_hint="Fix the mark and try again.",
+                )
 
             @mcp.tool(annotations=WRITE_ANNOTATIONS)
             async def remarkable_pdf_ocr(
@@ -3936,38 +3733,21 @@ def register_write_tools():
                 ):
                     return invalid_param("tags must be a list of tag names.", 'Example: ["Books"]')
 
-                def _impl():
-                    error = _require_managed_write_mode()
-                    if error:
-                        return error
-                    client = get_rmapi()
-                    try:
-                        collection = client.get_meta_items()
-                        items_by_id = get_items_by_id(collection)
-                        if check:
-                            return _ocr_check(
-                                client, collection, items_by_id, document, folder, tags
-                            )
-                        target, error = lookup(
-                            client,
-                            document,
-                            kind="pdf",
-                            collection=collection,
-                            items_by_id=items_by_id,
-                        )
-                        if error:
-                            return error
+                def run(client, target):
+                    if target is not None:
                         return _ocr_document(client, target)
-                    except (MarkError, pdf_ocr.OcrError) as e:
-                        return invalid_param(str(e), "See the message.")
-                    except Exception as e:
-                        return make_error(
-                            error_type="ocr_failed",
-                            message=f"OCR failed: {e}",
-                            suggestion="Check that the document is a PDF and try again.",
-                        )
+                    collection = client.get_meta_items()
+                    items_by_id = get_items_by_id(collection)
+                    return _ocr_check(client, collection, items_by_id, document, folder, tags)
 
-                return await asyncio.to_thread(_impl)
+                return await _cloud_pdf_call(
+                    None if check else document,
+                    run,
+                    failed="ocr_failed",
+                    failure="OCR failed",
+                    invalid_errors=(MarkError, pdf_ocr.OcrError),
+                    invalid_hint="See the message.",
+                )
 
             @mcp.tool(annotations=WRITE_ANNOTATIONS)
             async def remarkable_pdf_pages(
@@ -4020,66 +3800,48 @@ def register_write_tools():
                         'Example: insert=[{"after": 2, "blank": 1}]',
                     )
 
-                def _impl():
-                    error = _require_managed_write_mode()
-                    if error:
-                        return error
-                    client = get_rmapi()
-                    try:
-                        collection = client.get_meta_items()
-                        items_by_id = get_items_by_id(collection)
-                        target, error = lookup(
-                            client,
-                            document,
-                            kind="pdf",
-                            collection=collection,
-                            items_by_id=items_by_id,
+                def run(client, target):
+                    edit = _pages_editor(insert, build=not dry_run)
+                    if dry_run:
+                        pdf, content, files = client.read_document_pdf(target.ID)
+                        pagedata_file = next(
+                            (f for f in files if f["id"].endswith(".pagedata")), None
                         )
-                        if error:
-                            return error
-                        edit = _pages_editor(insert, build=not dry_run)
-                        if dry_run:
-                            pdf, content, files = client.read_document_pdf(target.ID)
-                            pagedata_file = next(
-                                (f for f in files if f["id"].endswith(".pagedata")), None
+                        pagedata = (
+                            client._get_file(pagedata_file["hash"], pagedata_file["id"]).decode(
+                                "utf-8"
                             )
-                            pagedata = (
-                                client._get_file(pagedata_file["hash"], pagedata_file["id"]).decode(
-                                    "utf-8"
-                                )
-                                if pagedata_file
-                                else None
-                            )
-                            result = edit(pdf, content, pagedata)
-                        else:
-                            result = client.replace_document_pdf(target.ID, edit, with_pages=True)
-                            _invalidate_client_cache(client)
-                        data = {
-                            "document": target.VissibleName,
-                            "inserted_pages": result["inserted_pages"],
-                            "page_count": result["page_count"],
-                            "transport": "cloud",
-                        }
-                        if dry_run:
-                            data["dry_run"] = True
-                            hint = "Dry run: nothing was written. Repeat without dry_run."
-                        else:
-                            hint = (
-                                f"Inserted {len(result['inserted_pages'])} page(s) into "
-                                f"'{target.VissibleName}'. The tablet shows them after its "
-                                "next sync."
-                            )
-                        return make_response(data, hint)
-                    except (MarkError, ValueError) as e:
-                        return invalid_param(str(e), "Fix the insert entries and try again.")
-                    except Exception as e:
-                        return make_error(
-                            error_type="insert_failed",
-                            message=f"Failed to insert pages: {e}",
-                            suggestion="Check that the document is a PDF and try again.",
+                            if pagedata_file
+                            else None
                         )
+                        result = edit(pdf, content, pagedata)
+                    else:
+                        result = _replace_pdf(client, target.ID, edit, with_pages=True)
+                    data = {
+                        "document": target.VissibleName,
+                        "inserted_pages": result["inserted_pages"],
+                        "page_count": result["page_count"],
+                        "transport": "cloud",
+                    }
+                    if dry_run:
+                        data["dry_run"] = True
+                        hint = "Dry run: nothing was written. Repeat without dry_run."
+                    else:
+                        hint = (
+                            f"Inserted {len(result['inserted_pages'])} page(s) into "
+                            f"'{target.VissibleName}'. The tablet shows them after its "
+                            "next sync."
+                        )
+                    return make_response(data, hint)
 
-                return await asyncio.to_thread(_impl)
+                return await _cloud_pdf_call(
+                    document,
+                    run,
+                    failed="insert_failed",
+                    failure="Failed to insert pages",
+                    invalid_errors=(MarkError, ValueError),
+                    invalid_hint="Fix the insert entries and try again.",
+                )
 
             @mcp.tool(annotations=WRITE_ANNOTATIONS)
             async def remarkable_pdf_outline(
@@ -4142,42 +3904,23 @@ def register_write_tools():
                     )
                 writing = outline is not None and not dry_run
 
-                def _impl():
-                    error = _require_managed_write_mode()
-                    if error:
-                        return error
-                    client = get_rmapi()
-                    try:
-                        collection = client.get_meta_items()
-                        items_by_id = get_items_by_id(collection)
-                        target, error = lookup(
-                            client,
-                            document,
-                            kind="pdf",
-                            collection=collection,
-                            items_by_id=items_by_id,
-                        )
-                        if error:
-                            return error
-                        edit = _outline_editor(outline, build=writing)
-                        if writing:
-                            result = client.replace_document_pdf(target.ID, edit)
-                            if result["changed"]:
-                                _invalidate_client_cache(client)
-                        else:
-                            pdf, content, _ = client.read_document_pdf(target.ID)
-                            result = edit(pdf, content)
-                        return _outline_response(target, result, dry_run)
-                    except MarkError as e:
-                        return invalid_param(str(e), "Fix the outline and try again.")
-                    except Exception as e:
-                        return make_error(
-                            error_type="outline_failed",
-                            message=f"Failed to change the outline: {e}",
-                            suggestion="Check that the document is a PDF and try again.",
-                        )
+                def run(client, target):
+                    edit = _outline_editor(outline, build=writing)
+                    if writing:
+                        result = _replace_pdf(client, target.ID, edit)
+                    else:
+                        pdf, content, _ = client.read_document_pdf(target.ID)
+                        result = edit(pdf, content)
+                    return _outline_response(target, result, dry_run)
 
-                return await asyncio.to_thread(_impl)
+                return await _cloud_pdf_call(
+                    document,
+                    run,
+                    failed="outline_failed",
+                    failure="Failed to change the outline",
+                    invalid_errors=(MarkError,),
+                    invalid_hint="Fix the outline and try again.",
+                )
 
         @mcp.tool(annotations=DELETE_ANNOTATIONS)
         async def remarkable_delete(
@@ -4236,135 +3979,21 @@ def register_write_tools():
             if abort:
                 return abort
 
-            if not isinstance(document, str):
-                if _is_cloud_mode() and permanent:
-                    return make_error(
-                        error_type="permanent_delete_unsupported",
-                        message="Permanent deletion is not supported in cloud mode.",
-                        suggestion=(
-                            "Delete normally to move the items to Trash, then empty "
-                            "Trash from a reMarkable app or tablet."
-                        ),
-                    )
-
-                def _batch() -> str:
-                    return _run_batch(
-                        "delete",
-                        lambda client, cloud: _delete_many(
-                            client, names, cloud, permanent, defer_restart
-                        ),
-                    )
-
-                ssh_client = None if _is_cloud_mode() else _get_ssh_client()
-                if isinstance(ssh_client, SSHClient):
-                    return await _run_ssh_tool_operation(
-                        ssh_client, "delete", _batch, defer_restart=defer_restart
-                    )
-                return await asyncio.to_thread(_batch)
-
-            if _is_cloud_mode():
-                if permanent:
-                    return make_error(
-                        error_type="permanent_delete_unsupported",
-                        message="Permanent deletion is not supported in cloud mode.",
-                        suggestion=(
-                            "Delete normally to move the item to Trash, then empty "
-                            "Trash from a reMarkable app or tablet."
-                        ),
-                    )
-                return await asyncio.to_thread(_cloud_delete, document)
+            if permanent:
+                error = _permanent_delete_error()
+                if error:
+                    return error
+            single = isinstance(document, str)
 
             def _impl() -> str:
-                try:
-                    ssh_client = _get_ssh_client()
-                    collection = ssh_client.get_meta_items()
-                    items_by_id = get_items_by_id(collection)
-
-                    # Find the document
-                    target, error = lookup(
-                        ssh_client, document, collection=collection, items_by_id=items_by_id
-                    )
-                    if error:
-                        return error
-
-                    doc_path = display_path(target, items_by_id)
-
-                    if permanent:
-                        if target.is_folder and any(
-                            item.Parent == target.ID for item in collection
-                        ):
-                            return make_error(
-                                error_type="folder_not_empty",
-                                message=(
-                                    f"Cannot permanently delete non-empty folder "
-                                    f"'{target.VissibleName}'."
-                                ),
-                                suggestion=(
-                                    "Permanently delete its child documents and "
-                                    "folders first, or omit permanent=True to move "
-                                    "the whole folder to Trash."
-                                ),
-                            )
-                        _permanently_delete_ssh_entry(ssh_client, target.ID)
-                    else:
-                        meta_content = ssh_client._scp_download(
-                            f"{XOCHITL_PATH}/{target.ID}.metadata"
-                        )
-                        metadata = json.loads(meta_content.decode("utf-8"))
-                        metadata["parent"] = "trash"
-                        metadata["deleted"] = False
-                        metadata["lastModified"] = str(int(time.time() * 1000))
-                        metadata["metadatamodified"] = True
-                        try:
-                            metadata["version"] = int(metadata.get("version", 0)) + 1
-                        except (TypeError, ValueError):
-                            metadata["version"] = 1
-                        _write_metadata(ssh_client, target.ID, metadata)
-
-                    # Restart xochitl (unless deferred for a batch)
-                    restarted = _maybe_restart_xochitl(ssh_client, defer_restart)
-
-                    _update_deferred_ssh_cache(ssh_client, restarted, remove_id=target.ID)
-                    _clear_document_extraction_cache(target.ID)
-
-                    return make_response(
-                        {
-                            "deleted": True,
-                            "name": target.VissibleName,
-                            "path": doc_path,
-                            "type": "folder" if target.is_folder else "document",
-                            "permanent": permanent,
-                            "refresh_pending": not restarted,
-                        },
-                        _write_result_message(
-                            restarted,
-                            (
-                                "Document permanently deleted."
-                                if permanent
-                                else "Document moved to Trash."
-                            ),
-                            "It will no longer appear in the active library.",
-                        ),
-                    )
-
-                except SSHReliabilityError:
-                    raise
-                except Exception as e:
-                    return make_error(
-                        error_type="delete_failed",
-                        message=f"Failed to delete document: {e}",
-                        suggestion="Check SSH connection and try again.",
-                    )
-
-            ssh_client = _get_ssh_client()
-            if isinstance(ssh_client, SSHClient):
-                return await _run_ssh_tool_operation(
-                    ssh_client,
+                return _run_batch(
                     "delete",
-                    _impl,
-                    defer_restart=defer_restart,
+                    lambda client, cloud: _delete_many(
+                        client, names, cloud, permanent, defer_restart, single=single
+                    ),
                 )
-            return await asyncio.to_thread(_impl)
+
+            return await _dispatch("delete", _impl, defer_restart)
 
     async def remarkable_refresh() -> str:
         """

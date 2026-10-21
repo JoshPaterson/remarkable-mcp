@@ -3697,6 +3697,15 @@ class TestMarkdownPDFWriteback:
         }
 
 
+def _applied(client, doc_id: str) -> dict:
+    """The metadata a cloud write's ``update_documents_metadata`` call gives
+    ``doc_id``, applied to empty metadata."""
+    (applies,) = client.update_documents_metadata.call_args.args
+    metadata: dict = {}
+    applies[doc_id](metadata)
+    return metadata
+
+
 class TestCloudWriteDispatch:
     """Cloud-mode write tools dispatch to the RemarkableClient methods."""
 
@@ -3754,7 +3763,7 @@ class TestCloudWriteDispatch:
             register_write_tools()
             try:
                 target = self._make_item("doc-1", "Old Name")
-                client = Mock(spec=["get_meta_items", "rename"])
+                client = Mock(spec=["get_meta_items", "update_documents_metadata"])
                 client.get_meta_items.return_value = [target]
                 with patch("remarkable_mcp.write_tools.get_rmapi", return_value=client):
                     result = await _call_tool(
@@ -3764,7 +3773,7 @@ class TestCloudWriteDispatch:
                 data = json.loads(result.content[0].text)
                 assert data["renamed"] is True
                 assert data["transport"] == "cloud"
-                client.rename.assert_called_once_with("doc-1", "New Name")
+                assert _applied(client, "doc-1")["visibleName"] == "New Name"
             finally:
                 self._cleanup()
 
@@ -3777,7 +3786,7 @@ class TestCloudWriteDispatch:
             try:
                 target = self._make_item("doc-1", "Report")
                 dest = self._make_item("fold-1", "Archive", is_folder=True)
-                client = Mock(spec=["get_meta_items", "move"])
+                client = Mock(spec=["get_meta_items", "update_documents_metadata"])
                 client.get_meta_items.return_value = [target, dest]
                 with patch("remarkable_mcp.write_tools.get_rmapi", return_value=client):
                     result = await _call_tool(
@@ -3787,7 +3796,7 @@ class TestCloudWriteDispatch:
                 data = json.loads(result.content[0].text)
                 assert data["moved"] is True
                 assert data["transport"] == "cloud"
-                client.move.assert_called_once_with("doc-1", "fold-1")
+                assert _applied(client, "doc-1")["parent"] == "fold-1"
             finally:
                 self._cleanup()
 
@@ -3800,14 +3809,14 @@ class TestCloudWriteDispatch:
             register_write_tools()
             try:
                 target = self._make_item("doc-1", "Old Notes")
-                client = Mock(spec=["get_meta_items", "delete"])
+                client = Mock(spec=["get_meta_items", "update_documents_metadata"])
                 client.get_meta_items.return_value = [target]
                 with patch("remarkable_mcp.write_tools.get_rmapi", return_value=client):
                     result = await _call_tool("remarkable_delete", {"document": "Old Notes"})
                 data = json.loads(result.content[0].text)
                 assert data["deleted"] is True
                 assert data["transport"] == "cloud"
-                client.delete.assert_called_once_with("doc-1")
+                assert _applied(client, "doc-1")["parent"] == "trash"
             finally:
                 self._cleanup()
 
@@ -3822,7 +3831,7 @@ class TestCloudWriteDispatch:
             register_write_tools()
             try:
                 target = self._make_item("doc-1", "Old Notes")
-                client = Mock(spec=["get_meta_items", "delete"])
+                client = Mock(spec=["get_meta_items", "update_documents_metadata"])
                 client.get_meta_items.return_value = [target]
                 with (
                     patch("remarkable_mcp.write_tools.get_rmapi", return_value=client),
@@ -3834,7 +3843,7 @@ class TestCloudWriteDispatch:
                     result = await _call_tool("remarkable_delete", {"document": "Old Notes"})
                 data = json.loads(result.content[0].text)
                 assert data["_error"]["type"] == "confirmation_unavailable"
-                client.delete.assert_not_called()
+                client.update_documents_metadata.assert_not_called()
             finally:
                 self._cleanup()
 
@@ -3848,7 +3857,7 @@ class TestCloudWriteDispatch:
             register_write_tools()
             try:
                 target = self._make_item("doc-1", "Old Notes")
-                client = Mock(spec=["get_meta_items", "delete"])
+                client = Mock(spec=["get_meta_items", "update_documents_metadata"])
                 client.get_meta_items.return_value = [target]
                 with (
                     patch("remarkable_mcp.write_tools.get_rmapi", return_value=client),
@@ -3860,7 +3869,7 @@ class TestCloudWriteDispatch:
                     result = await _call_tool("remarkable_delete", {"document": "Old Notes"})
                 data = json.loads(result.content[0].text)
                 assert data["deleted"] is True
-                client.delete.assert_called_once_with("doc-1")
+                assert _applied(client, "doc-1")["parent"] == "trash"
             finally:
                 self._cleanup()
 
@@ -3880,7 +3889,7 @@ class TestCloudWriteDispatch:
         with patch.dict(os.environ, self._cloud_env(), clear=True):
             register_write_tools()
             try:
-                client = Mock(spec=["get_meta_items", "delete"])
+                client = Mock(spec=["get_meta_items", "update_documents_metadata"])
                 with (
                     patch("remarkable_mcp.write_tools.get_rmapi", return_value=client),
                     patch("remarkable_mcp.resources.start_background_loader", return_value=None),
@@ -3896,7 +3905,7 @@ class TestCloudWriteDispatch:
                 data = json.loads(result.content[0].text)
                 assert data["deleted"] is False
                 assert data["cancelled"] is True
-                client.delete.assert_not_called()
+                client.update_documents_metadata.assert_not_called()
             finally:
                 self._cleanup()
 

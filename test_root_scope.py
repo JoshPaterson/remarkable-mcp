@@ -74,6 +74,15 @@ def cloud(monkeypatch, root):
         yield client
 
 
+def _applied(client):
+    """``(doc_id, metadata)`` of the one document a cloud metadata write changed."""
+    (applies,) = client.update_documents_metadata.call_args.args
+    ((doc_id, apply),) = applies.items()
+    metadata: dict = {}
+    apply(metadata)
+    return doc_id, metadata
+
+
 async def _call(name, arguments):
     result = await mcp.call_tool(name, arguments)
     return json.loads(result.content[0].text)
@@ -145,7 +154,7 @@ async def test_browse_shows_root_relative_paths(cloud):
 
 async def test_move_resolves_document_and_destination_inside_the_root(cloud):
     data = await _call("remarkable_move", {"document": "/Notes", "dest_folder": "/Archive"})
-    cloud.move.assert_called_once_with("notes-in", "archive-in")
+    assert _applied(cloud) == ("notes-in", {"parent": "archive-in"})
     assert data["from"] == "/Notes"
 
 
@@ -155,31 +164,31 @@ async def test_move_to_root_targets_the_root_folder(cloud):
         _item("deep", "Deep", parent="archive-in"),
     ]
     await _call("remarkable_move", {"document": "/Archive/Deep", "dest_folder": "/"})
-    cloud.move.assert_called_once_with("deep", "work")
+    assert _applied(cloud) == ("deep", {"parent": "work"})
 
 
 async def test_move_outside_document_is_not_found(cloud):
     data = await _call("remarkable_move", {"document": "Outside", "dest_folder": "/"})
     assert data["_error"]["type"] == "document_not_found"
     assert "Outside" not in (data["_error"].get("did_you_mean") or [])
-    cloud.move.assert_not_called()
+    cloud.update_documents_metadata.assert_not_called()
 
 
 async def test_rename_uses_the_root(cloud):
     await _call("remarkable_rename", {"document": "Notes", "new_name": "Renamed"})
-    cloud.rename.assert_called_once_with("notes-in", "Renamed")
+    assert _applied(cloud) == ("notes-in", {"visibleName": "Renamed"})
 
 
 async def test_delete_uses_the_root(cloud):
     data = await _call("remarkable_delete", {"document": "/Notes"})
-    cloud.delete.assert_called_once_with("notes-in")
+    assert _applied(cloud)[0] == "notes-in"
     assert data["path"] == "/Notes"
 
 
 async def test_delete_outside_document_is_not_found(cloud):
     data = await _call("remarkable_delete", {"document": "/Outside"})
     assert data["_error"]["type"] == "document_not_found"
-    cloud.delete.assert_not_called()
+    cloud.update_documents_metadata.assert_not_called()
 
 
 async def test_mkdir_at_root_creates_inside_the_root_folder(cloud):

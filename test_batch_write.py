@@ -215,3 +215,90 @@ def test_ssh_reads_everything_before_writing(monkeypatch):
     with pytest.raises(FileNotFoundError):
         write_tools._ssh_update_metadata(client, [(t, apply) for t in missing], False)
     assert written == []
+
+
+# --- one document and a batch of one reply alike ----------------------------
+
+
+def _single_and_batch_of_one(tool):
+    """Arguments for ``tool`` on Week 1 alone, and as a batch of one."""
+    if tool == "remarkable_move":
+        single = {"document": "Week 1", "dest_folder": "/Archive"}
+        return single, dict(single, document=["Week 1"])
+    if tool == "remarkable_rename":
+        return {"document": "Week 1", "new_name": "First"}, {"renames": {"Week 1": "First"}}
+    return {"document": "Week 1"}, {"document": ["Week 1"]}
+
+
+def _batch_entry(tool, batch):
+    if tool == "remarkable_move":
+        return dict(batch["moved"][0], to=batch["to"])
+    if tool == "remarkable_rename":
+        return batch["renamed"][0]
+    return dict(batch["deleted"][0], permanent=batch["permanent"])
+
+
+def _single_entry(single):
+    dropped = ("moved", "renamed", "deleted", "_hint", "transport", "refresh_pending")
+    return {k: v for k, v in single.items() if k not in dropped}
+
+
+@pytest.mark.parametrize("tool", TOOLS)
+async def test_cloud_single_and_batch_replies_agree(cloud, tool):
+    single_args, batch_args = _single_and_batch_of_one(tool)
+    single = await _call(tool, **single_args)
+    with patch("remarkable_mcp.write_tools.get_rmapi", return_value=FakeCloud()):
+        batch = await _call(tool, **batch_args)
+
+    assert single[tool.split("_")[1].rstrip("e") + "ed"] is True
+    assert single["transport"] == batch["transport"] == "cloud"
+    assert "refresh_pending" not in single
+    assert _single_entry(single) == _batch_entry(tool, batch)
+
+
+class FakeSSH:
+    """Metadata files of the DOCS library behind the SSH write helpers."""
+
+    def __init__(self):
+        from remarkable_mcp.write_tools import XOCHITL_PATH
+
+        self.files = {
+            f"{XOCHITL_PATH}/{doc_id}.metadata": json.dumps(
+                {"visibleName": name, "parent": parent}
+            ).encode()
+            for doc_id, (name, parent, _) in DOCS.items()
+        }
+
+    def get_meta_items(self):
+        return [
+            SimpleNamespace(ID=doc_id, VissibleName=name, Parent=parent, is_folder=folder)
+            for doc_id, (name, parent, folder) in DOCS.items()
+        ]
+
+    def _scp_download(self, path):
+        return self.files[path]
+
+
+@pytest.mark.parametrize("tool", TOOLS)
+def test_ssh_single_and_batch_replies_agree(monkeypatch, tool):
+    from remarkable_mcp import write_tools
+
+    monkeypatch.setattr(write_tools, "_write_metadata", lambda c, doc_id, meta: None)
+    monkeypatch.setattr(write_tools, "_maybe_restart_xochitl", lambda c, defer: not defer)
+    monkeypatch.setattr(write_tools, "_update_deferred_ssh_cache", lambda *a, **k: None)
+    monkeypatch.setattr(write_tools, "_clear_document_extraction_cache", lambda doc_id: None)
+
+    def run(single: bool) -> dict:
+        client = FakeSSH()
+        if tool == "remarkable_move":
+            reply = write_tools._move_many(client, ["Week 1"], "/Archive", False, True, single)
+        elif tool == "remarkable_rename":
+            reply = write_tools._rename_many(client, {"Week 1": "First"}, False, True, single)
+        else:
+            reply = write_tools._delete_many(client, ["Week 1"], False, False, True, single)
+        return json.loads(reply)
+
+    single, batch = run(True), run(False)
+    assert single["transport"] == batch["transport"] == "ssh"
+    assert single["refresh_pending"] is batch["refresh_pending"] is True
+    assert _single_entry(single) == _batch_entry(tool, batch)

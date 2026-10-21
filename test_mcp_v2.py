@@ -189,7 +189,7 @@ async def test_delete_confirmation_works_in_both_protocol_eras(
 
     document = _document("Old Notes")
     document.is_folder = False
-    api_client = Mock(spec=["get_meta_items", "delete"])
+    api_client = Mock(spec=["get_meta_items", "update_documents_metadata"])
     api_client.get_meta_items.return_value = [document]
     confirmation_calls = 0
 
@@ -223,7 +223,10 @@ async def test_delete_confirmation_works_in_both_protocol_eras(
     assert confirmation_calls == 1
     if permanent:
         assert payload["_error"]["type"] == "permanent_delete_unsupported"
-        api_client.delete.assert_not_called()
+        api_client.update_documents_metadata.assert_not_called()
     else:
         assert payload["deleted"] is True
-        api_client.delete.assert_called_once_with("doc-1")
+        (applies,) = api_client.update_documents_metadata.call_args.args
+        metadata = {"parent": ""}
+        applies["doc-1"](metadata)
+        assert metadata["parent"] == "trash"
