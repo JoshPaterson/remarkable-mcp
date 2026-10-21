@@ -34,8 +34,9 @@ TIME_BUDGET = 40.0
 WORK_DIR_NAME = "ocr-work"
 FONT_NAME = "ocrtext"
 
-# A word: (text, x0, y0, x1, y1) in image pixels.
-Word = Tuple[str, float, float, float, float]
+# A word: (text, x0, y0, x1, y1) in image pixels, then the id of its line;
+# words of one line are written together, in order.
+Word = tuple
 
 
 class OcrError(Exception):
@@ -87,7 +88,8 @@ def tesseract_words(png: bytes) -> List[Word]:
         if not text or float(data["conf"][i]) < 0:
             continue
         x, y, w, h = data["left"][i], data["top"][i], data["width"][i], data["height"][i]
-        words.append((text, x, y, x + w, y + h))
+        line = f"{data['block_num'][i]}.{data['par_num'][i]}.{data['line_num'][i]}"
+        words.append((text, x, y, x + w, y + h, line))
     return words
 
 
@@ -112,18 +114,26 @@ def google_words(png: bytes, api_key: str) -> List[Word]:
     if response.status_code != 200:
         raise OcrError(f"Google Vision returned {response.status_code}.")
     annotation = (response.json().get("responses") or [{}])[0].get("fullTextAnnotation") or {}
-    words = []
+    words, line = [], 0
     for page in annotation.get("pages") or []:
         for block in page.get("blocks") or []:
             for paragraph in block.get("paragraphs") or []:
+                line += 1
                 for word in paragraph.get("words") or []:
-                    text = "".join(s.get("text", "") for s in word.get("symbols") or [])
+                    symbols = word.get("symbols") or []
+                    text = "".join(s.get("text", "") for s in symbols)
                     vertices = (word.get("boundingBox") or {}).get("vertices") or []
-                    if not text.strip() or not vertices:
-                        continue
-                    xs = [v.get("x", 0) for v in vertices]
-                    ys = [v.get("y", 0) for v in vertices]
-                    words.append((text, min(xs), min(ys), max(xs), max(ys)))
+                    if text.strip() and vertices:
+                        xs = [v.get("x", 0) for v in vertices]
+                        ys = [v.get("y", 0) for v in vertices]
+                        words.append((text, min(xs), min(ys), max(xs), max(ys), line))
+                    end = (
+                        ((symbols[-1].get("property") or {}).get("detectedBreak") or {}).get("type")
+                        if symbols
+                        else None
+                    )
+                    if end in ("EOL_SURE_SPACE", "LINE_BREAK", "HYPHEN"):
+                        line += 1
     return words
 
 
@@ -157,14 +167,31 @@ def ocr_backend() -> Tuple[str, Callable[[bytes], List[Word]]]:
     return "tesseract", tesseract_words
 
 
+def _lines(words: List[Word]) -> List[Word]:
+    """Consecutive words with the same line id joined into one entry with
+    spaces between them; words without a line id stay on their own."""
+    lines: List[list] = []
+    for word in words:
+        line_id = word[5] if len(word) > 5 else None
+        if lines and line_id is not None and lines[-1][5] == line_id:
+            last = lines[-1]
+            last[0] += " " + word[0]
+            last[1], last[2] = min(last[1], word[1]), min(last[2], word[2])
+            last[3], last[4] = max(last[3], word[3]), max(last[4], word[4])
+        else:
+            lines.append([word[0], word[1], word[2], word[3], word[4], line_id])
+    return [tuple(line) for line in lines]
+
+
 def add_text_layer(doc: "pymupdf.Document", index: int, words: List[Word], zoom: float) -> int:
     """Write ``words`` (pixel boxes at ``zoom`` pixels per point) as invisible
-    text on page ``index``, each stretched to its box. Returns the count."""
+    text on page ``index``, a line at a time, each stretched to its box.
+    Returns the number of lines written."""
     page = doc[index]
     font = pymupdf.Font("notos")
     page.insert_font(fontname=FONT_NAME, fontbuffer=font.buffer)
     count = 0
-    for text, x0, y0, x1, y1 in words:
+    for text, x0, y0, x1, y1, _ in _lines(words):
         box = pymupdf.Rect(x0 / zoom, y0 / zoom, x1 / zoom, y1 / zoom) + (
             page.rect.x0,
             page.rect.y0,
