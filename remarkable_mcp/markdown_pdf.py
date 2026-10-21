@@ -45,8 +45,13 @@ def _render_image(_renderer, tokens, index, options, env) -> str:
     return f"<p><em>[Image omitted: {alt}]</em></p>"
 
 
-def render_markdown_pdf(markdown: str) -> bytes:
-    """Render Markdown into A4 PDF bytes without loading external assets."""
+def render_markdown_pdf(markdown: str, outline: bool = True) -> bytes:
+    """Render Markdown into A4 PDF bytes without loading external assets.
+
+    With ``outline`` the headings become the PDF's outline (the table of
+    contents the tablet shows). A heading more than one level deeper than the
+    one before it is placed one level deeper, as outlines require.
+    """
     if not markdown or not markdown.strip():
         raise ValueError("Markdown content cannot be empty")
 
@@ -66,8 +71,21 @@ def render_markdown_pdf(markdown: str) -> bytes:
     def page_rect(_rect_number, _filled):
         return page, content, None
 
-    document = story.write_with_links(page_rect)
+    headings = []
+
+    def position(element):
+        if element.heading and element.open_close & 1 and (element.text or "").strip():
+            headings.append((element.heading, element.text.strip(), element.page_num))
+
+    document = story.write_with_links(page_rect, positionfn=position)
     try:
+        if outline and headings:
+            toc, previous = [], 0
+            for heading, text, page_num in headings:
+                level = max(1, min(heading, previous + 1))
+                toc.append([level, text, page_num])
+                previous = level
+            document.set_toc(toc)
         return document.tobytes(garbage=3, deflate=True)
     finally:
         document.close()
