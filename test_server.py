@@ -3044,12 +3044,12 @@ class TestWriteTools:
         ]
 
         for tool_name in write_tool_names:
-            assert tool_name in tool_names, (
-                f"Write tool {tool_name} should be registered by default"
-            )
-        assert "remarkable_author" not in tool_names, (
-            "remarkable_author is SSH-only and must be hidden in cloud mode"
-        )
+            assert (
+                tool_name in tool_names
+            ), f"Write tool {tool_name} should be registered by default"
+        assert (
+            "remarkable_author" not in tool_names
+        ), "remarkable_author is SSH-only and must be hidden in cloud mode"
 
     @pytest.mark.asyncio
     async def test_write_tools_registered_when_enabled(self):
@@ -3399,6 +3399,13 @@ class TestWriteTools:
 
         env = {k: v for k, v in os.environ.items() if k != "REMARKABLE_USE_SSH"}
         env["REMARKABLE_USE_USB_WEB"] = "1"
+        for name in (
+            "remarkable_mkdir",
+            "remarkable_move",
+            "remarkable_rename",
+            "remarkable_delete",
+        ):
+            mcp._tool_manager._tools.pop(name, None)
         with patch.dict(os.environ, env, clear=True):
             register_write_tools()
             try:
