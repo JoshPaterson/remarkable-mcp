@@ -41,11 +41,17 @@ from mcp.types import ToolAnnotations
 from pydantic import BaseModel, Field
 
 from remarkable_mcp.api import (
-    get_item_path,
     get_items_by_id,
     get_rmapi,
 )
 from remarkable_mcp.capabilities import client_supports_elicitation
+from remarkable_mcp.lookup import (
+    display_path,
+    find_folder_id,
+    find_item,
+    folder_paths,
+    scoped_items,
+)
 from remarkable_mcp.pages import content_page_ids, tablet_page
 from remarkable_mcp.responses import make_error, make_response
 from remarkable_mcp.ssh import XOCHITL_PATH, Document, SSHClient
@@ -931,80 +937,25 @@ def _add_upload_source(response: str, fields: dict) -> str:
 
 
 def _resolve_parent_id(parent_path: str, items_by_id: dict, collection: list) -> Optional[str]:
-    """Resolve a folder path to its UUID.
+    """The ID of the live folder at root-relative ``parent_path``.
 
-    Args:
-        parent_path: Path like "/" or "/Folder/Subfolder"
-        items_by_id: Dict mapping item IDs to items
-        collection: Full list of items
-
-    Returns:
-        The UUID of the folder, "" for root, or None if not found
+    ``/`` is the configured root (``""`` for the library root). Returns None
+    when no such folder exists inside the root.
     """
-    if not parent_path or parent_path == "/":
-        return ""
-
-    from remarkable_mcp.tools import _is_cloud_archived
-
-    # Normalize
-    parent_path = parent_path.strip("/")
-
-    for item in collection:
-        # Never write into a trashed folder.
-        if not item.is_folder or _is_cloud_archived(item, items_by_id):
-            continue
-        item_path = get_item_path(item, items_by_id).strip("/")
-        if item_path.lower() == parent_path.lower():
-            return item.ID
-
-    return None
+    return find_folder_id(parent_path, collection, items_by_id)
 
 
 def _resolve_document(
     name_or_path: str, collection: list, items_by_id: dict, folders_only: bool = False
 ) -> Optional[object]:
-    """Find a document or folder by name or path.
-
-    Args:
-        name_or_path: Document name or full path
-        collection: Full list of items
-        items_by_id: Dict mapping item IDs to items
-        folders_only: If True, only match folders
+    """Find a document or folder inside the root by name or root-relative path.
 
     Live items win. A trashed item is only matched by its explicit
-    ``/trash/...`` path (e.g. to permanently delete it over SSH), never by a
-    bare name that a live item could also carry.
-
-    Returns:
-        The matching item, or None
+    ``/trash/...`` path (e.g. to permanently delete it over SSH) when no root
+    is set, never by a bare name that a live item could also carry.
     """
-    from remarkable_mcp.tools import _is_cloud_archived
-
-    target = name_or_path.lower().strip("/")
-
-    trashed = []
-    for item in collection:
-        if folders_only and not item.is_folder:
-            continue
-        if _is_cloud_archived(item, items_by_id):
-            trashed.append(item)
-            continue
-        # Match by name
-        if item.VissibleName.lower() == target:
-            return item
-        # Match by path
-        item_path = get_item_path(item, items_by_id).strip("/")
-        if item_path.lower() == target:
-            return item
-
-    # Trashed items need the explicit absolute path, not "trash/...".
-    if not name_or_path.lower().startswith("/trash/"):
-        return None
-    for item in trashed:
-        if get_item_path(item, items_by_id).strip("/").lower() == target:
-            return item
-
-    return None
+    kind = "folder" if folders_only else "any"
+    return find_item(name_or_path, collection, items_by_id, kind=kind, include_trash=True)
 
 
 def _invalidate_client_cache(client) -> None:
@@ -1121,7 +1072,7 @@ def _cloud_move(document: str, dest_folder: str) -> str:
     if not target:
         from remarkable_mcp.extract import find_similar_documents
 
-        similar = find_similar_documents(document, collection)
+        similar = find_similar_documents(document, scoped_items(collection, items_by_id))
         return make_error(
             error_type="document_not_found",
             message=f"Document not found: '{document}'",
@@ -1155,7 +1106,7 @@ def _cloud_move(document: str, dest_folder: str) -> str:
                 )
             check_id = getattr(items_by_id[check_id], "Parent", "")
 
-    old_path = get_item_path(target, items_by_id)
+    old_path = display_path(target, items_by_id)
     client.move(target.ID, dest_id)
     _invalidate_client_cache(client)
     return make_response(
@@ -1180,7 +1131,7 @@ def _cloud_rename(document: str, new_name: str) -> str:
     if not target:
         from remarkable_mcp.extract import find_similar_documents
 
-        similar = find_similar_documents(document, collection)
+        similar = find_similar_documents(document, scoped_items(collection, items_by_id))
         return make_error(
             error_type="document_not_found",
             message=f"Document not found: '{document}'",
@@ -1627,32 +1578,27 @@ def _ocr_check(client, collection, items_by_id, document, folder, tags) -> str:
             )
         targets = [target]
     else:
-        base_id = ""
-        if folder not in (None, "", "/"):
-            base = _resolve_document(folder, collection, items_by_id, folders_only=True)
-            if base is None:
-                return make_error(
-                    error_type="folder_not_found",
-                    message=f"Folder not found: '{folder}'",
-                    suggestion="Use remarkable_browse('/') to see the folders.",
-                )
-            base_id = base.ID
+        base_id = _resolve_parent_id(folder or "/", items_by_id, collection)
+        if base_id is None:
+            return make_error(
+                error_type="folder_not_found",
+                message=f"Folder not found: '{folder}'",
+                suggestion="Use remarkable_browse('/') to see the folders.",
+            )
         wanted = {t.lower() for t in tags or []}
 
         def under(item) -> bool:
             parent = getattr(item, "Parent", "")
             while parent:
-                if parent == base_id or parent == "trash":
-                    return parent == base_id
+                if parent == base_id:
+                    return True
                 parent = getattr(items_by_id.get(parent), "Parent", "")
             return not base_id
 
         targets = [
             item
-            for item in collection
-            if not item.is_folder
-            and getattr(item, "Parent", "") != "trash"
-            and under(item)
+            for item in scoped_items(collection, items_by_id, "document")
+            if under(item)
             and (not wanted or wanted & {t.lower() for t in getattr(item, "tags", None) or []})
         ]
     if len(targets) > MAX_OCR_CHECKS:
@@ -1673,7 +1619,7 @@ def _ocr_check(client, collection, items_by_id, document, folder, tags) -> str:
         if found["scanned"] or found["rotated"]:
             entry = {
                 "document": item.VissibleName,
-                "path": get_item_path(item, items_by_id),
+                "path": display_path(item, items_by_id),
                 "pages_needing_ocr": _tablet_pages(found["scanned"], page_map),
                 "pages": len(page_map),
             }
@@ -1990,7 +1936,7 @@ def _cloud_delete(document: str) -> str:
     if not target:
         from remarkable_mcp.extract import find_similar_documents
 
-        similar = find_similar_documents(document, collection)
+        similar = find_similar_documents(document, scoped_items(collection, items_by_id))
         return make_error(
             error_type="document_not_found",
             message=f"Document not found: '{document}'",
@@ -1998,7 +1944,7 @@ def _cloud_delete(document: str) -> str:
             did_you_mean=similar if similar else None,
         )
 
-    doc_path = get_item_path(target, items_by_id)
+    doc_path = display_path(target, items_by_id)
     client.delete(target.ID)
     _invalidate_client_cache(client)
     return make_response(
@@ -2076,7 +2022,7 @@ def _resolve_targets(names: List[str], collection, items_by_id) -> tuple:
         if not target:
             from remarkable_mcp.extract import find_similar_documents
 
-            similar = find_similar_documents(name, collection)
+            similar = find_similar_documents(name, scoped_items(collection, items_by_id))
             return None, make_error(
                 error_type="document_not_found",
                 message=f"Document not found: '{name}'",
@@ -2149,7 +2095,7 @@ def _move_many(client, names: List[str], dest_folder: str, cloud: bool, defer_re
         error = _move_cycle_error(target, dest_id, items_by_id)
         if error:
             return error
-    moved = [{"name": t.VissibleName, "from": get_item_path(t, items_by_id)} for t in targets]
+    moved = [{"name": t.VissibleName, "from": display_path(t, items_by_id)} for t in targets]
 
     def apply(metadata: dict) -> None:
         metadata["parent"] = dest_id
@@ -2228,7 +2174,7 @@ def _delete_many(client, names: List[str], cloud: bool, permanent: bool, defer_r
     deleted = [
         {
             "name": t.VissibleName,
-            "path": get_item_path(t, items_by_id),
+            "path": display_path(t, items_by_id),
             "type": "folder" if t.is_folder else "document",
         }
         for t in targets
@@ -2391,7 +2337,7 @@ def _author_draw(
     if not target:
         from remarkable_mcp.extract import find_similar_documents
 
-        similar = find_similar_documents(document, collection)
+        similar = find_similar_documents(document, scoped_items(collection, items_by_id))
         return make_error(
             error_type="document_not_found",
             message=f"Document not found: '{document}'",
@@ -2505,7 +2451,7 @@ def _author_add_page(document: str, defer_restart: bool = False) -> str:
     if not target:
         from remarkable_mcp.extract import find_similar_documents
 
-        similar = find_similar_documents(document, collection)
+        similar = find_similar_documents(document, scoped_items(collection, items_by_id))
         return make_error(
             error_type="document_not_found",
             message=f"Document not found: '{document}'",
@@ -2597,7 +2543,7 @@ def _author_create_document(
     items_by_id = get_items_by_id(collection)
     parent_id = _resolve_parent_id(folder or "/", items_by_id, collection)
     if parent_id is None:
-        folders = [get_item_path(i, items_by_id) for i in collection if i.is_folder]
+        folders = folder_paths(collection, items_by_id)
         return make_error(
             error_type="folder_not_found",
             message=f"Folder not found: '{folder}'",
@@ -2817,7 +2763,7 @@ def register_write_tools():
                     items_by_id = get_items_by_id(collection)
                     parent_id = _resolve_parent_id(parent_folder, items_by_id, collection)
                     if parent_id is None:
-                        folders = [get_item_path(i, items_by_id) for i in collection if i.is_folder]
+                        folders = folder_paths(collection, items_by_id)
                         return make_error(
                             error_type="folder_not_found",
                             message=f"Folder not found: '{parent_folder}'",
@@ -2878,7 +2824,7 @@ def register_write_tools():
                 # Resolve parent folder
                 parent_id = _resolve_parent_id(parent_folder, items_by_id, collection)
                 if parent_id is None:
-                    folders = [get_item_path(i, items_by_id) for i in collection if i.is_folder]
+                    folders = folder_paths(collection, items_by_id)
                     return make_error(
                         error_type="folder_not_found",
                         message=f"Folder not found: '{parent_folder}'",
@@ -3427,7 +3373,9 @@ def register_write_tools():
                     if not target:
                         from remarkable_mcp.extract import find_similar_documents
 
-                        similar = find_similar_documents(document, collection)
+                        similar = find_similar_documents(
+                            document, scoped_items(collection, items_by_id)
+                        )
                         return make_error(
                             error_type="document_not_found",
                             message=f"Document not found: '{document}'",
@@ -3471,7 +3419,7 @@ def register_write_tools():
                     meta_content = ssh_client._scp_download(f"{XOCHITL_PATH}/{target.ID}.metadata")
                     metadata = json.loads(meta_content.decode("utf-8"))
 
-                    old_path = get_item_path(target, items_by_id)
+                    old_path = display_path(target, items_by_id)
 
                     # Update parent
                     metadata["parent"] = dest_id
@@ -3586,7 +3534,9 @@ def register_write_tools():
                     if not target:
                         from remarkable_mcp.extract import find_similar_documents
 
-                        similar = find_similar_documents(document, collection)
+                        similar = find_similar_documents(
+                            document, scoped_items(collection, items_by_id)
+                        )
                         return make_error(
                             error_type="document_not_found",
                             message=f"Document not found: '{document}'",
@@ -3733,7 +3683,9 @@ def register_write_tools():
                         if not target:
                             from remarkable_mcp.extract import find_similar_documents
 
-                            similar = find_similar_documents(name, collection)
+                            similar = find_similar_documents(
+                                name, scoped_items(collection, items_by_id)
+                            )
                             return make_error(
                                 error_type="document_not_found",
                                 message=f"Document not found: '{name}'",
@@ -4018,7 +3970,9 @@ def register_write_tools():
                         if not target:
                             from remarkable_mcp.extract import find_similar_documents
 
-                            similar = find_similar_documents(document, collection)
+                            similar = find_similar_documents(
+                                document, scoped_items(collection, items_by_id)
+                            )
                             return make_error(
                                 error_type="document_not_found",
                                 message=f"Document not found: '{document}'",
@@ -4360,7 +4314,9 @@ def register_write_tools():
                         if not target:
                             from remarkable_mcp.extract import find_similar_documents
 
-                            similar = find_similar_documents(document, collection)
+                            similar = find_similar_documents(
+                                document, scoped_items(collection, items_by_id)
+                            )
                             return make_error(
                                 error_type="document_not_found",
                                 message=f"Document not found: '{document}'",
@@ -4498,7 +4454,9 @@ def register_write_tools():
                     if not target:
                         from remarkable_mcp.extract import find_similar_documents
 
-                        similar = find_similar_documents(document, collection)
+                        similar = find_similar_documents(
+                            document, scoped_items(collection, items_by_id)
+                        )
                         return make_error(
                             error_type="document_not_found",
                             message=f"Document not found: '{document}'",
@@ -4506,7 +4464,7 @@ def register_write_tools():
                             did_you_mean=similar if similar else None,
                         )
 
-                    doc_path = get_item_path(target, items_by_id)
+                    doc_path = display_path(target, items_by_id)
 
                     if permanent:
                         if target.is_folder and any(

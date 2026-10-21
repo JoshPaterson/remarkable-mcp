@@ -859,7 +859,9 @@ Limit the MCP server to a specific folder on your reMarkable. All operations wil
 With this configuration:
 - `remarkable_browse("/")` shows contents of `/Work`
 - `remarkable_browse("/Projects")` shows `/Work/Projects`
-- Documents outside `/Work` are not accessible
+- Documents outside `/Work` are not accessible, to read and write tools alike
+- Write tools take root-relative paths too: `remarkable_move("/Notes", "/Archive")`
+  moves `/Work/Notes` to `/Work/Archive`, and `/` as a destination is `/Work`
 
 Useful for:
 - Focusing on work documents during office hours

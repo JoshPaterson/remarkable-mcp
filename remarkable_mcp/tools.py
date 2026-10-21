@@ -66,6 +66,8 @@ from remarkable_mcp.extract import (
     render_page_full_page_from_document_zip,
     render_tablet_pdf_page_to_png,
 )
+from remarkable_mcp.lookup import find_item
+from remarkable_mcp.lookup import is_cloud_archived as _is_cloud_archived
 from remarkable_mcp.pages import tablet_page
 from remarkable_mcp.pdf_marks import (
     for_export,
@@ -87,21 +89,8 @@ logger = logging.getLogger(__name__)
 
 
 def _find_target_document(collection, items_by_id: dict, document: str):
-    """Find an in-scope document by display name or full path."""
-    root = _get_root_path()
-    actual_document = _resolve_root_path(document) if document.startswith("/") else document
-    document_lower = actual_document.lower().strip("/")
-    for item in collection:
-        if item.is_folder or _is_cloud_archived(item, items_by_id):
-            continue
-        item_path = get_item_path(item, items_by_id)
-        if not _is_within_root(item_path, root):
-            continue
-        if item.VissibleName.lower() == document_lower:
-            return item
-        if item_path.lower().strip("/") == document_lower:
-            return item
-    return None
+    """Find an in-scope document by display name or root-relative path."""
+    return find_item(document, collection, items_by_id, kind="document")
 
 
 # Base annotations for read-only operations
@@ -153,18 +142,6 @@ EXPORT_ANNOTATIONS = ToolAnnotations(
 
 # Default page size for pagination (characters) - used for PDFs/EPUBs
 DEFAULT_PAGE_SIZE = 8000
-
-
-def _is_directly_archived(item) -> bool:
-    """Check the item's own metadata, ignoring its ancestors."""
-    # SSH/local-dir/USB expose an explicit property. Require a real bool so
-    # permissive proxy objects do not accidentally hide otherwise valid items.
-    archived = getattr(item, "is_cloud_archived", None)
-    if isinstance(archived, bool):
-        return archived
-    # Cloud mode: check parent == "trash"
-    parent = item.Parent if hasattr(item, "Parent") else getattr(item, "parent", "")
-    return parent == "trash"
 
 
 def _item_tags(item) -> List[str]:
@@ -274,27 +251,6 @@ def _descendant_items(items_by_parent: dict, parent_id: str) -> List:
             if item.is_folder:
                 stack.append(item.ID)
     return found
-
-
-def _is_cloud_archived(item, items_by_id: Optional[dict] = None) -> bool:
-    """Check if an item is cloud-archived (not available on device).
-
-    Trashing a folder only re-parents the folder itself, so with
-    ``items_by_id`` the ancestors are checked too.
-    """
-    if _is_directly_archived(item):
-        return True
-    if not items_by_id:
-        return False
-    seen = {item.ID}
-    parent_id = getattr(item, "Parent", "")
-    while parent_id in items_by_id and parent_id not in seen:
-        seen.add(parent_id)
-        parent = items_by_id[parent_id]
-        if _is_directly_archived(parent):
-            return True
-        parent_id = getattr(parent, "Parent", "")
-    return False
 
 
 def _modified_sort_key(item) -> float:

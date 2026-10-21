@@ -33,7 +33,11 @@ All tools respect the `REMARKABLE_ROOT_PATH` environment variable. When configur
 
 With this configuration:
 - Paths in responses are relative to the root (e.g., `/Work/Project` appears as `/Project`)
-- Documents outside the root are not accessible
+- Documents outside the root are not accessible, to read and write tools alike;
+  a bare name only matches documents inside the root
+- Paths sent to tools are root-relative too, including destination and parent
+  folders of write tools (`/` is the root folder itself)
+- Trashed items cannot be addressed by a `/trash/...` path while a root is set
 - `remarkable_status()` shows the configured root and document count within that folder
 
 ---
