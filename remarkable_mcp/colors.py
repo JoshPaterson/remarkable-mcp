@@ -6,57 +6,99 @@ color id (rmscene ``PenColor``). Current firmware also stores an ARGB value
 color, which is how the blue and orange highlighters are distinguished.
 """
 
-from typing import Any, Dict, Optional
+import dataclasses
+from typing import Any, Dict, Optional, Tuple
 
 # Color id 9: the actual color is the item's ARGB value.
 CUSTOM_COLOR_ID = 9
 
-# Names for v6 color ids (rmscene PenColor).
+# ``color_rgba`` the tablet stores with a highlighter color that its color id
+# alone defines.
+NO_RGBA = (0, 0, 0, 255)
+
+
+@dataclasses.dataclass(frozen=True)
+class NamedColor:
+    """A named pen or highlighter color.
+
+    ``color_id`` is the v6 color id (rmscene ``PenColor``) and ``rgba`` the
+    ``color_rgba`` the tablet stores with it (the actual color for id 9).
+    ``screen`` is the color as the Paper Pro's screen shows it, which marks
+    drawn into a PDF use so they match the tablet's own ink there. ``desktop``
+    is the color the desktop and browser apps and the tablet's PDF export
+    draw. ``opacity`` is set for highlighters the export draws translucent.
+    """
+
+    name: str
+    color_id: int
+    screen: str
+    desktop: str
+    rgba: Tuple[int, int, int, int] = NO_RGBA
+    opacity: Optional[float] = None
+
+
+# Pen colors. The Paper Pro's screen draws the pure colors without
+# dithering, matching its own pen strokes; the softer desktop values are
+# dithered on the screen and look different.
+PENS: Tuple[NamedColor, ...] = (
+    NamedColor("black", 0, "#000000", "#000000"),
+    NamedColor("gray", 1, "#909090", "#909090"),
+    NamedColor("white", 2, "#FFFFFF", "#FFFFFF"),
+    NamedColor("blue", 6, "#0000FF", "#304AE0"),
+    NamedColor("red", 7, "#FF0000", "#C23132"),
+    NamedColor("green", 10, "#00FF00", "#91DA71"),
+    NamedColor("yellow", 13, "#FFFF00", "#FAE719"),
+    NamedColor("cyan", 11, "#00FFFF", "#74D2E8"),
+    NamedColor("magenta", 12, "#FF00FF", "#C07FD2"),
+)
+# Highlighter colors. Blue, orange and gray on the screen are the export's
+# values, which the tablet also shows as its own highlighters. Yellow, pink
+# and green were measured on a Paper Pro, whose own highlighter colors differ
+# from its export: drawing its highlighter across swatches that vary one
+# channel (the others 00) shows, per channel, the last swatch the stroke goes
+# under, which is the highlighter's value. The export draws gray as black at
+# 25% opacity with the Darken blend: #BFBFBF on white paper.
+HIGHLIGHTERS: Tuple[NamedColor, ...] = (
+    NamedColor("yellow", 3, "#FFED75", "#FEFD60"),
+    NamedColor("blue", CUSTOM_COLOR_ID, "#BEEAFE", "#BEEAFE", (190, 234, 254, 255)),
+    NamedColor("pink", 5, "#F29EFF", "#FF55CF"),
+    NamedColor("orange", CUSTOM_COLOR_ID, "#FFC38C", "#FFC38C", (255, 195, 140, 255)),
+    NamedColor("green", 4, "#ACFF85", "#A9FA5C"),
+    NamedColor("gray", 8, "#000000", "#000000", opacity=0.2509804),
+)
+PEN_BY_NAME: Dict[str, NamedColor] = {c.name: c for c in PENS}
+HIGHLIGHTER_BY_NAME: Dict[str, NamedColor] = {c.name: c for c in HIGHLIGHTERS}
+
+_BY_ID = {c.color_id: c for c in (*PENS, *HIGHLIGHTERS) if c.color_id != CUSTOM_COLOR_ID}
+
+# Names for v6 color ids.
 COLOR_NAMES: Dict[int, str] = {
-    0: "black",
-    1: "gray",
-    2: "white",
-    3: "yellow",
-    4: "green",
-    5: "pink",
-    6: "blue",
-    7: "red",
-    8: "gray",
-    9: "highlight",
-    10: "green",
-    11: "cyan",
-    12: "magenta",
-    13: "yellow",
+    **{i: c.name for i, c in _BY_ID.items()},
+    CUSTOM_COLOR_ID: "highlight",
 }
 
 # Render colors for v6 color ids when no ARGB value applies: the colors the
-# tablet's PDF export draws. Ids 3, 4, 5 and 8 are highlighter colors; the
-# export draws the gray highlighter (8) as black at 25% opacity with the
-# Darken blend (see HIGHLIGHT_OPACITY).
+# tablet's PDF export draws (see HIGHLIGHT_OPACITY for translucent ones).
+# Color id 9 without an ARGB value draws as the yellow highlighter.
 RENDER_COLORS: Dict[int, str] = {
-    0: "#000000",
-    1: "#909090",
-    2: "#FFFFFF",
-    3: "#FEFD60",
-    4: "#A9FA5C",
-    5: "#FF55CF",
-    6: "#304AE0",
-    7: "#C23132",
-    8: "#000000",
-    9: "#FEFD60",
-    10: "#91DA71",
-    11: "#74D2E8",
-    12: "#C07FD2",
-    13: "#FAE719",
+    **{i: c.desktop for i, c in _BY_ID.items()},
+    CUSTOM_COLOR_ID: HIGHLIGHTER_BY_NAME["yellow"].desktop,
 }
 
 # Opacity of highlighter colors the export draws translucent; others are opaque.
-HIGHLIGHT_OPACITY: Dict[int, float] = {8: 0.2509804}
+HIGHLIGHT_OPACITY: Dict[int, float] = {
+    c.color_id: c.opacity for c in HIGHLIGHTERS if c.opacity is not None
+}
+
+
+def _pack(rgba: Tuple[int, int, int, int]) -> int:
+    r, g, b, a = rgba
+    return (a << 24) | (r << 16) | (g << 8) | b
+
 
 # Highlighter colors written as color id 9 plus an ARGB value.
 ARGB_NAMES: Dict[int, str] = {
-    0xFFBEEAFE: "blue",
-    0xFFFFC38C: "orange",
+    _pack(c.rgba): c.name for c in HIGHLIGHTERS if c.color_id == CUSTOM_COLOR_ID
 }
 
 # ARGB value firmware writes when the color id alone defines the color.

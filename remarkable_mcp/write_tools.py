@@ -2701,6 +2701,8 @@ def register_write_tools():
              "tool": "fineliner" | "highlighter" | int,
              "color": "black" | "yellow" | ...,
              "width": <optional float>, "thickness_scale": <optional float>}
+            Pen colors: black, gray, white, blue, red, green, yellow, cyan,
+            magenta. Highlighter colors: yellow, blue, pink, orange, green, gray.
         - name: Title of the new notebook (create_document).
         - text: Optional typed text for the first page (create_document). Omit it
             unless the user explicitly requested specific content; never fabricate

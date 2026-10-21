@@ -15,7 +15,7 @@ import re
 import uuid
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from remarkable_mcp import rm_ink
+from remarkable_mcp import colors, rm_ink
 
 GLYPH_BLOCK = 0x03
 # Rectangle padding beyond PyMuPDF's loose character boxes, as a share of
@@ -25,12 +25,7 @@ RIGHT_PAD = 0.10
 
 # Highlighter colors: the tablet's color id and the color_rgba it stores.
 COLORS: Dict[str, Tuple[int, Tuple[int, int, int, int]]] = {
-    "yellow": (3, (0, 0, 0, 255)),
-    "green": (4, (0, 0, 0, 255)),
-    "pink": (5, (0, 0, 0, 255)),
-    "gray": (8, (0, 0, 0, 255)),
-    "blue": (9, (190, 234, 254, 255)),
-    "orange": (9, (255, 195, 140, 255)),
+    c.name: (c.color_id, c.rgba) for c in colors.HIGHLIGHTERS
 }
 DEFAULT_COLOR = "yellow"
 

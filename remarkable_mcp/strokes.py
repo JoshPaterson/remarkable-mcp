@@ -39,6 +39,7 @@ authored on a Paper Pro maps correctly even when edited from another device.
 
 from __future__ import annotations
 
+import dataclasses
 import io
 import logging
 from typing import Iterable, Optional
@@ -54,7 +55,7 @@ from rmscene.scene_stream import (
 )
 from rmscene.tagged_block_common import CrdtId
 
-from remarkable_mcp import rm_ink
+from remarkable_mcp import colors, rm_ink
 
 logger = logging.getLogger(__name__)
 
@@ -113,7 +114,10 @@ def _color_aliases() -> dict[str, int]:
 
 
 PEN_IDS = _pen_aliases()
+# rmscene's color names; named colors resolve per tool first (see
+# resolve_ink_color).
 COLOR_IDS = _color_aliases()
+HIGHLIGHTER_IDS = {int(Pen.HIGHLIGHTER_1.value), int(Pen.HIGHLIGHTER_2.value)}
 
 
 # Per-tool brush values measured from real hand-drawn strokes on the device
@@ -158,19 +162,37 @@ def resolve_tool(tool) -> int:
     )
 
 
-def resolve_color(color) -> int:
-    """Resolve a color name or int to a valid PenColor id."""
+def resolve_ink_color(color, tool_id: Optional[int] = None) -> tuple[int, Optional[tuple]]:
+    """Resolve a color name or int to ``(PenColor id, color_rgba or None)``.
+
+    A named color is the color erasable marks get for the same tool: the
+    highlighter's colors for the highlighter (blue and orange are color id 9
+    with their ``color_rgba``), the pen colors for every other tool. Other
+    names are rmscene's color names (``yellow_2``, ``gray_overlap``, ...).
+    """
     if color is None:
-        return COLOR_IDS[DEFAULT_COLOR]
+        color = DEFAULT_COLOR
     if isinstance(color, int):
-        return int(PenColor(color).value)
+        return int(PenColor(color).value), None
     key = str(color).strip().lower().replace(" ", "_").replace("-", "_")
+    highlighter = tool_id is not None and int(tool_id) in HIGHLIGHTER_IDS
+    palette = colors.HIGHLIGHTER_BY_NAME if highlighter else colors.PEN_BY_NAME
+    named = palette.get("gray" if key == "grey" else key)
+    if named is not None:
+        rgba = named.rgba if named.color_id == colors.CUSTOM_COLOR_ID else None
+        return named.color_id, rgba
     if key in COLOR_IDS:
-        return COLOR_IDS[key]
+        return COLOR_IDS[key], None
     raise StrokeError(
-        f"Unknown color {color!r}. Valid names include: black, gray/grey, white, "
-        "yellow, green, pink, blue, red, cyan, magenta, highlight."
+        f"Unknown color {color!r}. Pen colors: {', '.join(colors.PEN_BY_NAME)}; "
+        f"highlighter colors: {', '.join(colors.HIGHLIGHTER_BY_NAME)}."
     )
+
+
+def resolve_color(color, tool_id: Optional[int] = None) -> int:
+    """Resolve a color name or int to a valid PenColor id for a tool (see
+    ``resolve_ink_color``)."""
+    return resolve_ink_color(color, tool_id)[0]
 
 
 def get_paper_size(blocks: Iterable[object]) -> tuple[int, int]:
@@ -290,14 +312,17 @@ def build_line_block(
             nx, ny, pressure = rp[0], rp[1], None
         pts.append(_map_point(nx, ny, pressure, width, paper_w, paper_h))
 
+    color_id, rgba = resolve_ink_color(stroke.get("color"), tool_id)
     line = Line(
-        color=PenColor(resolve_color(stroke.get("color"))),
+        color=PenColor(color_id),
         tool=Pen(tool_id),
         points=pts,
         thickness_scale=float(stroke.get("thickness_scale") or base_scale),
         starting_length=0.0,
         move_id=None,
     )
+    if rgba is not None:
+        line = dataclasses.replace(line, color_rgba=rgba)
     item = CrdtSequenceItem(
         item_id=item_id,
         left_id=CrdtId(0, 0),

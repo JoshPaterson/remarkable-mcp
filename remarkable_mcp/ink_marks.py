@@ -21,7 +21,7 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
-from remarkable_mcp import rm_ink, svg_path
+from remarkable_mcp import colors, rm_ink, svg_path
 
 FONT_DIR = Path(__file__).parent / "fonts"
 FONT_FILES = {False: "EMSReadability.svg", True: "EMSReadabilityItalic.svg"}
@@ -38,19 +38,8 @@ CURVE_STEPS = 8
 # Highlights taller than this are drawn as several highlighter rows.
 MAX_HIGHLIGHT_ROW = 24.0
 
-# Pen color ids for named colors (pens), and highlighter ids with the
-# color_rgba the tablet stores.
-PEN_COLORS = {
-    "black": 0,
-    "gray": 1,
-    "white": 2,
-    "blue": 6,
-    "red": 7,
-    "green": 10,
-    "cyan": 11,
-    "magenta": 12,
-    "yellow": 13,
-}
+# Pen color ids for named colors (highlighters use text_highlights.COLORS).
+PEN_COLORS = {c.name: c.color_id for c in colors.PENS}
 FINELINER = "fineliner"
 HIGHLIGHTER = "highlighter"
 ERASABLE_KINDS = ("text", "shape", "path")

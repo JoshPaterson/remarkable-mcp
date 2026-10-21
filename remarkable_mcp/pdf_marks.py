@@ -29,7 +29,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import pymupdf
 
-from remarkable_mcp import svg_path
+from remarkable_mcp import colors, svg_path
 
 BASE_FILE = "remarkable-mcp-original.pdf"
 MARKS_FILE = "remarkable-mcp-marks.json"
@@ -65,74 +65,17 @@ def _rgb(hex_color: str) -> Tuple[float, float, float]:
     return tuple(int(hex_color[i : i + 2], 16) / 255 for i in (1, 3, 5))
 
 
-# Pen colors as the Paper Pro shows them. Its screen draws the pure colors
-# below without dithering, matching its own pen strokes; the softer values
-# its PDF export uses for pens are dithered on the screen and look different.
-COLORS = {
-    name: _rgb(value)
-    for name, value in {
-        "black": "#000000",
-        "gray": "#909090",
-        "white": "#FFFFFF",
-        "blue": "#0000FF",
-        "red": "#FF0000",
-        "green": "#00FF00",
-        "yellow": "#FFFF00",
-        "cyan": "#00FFFF",
-        "magenta": "#FF00FF",
-    }.items()
-}
-# Highlighter colors, drawn with the Darken blend: on white paper they show
-# their color, and text under them stays dark. Blue, orange and gray are the
-# tablet's PDF export values, which the tablet also shows as its own
-# highlighters. Yellow, pink and green were measured on a Paper Pro, whose
-# own highlighter colors differ from its export: drawing its highlighter
-# across swatches that vary one channel (the others 00) shows, per channel,
-# the last swatch the stroke goes under, which is the highlighter's value.
-HIGHLIGHT_COLORS = {
-    name: _rgb(value)
-    for name, value in {
-        "yellow": "#FFED75",
-        "blue": "#BEEAFE",
-        "pink": "#F29EFF",
-        "orange": "#FFC38C",
-        "green": "#ACFF85",
-        "gray": "#000000",
-    }.items()
-}
-# The same named colors as the reMarkable desktop and browser apps (and the
-# tablet's PDF export) draw them. Exports re-draw named-color marks with
-# these, so exported files match those apps; on the tablet's own screen the
-# values above match instead.
-DESKTOP_COLORS = {
-    name: _rgb(value)
-    for name, value in {
-        "black": "#000000",
-        "gray": "#909090",
-        "white": "#FFFFFF",
-        "blue": "#304AE0",
-        "red": "#C23132",
-        "green": "#91DA71",
-        "yellow": "#FAE719",
-        "cyan": "#74D2E8",
-        "magenta": "#C07FD2",
-    }.items()
-}
-DESKTOP_HIGHLIGHT_COLORS = {
-    name: _rgb(value)
-    for name, value in {
-        "yellow": "#FEFD60",
-        "blue": "#BEEAFE",
-        "pink": "#FF55CF",
-        "orange": "#FFC38C",
-        "green": "#A9FA5C",
-        "gray": "#000000",
-    }.items()
-}
-# Highlighter colors drawn translucent, as the export draws them: gray is
-# black at 25% opacity, which is #BFBFBF on white paper and darkens colors
-# under it by a quarter.
-HIGHLIGHT_OPACITY = {"gray": 0.2509804}
+# Named colors (see ``colors``). Marks drawn into the PDF use the colors as
+# the Paper Pro's screen shows them; highlights are drawn with the Darken
+# blend, so on white paper they show their color and text under them stays
+# dark. Exports re-draw named-color marks with the desktop colors, so
+# exported files match the desktop and browser apps.
+COLORS = {c.name: _rgb(c.screen) for c in colors.PENS}
+HIGHLIGHT_COLORS = {c.name: _rgb(c.screen) for c in colors.HIGHLIGHTERS}
+DESKTOP_COLORS = {c.name: _rgb(c.desktop) for c in colors.PENS}
+DESKTOP_HIGHLIGHT_COLORS = {c.name: _rgb(c.desktop) for c in colors.HIGHLIGHTERS}
+# Highlighter colors drawn translucent, as the export draws them.
+HIGHLIGHT_OPACITY = {c.name: c.opacity for c in colors.HIGHLIGHTERS if c.opacity is not None}
 DEFAULT_TEXT_SIZE = 11.0
 DEFAULT_LATEX_SIZE = 12.0
 DEFAULT_SYMBOL_SIZE = 12.0
@@ -1751,7 +1694,10 @@ def _text_highlight(options, size, pdf_page: int, color: Optional[str], locate) 
     occurrence = options.get("occurrence", 1)
     if isinstance(occurrence, bool) or not isinstance(occurrence, int) or occurrence < 1:
         raise MarkError("occurrence must be 1 or more.")
-    name = options.get("color", color if color in COLORS else DEFAULT_COLOR)
+    name = options.get("color")
+    if name is None:
+        name = color if isinstance(color, str) and color.strip().lower() in COLORS else None
+    name = str(name or DEFAULT_COLOR).strip().lower()
     if name not in COLORS:
         raise MarkError(f"A text highlight's color is one of: {', '.join(COLORS)}.")
     layer = options.get("layer")

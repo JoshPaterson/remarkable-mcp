@@ -130,3 +130,40 @@ def test_ink_color_tables():
         "yellow_2": 13,
         "grey": 1,
     }
+
+
+def test_canvas_colors_match_erasable_marks_for_the_same_tool():
+    fineliner = strokes.resolve_tool("fineliner")
+    highlighter = strokes.resolve_tool("highlighter")
+    for name, color_id in ink_marks.PEN_COLORS.items():
+        assert strokes.resolve_ink_color(name, fineliner) == (color_id, None)
+    for name, (color_id, rgba) in text_highlights.COLORS.items():
+        expected = rgba if color_id == colors.CUSTOM_COLOR_ID else None
+        assert strokes.resolve_ink_color(name, highlighter) == (color_id, expected)
+    assert strokes.resolve_color("yellow") == 13 and strokes.resolve_color("Grey") == 1
+    assert strokes.resolve_color("yellow_2", highlighter) == 13
+    assert strokes.resolve_color(3, fineliner) == 3
+
+
+def test_canvas_blue_highlighter_stores_its_rgba():
+    from rmscene.tagged_block_common import CrdtId
+
+    stroke = {"points": [[0.1, 0.1], [0.2, 0.1]], "tool": "highlighter", "color": "blue"}
+    block = strokes.build_line_block(CrdtId(0, 11), CrdtId(1, 20), stroke, 1404, 1872)
+    assert int(block.item.value.color) == 9
+    assert block.item.value.color_rgba == (190, 234, 254, 255)
+
+
+def test_text_highlight_color_is_normalized():
+    part = {"start": 0, "length": 5, "text": "hello", "rect": (100, 200, 140, 212)}
+    result = pdf_marks.edit_marks(
+        [],
+        add=[{"page": 1, "text_highlight": "hello", "color": " Blue "}],
+        remove=[],
+        clear=False,
+        page_map=[0],
+        sizes=[(595.0, 842.0)],
+        color=None,
+        locate=lambda *_: [part],
+    )
+    assert result["marks"][0]["color_name"] == "blue"
