@@ -675,12 +675,12 @@ Or set the environment variable:
 | `remarkable_upload(file_path \| file_content, parent_folder, document_name, defer_restart, file_format)` | Upload a PDF or EPUB from a local path or from base64 contents (cloud, SSH, and USB web; USB web preserves the name but ignores `parent_folder`) |
 | `remarkable_markdown_to_pdf(markdown, document_name, parent_folder, defer_restart, outline)` | Render Markdown as a paginated PDF and upload it; its headings become the table of contents the tablet shows (cloud, SSH, and USB web) |
 | `remarkable_mkdir(folder_name, parent, defer_restart)` | Create a new folder (cloud and SSH) |
-| `remarkable_move(document, dest_folder, defer_restart)` | Move a document or folder (cloud and SSH) |
-| `remarkable_rename(document, new_name, defer_restart)` | Rename a document or folder (cloud and SSH) |
+| `remarkable_move(document, dest_folder, defer_restart)` | Move a document or folder, or a list of them in one write (cloud and SSH) |
+| `remarkable_rename(document, new_name, renames, defer_restart)` | Rename a document or folder, or several with `renames={old: new}` in one write (cloud and SSH) |
 | `remarkable_tag(document, add, remove, rename, page, defer_restart)` | Add, rename or remove document tags, or a page's tags with `page`; `document` may be a list, changed together in one write (cloud and SSH) |
 | `remarkable_mark_pdf(document, add, remove, clear, color, dry_run, layout)` | Add or remove marks (text, shapes, highlights, freeform paths, LaTeX equations, and SVG, PDF, PNG or JPEG graphics) on a PDF's pages, e.g. to grade a worksheet or annotate a paper; `dry_run` previews, `layout` returns text and ink positions (**cloud only**) |
 | `remarkable_pdf_outline(document, outline, dry_run)` | List, set or remove a PDF's outline, the table of contents the tablet shows, e.g. chapters for a book without one (**cloud only**) |
-| `remarkable_delete(document, defer_restart, permanent)` | Move a document/folder to Trash; SSH can permanently remove it with `permanent=True` |
+| `remarkable_delete(document, defer_restart, permanent)` | Move a document/folder (or a list, with one confirmation) to Trash; SSH can permanently remove it with `permanent=True` |
 | `remarkable_refresh()` | Safely restart `xochitl` once to apply pending writes made with `defer_restart=True`; no-op after this process has confirmed a clean state — **SSH only** |
 | `remarkable_author(method, ..., defer_restart)` | Author native ink and notebooks — `draw` (append strokes), `add_page` (append a blank notebook page), `create_document` (new notebook) — **SSH only** |
 

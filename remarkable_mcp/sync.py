@@ -1175,6 +1175,19 @@ class RemarkableClient:
         """Move a document or folder to the trash (recoverable via ``restore``)."""
         self.move(doc_id, "trash")
 
+    def update_documents_metadata(self, applies: Dict[str, Any]) -> None:
+        """Apply ``applies[doc_id](metadata)`` to several documents' metadata
+        in one root commit, as ``rename`` and ``move`` do for one; nothing is
+        written if any document is missing."""
+
+        def mutate(entries):
+            for doc_id, apply in applies.items():
+                entry = self._require_entry(entries, doc_id)
+                entries = self._replace_root_entry(entries, self._mutate_doc_metadata(entry, apply))
+            return entries
+
+        self._sync_root(mutate)
+
     def restore(self, doc_id: str, parent_id: str = "") -> None:
         """Restore a trashed document or folder back to ``parent_id`` ("" = root)."""
         self.move(doc_id, parent_id or "")
