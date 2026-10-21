@@ -392,9 +392,12 @@ def _ocr_png_tesseract(png_path: Path) -> Optional[str]:
         Extracted text, or None if OCR failed
     """
     try:
-        import pytesseract
         from PIL import Image as PILImage
         from PIL import ImageFilter, ImageOps
+
+        from remarkable_mcp.extract import tesseract_module
+
+        pytesseract = tesseract_module()
 
         img = PILImage.open(png_path)
 

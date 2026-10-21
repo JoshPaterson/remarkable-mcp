@@ -3594,13 +3594,37 @@ def _ocr_google_vision_sdk(rm_files: List[Path]) -> Optional[List[Optional[List[
         return _ocr_tesseract(rm_files)
 
 
+# Where Homebrew and other installers put Tesseract; apps started outside a
+# shell (such as the server under Claude Desktop) often lack these in PATH.
+TESSERACT_LOCATIONS = (
+    "/opt/homebrew/bin/tesseract",
+    "/usr/local/bin/tesseract",
+    "/usr/bin/tesseract",
+)
+
+
+def tesseract_module():
+    """``pytesseract``, pointed at the Tesseract program when it is not on
+    PATH but installed in a usual place. Raises ImportError when pytesseract
+    is missing."""
+    import shutil
+
+    import pytesseract
+
+    if shutil.which(pytesseract.pytesseract.tesseract_cmd) is None:
+        found = next((path for path in TESSERACT_LOCATIONS if os.path.exists(path)), None)
+        if found:
+            pytesseract.pytesseract.tesseract_cmd = found
+    return pytesseract
+
+
 def _tesseract_lines(png: bytes) -> List[OcrLine]:
     """Lines ``(text, pixel box)`` found by Tesseract, in reading order."""
     import io
 
-    import pytesseract
     from PIL import Image, ImageFilter, ImageOps
 
+    pytesseract = tesseract_module()
     # Grayscale, more contrast and slight sharpening help with handwriting.
     img = Image.open(io.BytesIO(png)).convert("L")
     img = ImageOps.autocontrast(img, cutoff=2)
@@ -3644,7 +3668,7 @@ def _ocr_tesseract(rm_files: List[Path]) -> Optional[List[Optional[List[Dict[str
     Requires: pytesseract and PyMuPDF.
     """
     try:
-        import pytesseract  # noqa: F401
+        tesseract_module()
     except ImportError:
         # OCR dependencies not installed
         return None

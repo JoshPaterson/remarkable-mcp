@@ -119,3 +119,15 @@ def test_markdown_export_puts_ocr_under_its_page(tmp_path):
     markdown = destination.read_text()
 
     assert "### Page 2" in markdown and "x = 4  [Layer 2]" in markdown
+
+
+def test_tesseract_found_outside_path(monkeypatch, tmp_path):
+    import pytesseract
+
+    program = tmp_path / "tesseract"
+    program.write_text("")
+    monkeypatch.setattr(pytesseract.pytesseract, "tesseract_cmd", "tesseract")
+    monkeypatch.setenv("PATH", "/nonexistent")
+    monkeypatch.setattr(extract, "TESSERACT_LOCATIONS", ("/missing", str(program)))
+
+    assert extract.tesseract_module().pytesseract.tesseract_cmd == str(program)
