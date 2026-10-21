@@ -173,7 +173,7 @@ def test_a_generation_conflict_is_retried_on_the_new_root(cloud, client):
 
 def test_conflicts_that_never_end_raise(cloud, client):
     cloud.conflicts = 99
-    with pytest.raises(CloudWriteError, match="conflict"):
+    with pytest.raises(CloudWriteError, match="generation conflict on all"):
         client.create_folder("Never")
     commits = [r for r in cloud.requests if r == ("PUT", sync.ROOT_PUT_URL)]
     assert len(commits) == sync._ROOT_COMMIT_ATTEMPTS

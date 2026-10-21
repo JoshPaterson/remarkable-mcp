@@ -921,7 +921,6 @@ class RemarkableClient:
         root is committed. On success all in-memory document caches are
         invalidated.
         """
-        last_error: Optional[Exception] = None
         for attempt in range(_ROOT_COMMIT_ATTEMPTS):
             entries, generation = self._read_root_entries()
             current = list(entries)
@@ -933,17 +932,19 @@ class RemarkableClient:
             self._put_blob(root_body, root_hash, "root.docSchema", "text/plain; charset=UTF-8")
             try:
                 self._commit_root(root_hash, generation)
-                self._invalidate_caches()
-                return
             except CloudWriteError as e:
-                if getattr(e, "conflict", False) and attempt < _ROOT_COMMIT_ATTEMPTS - 1:
-                    last_error = e
-                    time.sleep(_compute_sleep(_get_retry_delay(), attempt))
-                    continue
-                raise
-        raise CloudWriteError(
-            f"Could not commit root after {_ROOT_COMMIT_ATTEMPTS} attempts: {last_error}"
-        )
+                if not getattr(e, "conflict", False):
+                    raise
+                if attempt == _ROOT_COMMIT_ATTEMPTS - 1:
+                    raise CloudWriteError(
+                        f"Could not commit root: generation conflict on all "
+                        f"{_ROOT_COMMIT_ATTEMPTS} attempts (another device or app kept "
+                        "changing the library). Retry the write."
+                    ) from e
+                time.sleep(_compute_sleep(_get_retry_delay(), attempt))
+                continue
+            self._invalidate_caches()
+            return
 
     def _invalidate_caches(self) -> None:
         """Drop in-memory document/file-type caches after a mutation."""
