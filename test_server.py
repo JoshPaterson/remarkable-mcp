@@ -3595,6 +3595,23 @@ class TestMarkdownPDFWriteback:
         finally:
             document.close()
 
+    def test_headings_become_the_outline(self):
+        import pymupdf
+
+        from remarkable_mcp.markdown_pdf import render_markdown_pdf
+
+        body = "\n\n".join(f"Paragraph {i}." for i in range(80))
+        markdown = f"# Report\n\nIntro.\n\n### Detail\n\n{body}\n\n## Results\n\nDone."
+        with pymupdf.open(stream=render_markdown_pdf(markdown), filetype="pdf") as doc:
+            toc = doc.get_toc(simple=True)
+            last_page = len(doc)
+        assert [entry[:2] for entry in toc] == [[1, "Report"], [2, "Detail"], [2, "Results"]]
+        assert toc[0][2] == 1 and toc[-1][2] == last_page > 1
+
+        no_outline = render_markdown_pdf(markdown, outline=False)
+        with pymupdf.open(stream=no_outline, filetype="pdf") as doc:
+            assert doc.get_toc() == []
+
     def test_empty_markdown_is_rejected(self):
         from remarkable_mcp.markdown_pdf import render_markdown_pdf
 

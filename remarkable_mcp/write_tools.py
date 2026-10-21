@@ -2610,6 +2610,7 @@ def register_write_tools():
         document_name: str = "Markdown",
         parent_folder: str = "/",
         defer_restart: bool = False,
+        outline: bool = True,
     ) -> str:
         """
         <usecase>Render Markdown text as a PDF and upload it to the reMarkable tablet.</usecase>
@@ -2618,7 +2619,8 @@ def register_write_tools():
         content written back to the tablet without first creating a local file.
         Headings, lists, tables, links, blockquotes, and code blocks are rendered
         into a paginated A4 PDF. Raw HTML is escaped and image assets are omitted
-        so rendering never reads local files or fetches remote content.
+        so rendering never reads local files or fetches remote content. The
+        headings become the PDF's table of contents, which the tablet shows.
 
         Works in all three transports:
         - Cloud: sync upload with parent_folder and document_name
@@ -2636,6 +2638,7 @@ def register_write_tools():
         - defer_restart: SSH only. When True, skip the xochitl restart and call
           remarkable_refresh() once after the batch. Forwarded exactly like
           remarkable_upload; ignored in cloud and USB web modes.
+        - outline: Make the headings the PDF's table of contents (default: True).
         </parameters>
         <examples>
         - remarkable_markdown_to_pdf("# Meeting Notes\\n\\n- Follow up with Sam")
@@ -2653,7 +2656,7 @@ def register_write_tools():
         from remarkable_mcp.markdown_pdf import render_markdown_pdf
 
         try:
-            pdf_bytes = await asyncio.to_thread(render_markdown_pdf, markdown)
+            pdf_bytes = await asyncio.to_thread(render_markdown_pdf, markdown, outline)
         except Exception as e:
             return make_error(
                 error_type="render_failed",
