@@ -45,15 +45,10 @@ from remarkable_mcp.api import (
     get_rmapi,
 )
 from remarkable_mcp.capabilities import client_supports_elicitation
-from remarkable_mcp.lookup import (
-    display_path,
-    find_folder_id,
-    find_item,
-    folder_paths,
-    scoped_items,
-)
+from remarkable_mcp.lookup import display_path, lookup_folder, scoped_items
+from remarkable_mcp.lookup import lookup as lookup_item
 from remarkable_mcp.pages import content_page_ids, tablet_page
-from remarkable_mcp.responses import make_error, make_response
+from remarkable_mcp.responses import invalid_param, make_error, make_response
 from remarkable_mcp.ssh import XOCHITL_PATH, Document, SSHClient
 from remarkable_mcp.ssh_reliability import (
     SSHExecutionUnknownError,
@@ -936,26 +931,10 @@ def _add_upload_source(response: str, fields: dict) -> str:
     return json.dumps(data, indent=2)
 
 
-def _resolve_parent_id(parent_path: str, items_by_id: dict, collection: list) -> Optional[str]:
-    """The ID of the live folder at root-relative ``parent_path``.
-
-    ``/`` is the configured root (``""`` for the library root). Returns None
-    when no such folder exists inside the root.
-    """
-    return find_folder_id(parent_path, collection, items_by_id)
-
-
-def _resolve_document(
-    name_or_path: str, collection: list, items_by_id: dict, folders_only: bool = False
-) -> Optional[object]:
-    """Find a document or folder inside the root by name or root-relative path.
-
-    Live items win. A trashed item is only matched by its explicit
-    ``/trash/...`` path (e.g. to permanently delete it over SSH) when no root
-    is set, never by a bare name that a live item could also carry.
-    """
-    kind = "folder" if folders_only else "any"
-    return find_item(name_or_path, collection, items_by_id, kind=kind, include_trash=True)
+def lookup(client, document: str, **options):
+    """``lookup.lookup`` for write tools: an explicit ``/trash/...`` path (no
+    root set) also reaches a trashed item, e.g. to delete it permanently."""
+    return lookup_item(client, document, include_trash=True, **options)
 
 
 def _invalidate_client_cache(client) -> None:
@@ -1041,13 +1020,9 @@ def _cloud_mkdir(folder_name: str, parent: str) -> str:
     client = get_rmapi()
     collection = client.get_meta_items()
     items_by_id = get_items_by_id(collection)
-    parent_id = _resolve_parent_id(parent, items_by_id, collection)
-    if parent_id is None:
-        return make_error(
-            error_type="folder_not_found",
-            message=f"Parent folder not found: '{parent}'",
-            suggestion="Use remarkable_browse('/') to see available folders.",
-        )
+    parent_id, error = lookup_folder(parent, collection, items_by_id, param="parent")
+    if error:
+        return error
     doc = client.create_folder(folder_name, parent_id)
     _invalidate_client_cache(client)
     return make_response(
@@ -1068,25 +1043,13 @@ def _cloud_move(document: str, dest_folder: str) -> str:
     collection = client.get_meta_items()
     items_by_id = get_items_by_id(collection)
 
-    target = _resolve_document(document, collection, items_by_id)
-    if not target:
-        from remarkable_mcp.extract import find_similar_documents
+    target, error = lookup(client, document, collection=collection, items_by_id=items_by_id)
+    if error:
+        return error
 
-        similar = find_similar_documents(document, scoped_items(collection, items_by_id))
-        return make_error(
-            error_type="document_not_found",
-            message=f"Document not found: '{document}'",
-            suggestion="Use remarkable_browse() to find the correct name.",
-            did_you_mean=similar if similar else None,
-        )
-
-    dest_id = _resolve_parent_id(dest_folder, items_by_id, collection)
-    if dest_id is None:
-        return make_error(
-            error_type="folder_not_found",
-            message=f"Destination folder not found: '{dest_folder}'",
-            suggestion="Use remarkable_browse('/') to see available folders.",
-        )
+    dest_id, error = lookup_folder(dest_folder, collection, items_by_id, param="dest_folder")
+    if error:
+        return error
 
     # Prevent moving a folder into itself or one of its descendants
     if target.is_folder:
@@ -1127,17 +1090,9 @@ def _cloud_rename(document: str, new_name: str) -> str:
     collection = client.get_meta_items()
     items_by_id = get_items_by_id(collection)
 
-    target = _resolve_document(document, collection, items_by_id)
-    if not target:
-        from remarkable_mcp.extract import find_similar_documents
-
-        similar = find_similar_documents(document, scoped_items(collection, items_by_id))
-        return make_error(
-            error_type="document_not_found",
-            message=f"Document not found: '{document}'",
-            suggestion="Use remarkable_browse() to find the correct name.",
-            did_you_mean=similar if similar else None,
-        )
+    target, error = lookup(client, document, collection=collection, items_by_id=items_by_id)
+    if error:
+        return error
 
     old_name = target.VissibleName
     client.rename(target.ID, new_name)
@@ -1569,22 +1524,16 @@ def _ocr_check(client, collection, items_by_id, document, folder, tags) -> str:
     from remarkable_mcp.pdf_marks import original_pdf
 
     if document is not None:
-        target = _resolve_document(document, collection, items_by_id)
-        if not target or target.is_folder:
-            return make_error(
-                error_type="document_not_found",
-                message=f"PDF document not found: '{document}'",
-                suggestion="Use remarkable_browse() to find the correct name.",
-            )
+        target, error = lookup(
+            client, document, kind="pdf", collection=collection, items_by_id=items_by_id
+        )
+        if error:
+            return error
         targets = [target]
     else:
-        base_id = _resolve_parent_id(folder or "/", items_by_id, collection)
-        if base_id is None:
-            return make_error(
-                error_type="folder_not_found",
-                message=f"Folder not found: '{folder}'",
-                suggestion="Use remarkable_browse('/') to see the folders.",
-            )
+        base_id, error = lookup_folder(folder or "/", collection, items_by_id, param="folder")
+        if error:
+            return error
         wanted = {t.lower() for t in tags or []}
 
         def under(item) -> bool:
@@ -1602,10 +1551,9 @@ def _ocr_check(client, collection, items_by_id, document, folder, tags) -> str:
             and (not wanted or wanted & {t.lower() for t in getattr(item, "tags", None) or []})
         ]
     if len(targets) > MAX_OCR_CHECKS:
-        return make_error(
-            error_type="invalid_parameter",
-            message=f"{len(targets)} documents match; at most {MAX_OCR_CHECKS} are checked.",
-            suggestion="Narrow the check with a subfolder or tags.",
+        return invalid_param(
+            f"folder/tags: {len(targets)} documents match; at most {MAX_OCR_CHECKS} are checked.",
+            "Narrow the check with a subfolder or tags.",
         )
     needing, checked = [], 0
     for item in targets:
@@ -1932,17 +1880,9 @@ def _cloud_delete(document: str) -> str:
     collection = client.get_meta_items()
     items_by_id = get_items_by_id(collection)
 
-    target = _resolve_document(document, collection, items_by_id)
-    if not target:
-        from remarkable_mcp.extract import find_similar_documents
-
-        similar = find_similar_documents(document, scoped_items(collection, items_by_id))
-        return make_error(
-            error_type="document_not_found",
-            message=f"Document not found: '{document}'",
-            suggestion="Use remarkable_browse() to find the correct name.",
-            did_you_mean=similar if similar else None,
-        )
+    target, error = lookup(client, document, collection=collection, items_by_id=items_by_id)
+    if error:
+        return error
 
     doc_path = display_path(target, items_by_id)
     client.delete(target.ID)
@@ -1970,18 +1910,16 @@ def _describe_documents(document) -> str:
 
 
 def _invalid_document_list() -> str:
-    return make_error(
-        error_type="invalid_parameter",
-        message="document must be a name or a non-empty list of names.",
-        suggestion='Example: document=["Week 1 worksheet", "Week 2 worksheet"]',
+    return invalid_param(
+        "document must be a name or a non-empty list of names.",
+        'Example: document=["Week 1 worksheet", "Week 2 worksheet"]',
     )
 
 
 def _invalid_rename() -> str:
-    return make_error(
-        error_type="invalid_parameter",
-        message="Give document and new_name, or renames (not both).",
-        suggestion='Example: renames={"Week 1": "Week 1 - graded"}',
+    return invalid_param(
+        "renames: give document and new_name, or renames (not both).",
+        'Example: renames={"Week 1": "Week 1 - graded"}',
     )
 
 
@@ -2018,17 +1956,15 @@ def _resolve_targets(names: List[str], collection, items_by_id) -> tuple:
     naming the first that cannot be found; nothing has been changed then."""
     targets: list = []
     for name in names:
-        target = _resolve_document(name, collection, items_by_id)
-        if not target:
-            from remarkable_mcp.extract import find_similar_documents
-
-            similar = find_similar_documents(name, scoped_items(collection, items_by_id))
-            return None, make_error(
-                error_type="document_not_found",
-                message=f"Document not found: '{name}'",
-                suggestion="Use remarkable_browse() to find the correct name. Nothing was changed.",
-                did_you_mean=similar if similar else None,
-            )
+        target, error = lookup(
+            None,
+            name,
+            collection=collection,
+            items_by_id=items_by_id,
+            note="Nothing was changed.",
+        )
+        if error:
+            return None, error
         if all(t.ID != target.ID for t in targets):
             targets.append(target)
     return targets, None
@@ -2084,13 +2020,11 @@ def _move_many(client, names: List[str], dest_folder: str, cloud: bool, defer_re
     targets, error = _resolve_targets(names, collection, items_by_id)
     if error:
         return error
-    dest_id = _resolve_parent_id(dest_folder, items_by_id, collection)
-    if dest_id is None:
-        return make_error(
-            error_type="folder_not_found",
-            message=f"Destination folder not found: '{dest_folder}'",
-            suggestion="Use remarkable_browse('/') to see available folders. Nothing was changed.",
-        )
+    dest_id, error = lookup_folder(
+        dest_folder, collection, items_by_id, param="dest_folder", note="Nothing was changed."
+    )
+    if error:
+        return error
     for target in targets:
         error = _move_cycle_error(target, dest_id, items_by_id)
         if error:
@@ -2128,12 +2062,11 @@ def _rename_many(client, renames: Dict[str, str], cloud: bool, defer_restart: bo
         return error
     new_names: dict = {}
     for name, new_name in renames.items():
-        target = _resolve_document(name, collection, items_by_id)
+        target, _ = lookup(client, name, collection=collection, items_by_id=items_by_id)
         if target.ID in new_names and new_names[target.ID] != new_name:
-            return make_error(
-                error_type="invalid_parameter",
-                message=f"'{target.VissibleName}' is given two new names.",
-                suggestion="Give each document one new name. Nothing was changed.",
+            return invalid_param(
+                f"renames: '{target.VissibleName}' is given two new names.",
+                "Give each document one new name. Nothing was changed.",
             )
         new_names[target.ID] = new_name
     renamed = [{"old_name": t.VissibleName, "new_name": new_names[t.ID]} for t in targets]
@@ -2333,17 +2266,11 @@ def _author_draw(
     ssh_client = _get_ssh_client()
     collection = ssh_client.get_meta_items()
     items_by_id = get_items_by_id(collection)
-    target = _resolve_document(document, collection, items_by_id)
-    if not target:
-        from remarkable_mcp.extract import find_similar_documents
-
-        similar = find_similar_documents(document, scoped_items(collection, items_by_id))
-        return make_error(
-            error_type="document_not_found",
-            message=f"Document not found: '{document}'",
-            suggestion="Use remarkable_browse() to find the correct name.",
-            did_you_mean=similar or None,
-        )
+    target, error = lookup(
+        ssh_client, document, kind="document", collection=collection, items_by_id=items_by_id
+    )
+    if error:
+        return error
 
     doc_uuid = target.ID
     content_raw = _read_remote_bytes(ssh_client, f"{XOCHITL_PATH}/{doc_uuid}.content")
@@ -2447,17 +2374,11 @@ def _author_add_page(document: str, defer_restart: bool = False) -> str:
     ssh_client = _get_ssh_client()
     collection = ssh_client.get_meta_items()
     items_by_id = get_items_by_id(collection)
-    target = _resolve_document(document, collection, items_by_id)
-    if not target:
-        from remarkable_mcp.extract import find_similar_documents
-
-        similar = find_similar_documents(document, scoped_items(collection, items_by_id))
-        return make_error(
-            error_type="document_not_found",
-            message=f"Document not found: '{document}'",
-            suggestion="Use remarkable_browse() to find the correct name.",
-            did_you_mean=similar or None,
-        )
+    target, error = lookup(
+        ssh_client, document, kind="document", collection=collection, items_by_id=items_by_id
+    )
+    if error:
+        return error
 
     doc_uuid = target.ID
     content_raw = _read_remote_bytes(ssh_client, f"{XOCHITL_PATH}/{doc_uuid}.content")
@@ -2541,15 +2462,9 @@ def _author_create_document(
     ssh_client = _get_ssh_client()
     collection = ssh_client.get_meta_items()
     items_by_id = get_items_by_id(collection)
-    parent_id = _resolve_parent_id(folder or "/", items_by_id, collection)
-    if parent_id is None:
-        folders = folder_paths(collection, items_by_id)
-        return make_error(
-            error_type="folder_not_found",
-            message=f"Folder not found: '{folder}'",
-            suggestion="Use remarkable_browse('/') to see available folders.",
-            did_you_mean=folders[:5] if folders else None,
-        )
+    parent_id, error = lookup_folder(folder or "/", collection, items_by_id, param="folder")
+    if error:
+        return error
 
     doc_uuid = nb.new_uuid()
     page_id = nb.new_uuid()
@@ -2761,15 +2676,11 @@ def register_write_tools():
                     client = get_rmapi()
                     collection = client.get_meta_items()
                     items_by_id = get_items_by_id(collection)
-                    parent_id = _resolve_parent_id(parent_folder, items_by_id, collection)
-                    if parent_id is None:
-                        folders = folder_paths(collection, items_by_id)
-                        return make_error(
-                            error_type="folder_not_found",
-                            message=f"Folder not found: '{parent_folder}'",
-                            suggestion="Use remarkable_browse('/') to see available folders.",
-                            did_you_mean=folders[:5] if folders else None,
-                        )
+                    parent_id, error = lookup_folder(
+                        parent_folder, collection, items_by_id, param="parent_folder"
+                    )
+                    if error:
+                        return error
 
                     name = document_name or os.path.splitext(os.path.basename(file_path))[0]
                     with open(file_path, "rb") as f:
@@ -2822,15 +2733,11 @@ def register_write_tools():
                 items_by_id = get_items_by_id(collection)
 
                 # Resolve parent folder
-                parent_id = _resolve_parent_id(parent_folder, items_by_id, collection)
-                if parent_id is None:
-                    folders = folder_paths(collection, items_by_id)
-                    return make_error(
-                        error_type="folder_not_found",
-                        message=f"Folder not found: '{parent_folder}'",
-                        suggestion="Use remarkable_browse('/') to see available folders.",
-                        did_you_mean=folders[:5] if folders else None,
-                    )
+                parent_id, error = lookup_folder(
+                    parent_folder, collection, items_by_id, param="parent_folder"
+                )
+                if error:
+                    return error
 
                 # Generate UUID and set name
                 doc_uuid = str(uuid.uuid4())
@@ -2992,13 +2899,8 @@ def register_write_tools():
         """
         import tempfile
 
-        def invalid(message: str, suggestion: str) -> str:
-            return make_error(
-                error_type="invalid_parameter", message=message, suggestion=suggestion
-            )
-
         if (file_path is None) == (file_content is None):
-            return invalid(
+            return invalid_param(
                 "Give exactly one of file_path or file_content.",
                 "Use file_path for a file on this machine, or file_content for "
                 "base64-encoded bytes (up to the inline size limit).",
@@ -3006,25 +2908,25 @@ def register_write_tools():
 
         if file_content is not None:
             if trash_source_after_upload:
-                return invalid(
+                return invalid_param(
                     "trash_source_after_upload applies only to file_path uploads.",
                     "Omit trash_source_after_upload when using file_content.",
                 )
             if not document_name or not document_name.strip():
-                return invalid(
+                return invalid_param(
                     "document_name is required with file_content.",
                     "Pass the display name the document should have on the tablet.",
                 )
             fmt = (file_format or "").strip().lower()
             if fmt not in UPLOAD_FORMATS:
-                return invalid(
+                return invalid_param(
                     f"Unsupported file_format: '{file_format}'",
                     "Use file_format='pdf' or file_format='epub'.",
                 )
             try:
                 data = _decode_inline_file(file_content, fmt)
             except ValueError as e:
-                return invalid(
+                return invalid_param(
                     str(e),
                     "Send the whole file base64-encoded, or use file_path for large files.",
                 )
@@ -3044,7 +2946,7 @@ def register_write_tools():
                 source = _staged_source(file_path)
                 uploaded_sha256 = await asyncio.to_thread(_file_sha256, source)
             except (ValueError, OSError) as e:
-                return invalid(
+                return invalid_param(
                     str(e),
                     "Upload without trash_source_after_upload, or put the file directly "
                     "in the staging folder.",
@@ -3241,13 +3143,11 @@ def register_write_tools():
                     items_by_id = get_items_by_id(collection)
 
                     # Resolve parent
-                    parent_id = _resolve_parent_id(parent, items_by_id, collection)
-                    if parent_id is None:
-                        return make_error(
-                            error_type="folder_not_found",
-                            message=f"Parent folder not found: '{parent}'",
-                            suggestion="Use remarkable_browse('/') to see available folders.",
-                        )
+                    parent_id, error = lookup_folder(
+                        parent, collection, items_by_id, param="parent"
+                    )
+                    if error:
+                        return error
 
                     # Generate UUID
                     doc_uuid = str(uuid.uuid4())
@@ -3369,28 +3269,18 @@ def register_write_tools():
                     items_by_id = get_items_by_id(collection)
 
                     # Find the document
-                    target = _resolve_document(document, collection, items_by_id)
-                    if not target:
-                        from remarkable_mcp.extract import find_similar_documents
-
-                        similar = find_similar_documents(
-                            document, scoped_items(collection, items_by_id)
-                        )
-                        return make_error(
-                            error_type="document_not_found",
-                            message=f"Document not found: '{document}'",
-                            suggestion="Use remarkable_browse() to find the correct name.",
-                            did_you_mean=similar if similar else None,
-                        )
+                    target, error = lookup(
+                        ssh_client, document, collection=collection, items_by_id=items_by_id
+                    )
+                    if error:
+                        return error
 
                     # Find the destination folder
-                    dest_id = _resolve_parent_id(dest_folder, items_by_id, collection)
-                    if dest_id is None:
-                        return make_error(
-                            error_type="folder_not_found",
-                            message=f"Destination folder not found: '{dest_folder}'",
-                            suggestion="Use remarkable_browse('/') to see available folders.",
-                        )
+                    dest_id, error = lookup_folder(
+                        dest_folder, collection, items_by_id, param="dest_folder"
+                    )
+                    if error:
+                        return error
 
                     # Prevent moving a folder into itself or a descendant
                     if target.is_folder:
@@ -3530,19 +3420,11 @@ def register_write_tools():
                     items_by_id = get_items_by_id(collection)
 
                     # Find the document
-                    target = _resolve_document(document, collection, items_by_id)
-                    if not target:
-                        from remarkable_mcp.extract import find_similar_documents
-
-                        similar = find_similar_documents(
-                            document, scoped_items(collection, items_by_id)
-                        )
-                        return make_error(
-                            error_type="document_not_found",
-                            message=f"Document not found: '{document}'",
-                            suggestion="Use remarkable_browse() to find the correct name.",
-                            did_you_mean=similar if similar else None,
-                        )
+                    target, error = lookup(
+                        ssh_client, document, collection=collection, items_by_id=items_by_id
+                    )
+                    if error:
+                        return error
 
                     # Read existing metadata
                     meta_content = ssh_client._scp_download(f"{XOCHITL_PATH}/{target.ID}.metadata")
@@ -3646,15 +3528,10 @@ def register_write_tools():
             """
             from remarkable_mcp.tag_edit import TagEditError
 
-            def invalid(message: str, suggestion: str) -> str:
-                return make_error(
-                    error_type="invalid_parameter", message=message, suggestion=suggestion
-                )
-
             if page is not None and page < 1:
-                return invalid("page must be 1 or more.", "Pages are numbered from 1.")
+                return invalid_param("page must be 1 or more.", "Pages are numbered from 1.")
             if rename is not None and not isinstance(rename, dict):
-                return invalid(
+                return invalid_param(
                     "rename must map current names to new names.",
                     'Example: rename={"to-grade": "graded"}',
                 )
@@ -3662,7 +3539,7 @@ def register_write_tools():
             single = isinstance(document, str)
             names = [document] if single else list(document or [])
             if not names or not all(isinstance(n, str) and n for n in names):
-                return invalid(
+                return invalid_param(
                     "document must be a name or a list of names.",
                     'Example: document=["Week 3 worksheet", "Week 4 worksheet"]',
                 )
@@ -3679,28 +3556,16 @@ def register_write_tools():
                     items_by_id = get_items_by_id(collection)
                     targets = []
                     for name in names:
-                        target = _resolve_document(name, collection, items_by_id)
-                        if not target:
-                            from remarkable_mcp.extract import find_similar_documents
-
-                            similar = find_similar_documents(
-                                name, scoped_items(collection, items_by_id)
-                            )
-                            return make_error(
-                                error_type="document_not_found",
-                                message=f"Document not found: '{name}'",
-                                suggestion=(
-                                    "Use remarkable_browse() to find the correct name. "
-                                    "No tags were changed."
-                                ),
-                                did_you_mean=similar if similar else None,
-                            )
-                        if target.is_folder:
-                            return invalid(
-                                f"'{target.VissibleName}' is a folder; only documents have tags.",
-                                "Tag the documents inside the folder instead. "
-                                "No tags were changed.",
-                            )
+                        target, error = lookup(
+                            client,
+                            name,
+                            kind="document",
+                            collection=collection,
+                            items_by_id=items_by_id,
+                            note="No tags were changed.",
+                        )
+                        if error:
+                            return error
                         if all(t.ID != target.ID for t in targets):
                             targets.append(target)
                     apply = _tag_editor(
@@ -3728,7 +3593,7 @@ def register_write_tools():
                         )
                     return _tags_response(targets, page, results, "ssh", refresh_pending=pending)
                 except TagEditError as e:
-                    return invalid(str(e), "Check the tag names and page number.")
+                    return invalid_param(str(e), "Check the tag names and page number.")
                 except SSHReliabilityError:
                     raise
                 except Exception as e:
@@ -3945,15 +3810,10 @@ def register_write_tools():
                 """
                 from remarkable_mcp.pdf_marks import MarkError
 
-                def invalid(message: str, suggestion: str) -> str:
-                    return make_error(
-                        error_type="invalid_parameter", message=message, suggestion=suggestion
-                    )
-
                 adds, removes = add or [], _as_list(remove)
                 writing = bool(adds or removes or clear) and not dry_run
                 if layout is not None and writing:
-                    return invalid(
+                    return invalid_param(
                         "layout cannot be combined with a write.",
                         "Call with layout alone (or with dry_run=True) first, then write.",
                     )
@@ -3966,24 +3826,15 @@ def register_write_tools():
                     try:
                         collection = client.get_meta_items()
                         items_by_id = get_items_by_id(collection)
-                        target = _resolve_document(document, collection, items_by_id)
-                        if not target:
-                            from remarkable_mcp.extract import find_similar_documents
-
-                            similar = find_similar_documents(
-                                document, scoped_items(collection, items_by_id)
-                            )
-                            return make_error(
-                                error_type="document_not_found",
-                                message=f"Document not found: '{document}'",
-                                suggestion="Use remarkable_browse() to find the correct name.",
-                                did_you_mean=similar if similar else None,
-                            )
-                        if target.is_folder:
-                            return invalid(
-                                f"'{target.VissibleName}' is a folder.",
-                                "Mark a PDF document instead.",
-                            )
+                        target, error = lookup(
+                            client,
+                            document,
+                            kind="pdf",
+                            collection=collection,
+                            items_by_id=items_by_id,
+                        )
+                        if error:
+                            return error
                         obstacles = None
                         if any(isinstance(m, dict) and "near" in m for m in adds):
                             near_pdf, _, near_files = client.read_document_pdf(target.ID)
@@ -4013,7 +3864,7 @@ def register_write_tools():
                         )
                         return [TextContent(type="text", text=response), *images]
                     except MarkError as e:
-                        return invalid(str(e), "Fix the mark and try again.")
+                        return invalid_param(str(e), "Fix the mark and try again.")
                     except Exception as e:
                         return make_error(
                             error_type="mark_failed",
@@ -4073,22 +3924,17 @@ def register_write_tools():
                 from remarkable_mcp import pdf_ocr
                 from remarkable_mcp.pdf_marks import MarkError
 
-                def invalid(message: str, suggestion: str) -> str:
-                    return make_error(
-                        error_type="invalid_parameter", message=message, suggestion=suggestion
-                    )
-
                 if not check and (folder is not None or tags is not None):
-                    return invalid(
+                    return invalid_param(
                         "folder and tags only work with check=True.",
                         "OCR one document at a time: remarkable_pdf_ocr(document).",
                     )
                 if document is None and folder is None and tags is None:
-                    return invalid("Give a document, or folder/tags with check=True.", "")
+                    return invalid_param("Give a document, or folder/tags with check=True.", "")
                 if tags is not None and (
                     not isinstance(tags, list) or not all(isinstance(t, str) for t in tags)
                 ):
-                    return invalid("tags must be a list of tag names.", 'Example: ["Books"]')
+                    return invalid_param("tags must be a list of tag names.", 'Example: ["Books"]')
 
                 def _impl():
                     error = _require_managed_write_mode()
@@ -4102,16 +3948,18 @@ def register_write_tools():
                             return _ocr_check(
                                 client, collection, items_by_id, document, folder, tags
                             )
-                        target = _resolve_document(document, collection, items_by_id)
-                        if not target or target.is_folder:
-                            return make_error(
-                                error_type="document_not_found",
-                                message=f"PDF document not found: '{document}'",
-                                suggestion="Use remarkable_browse() to find the correct name.",
-                            )
+                        target, error = lookup(
+                            client,
+                            document,
+                            kind="pdf",
+                            collection=collection,
+                            items_by_id=items_by_id,
+                        )
+                        if error:
+                            return error
                         return _ocr_document(client, target)
                     except (MarkError, pdf_ocr.OcrError) as e:
-                        return invalid(str(e), "See the message.")
+                        return invalid_param(str(e), "See the message.")
                     except Exception as e:
                         return make_error(
                             error_type="ocr_failed",
@@ -4166,13 +4014,8 @@ def register_write_tools():
                 """
                 from remarkable_mcp.pdf_marks import MarkError
 
-                def invalid(message: str, suggestion: str) -> str:
-                    return make_error(
-                        error_type="invalid_parameter", message=message, suggestion=suggestion
-                    )
-
                 if not isinstance(insert, list) or not insert:
-                    return invalid(
+                    return invalid_param(
                         "insert must be a non-empty list of entries.",
                         'Example: insert=[{"after": 2, "blank": 1}]',
                     )
@@ -4185,13 +4028,15 @@ def register_write_tools():
                     try:
                         collection = client.get_meta_items()
                         items_by_id = get_items_by_id(collection)
-                        target = _resolve_document(document, collection, items_by_id)
-                        if not target or target.is_folder:
-                            return make_error(
-                                error_type="document_not_found",
-                                message=f"PDF document not found: '{document}'",
-                                suggestion="Use remarkable_browse() to find the correct name.",
-                            )
+                        target, error = lookup(
+                            client,
+                            document,
+                            kind="pdf",
+                            collection=collection,
+                            items_by_id=items_by_id,
+                        )
+                        if error:
+                            return error
                         edit = _pages_editor(insert, build=not dry_run)
                         if dry_run:
                             pdf, content, files = client.read_document_pdf(target.ID)
@@ -4226,7 +4071,7 @@ def register_write_tools():
                             )
                         return make_response(data, hint)
                     except (MarkError, ValueError) as e:
-                        return invalid(str(e), "Fix the insert entries and try again.")
+                        return invalid_param(str(e), "Fix the insert entries and try again.")
                     except Exception as e:
                         return make_error(
                             error_type="insert_failed",
@@ -4290,13 +4135,8 @@ def register_write_tools():
                 """
                 from remarkable_mcp.pdf_marks import MarkError
 
-                def invalid(message: str, suggestion: str) -> str:
-                    return make_error(
-                        error_type="invalid_parameter", message=message, suggestion=suggestion
-                    )
-
                 if isinstance(outline, str) and outline != "original":
-                    return invalid(
+                    return invalid_param(
                         'outline must be a list of entries, [] or "original".',
                         'Example: outline=[{"title": "Chapter 1", "page": 3}]',
                     )
@@ -4310,24 +4150,15 @@ def register_write_tools():
                     try:
                         collection = client.get_meta_items()
                         items_by_id = get_items_by_id(collection)
-                        target = _resolve_document(document, collection, items_by_id)
-                        if not target:
-                            from remarkable_mcp.extract import find_similar_documents
-
-                            similar = find_similar_documents(
-                                document, scoped_items(collection, items_by_id)
-                            )
-                            return make_error(
-                                error_type="document_not_found",
-                                message=f"Document not found: '{document}'",
-                                suggestion="Use remarkable_browse() to find the correct name.",
-                                did_you_mean=similar if similar else None,
-                            )
-                        if target.is_folder:
-                            return invalid(
-                                f"'{target.VissibleName}' is a folder.",
-                                "Give a PDF document instead.",
-                            )
+                        target, error = lookup(
+                            client,
+                            document,
+                            kind="pdf",
+                            collection=collection,
+                            items_by_id=items_by_id,
+                        )
+                        if error:
+                            return error
                         edit = _outline_editor(outline, build=writing)
                         if writing:
                             result = client.replace_document_pdf(target.ID, edit)
@@ -4338,7 +4169,7 @@ def register_write_tools():
                             result = edit(pdf, content)
                         return _outline_response(target, result, dry_run)
                     except MarkError as e:
-                        return invalid(str(e), "Fix the outline and try again.")
+                        return invalid_param(str(e), "Fix the outline and try again.")
                     except Exception as e:
                         return make_error(
                             error_type="outline_failed",
@@ -4450,19 +4281,11 @@ def register_write_tools():
                     items_by_id = get_items_by_id(collection)
 
                     # Find the document
-                    target = _resolve_document(document, collection, items_by_id)
-                    if not target:
-                        from remarkable_mcp.extract import find_similar_documents
-
-                        similar = find_similar_documents(
-                            document, scoped_items(collection, items_by_id)
-                        )
-                        return make_error(
-                            error_type="document_not_found",
-                            message=f"Document not found: '{document}'",
-                            suggestion="Use remarkable_browse() to find the correct name.",
-                            did_you_mean=similar if similar else None,
-                        )
+                    target, error = lookup(
+                        ssh_client, document, collection=collection, items_by_id=items_by_id
+                    )
+                    if error:
+                        return error
 
                     doc_path = display_path(target, items_by_id)
 

@@ -32,3 +32,19 @@ def make_error(
     if did_you_mean:
         error["_error"]["did_you_mean"] = did_you_mean
     return json.dumps(error, indent=2, cls=DateTimeEncoder)
+
+
+def invalid_param(message: str, suggestion: str) -> str:
+    """An ``invalid_parameter`` error; ``message`` names the parameter."""
+    return make_error("invalid_parameter", message, suggestion)
+
+
+def is_error_response(text: str) -> bool:
+    """Whether a tool's JSON text reply is an error (has an ``_error`` key)."""
+    if not text.lstrip().startswith("{"):
+        return False
+    try:
+        data = json.loads(text)
+    except ValueError:
+        return False
+    return isinstance(data, dict) and "_error" in data

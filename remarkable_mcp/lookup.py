@@ -12,9 +12,11 @@ the same way to reads and writes:
   is set
 """
 
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
-from remarkable_mcp.api import TRASH_PARENT_ID, get_item_path
+from remarkable_mcp.api import TRASH_PARENT_ID, get_file_type, get_item_path, get_items_by_id
+from remarkable_mcp.extract import find_similar_documents
+from remarkable_mcp.responses import invalid_param, make_error
 from remarkable_mcp.roots import get_root, is_under_root, to_library_path, to_root_relative
 
 
@@ -152,3 +154,92 @@ def folder_paths(collection, items_by_id: dict) -> List[str]:
     return [
         display_path(item, items_by_id) for item in scoped_items(collection, items_by_id, "folder")
     ]
+
+
+def _search_hint(document: str) -> str:
+    words = document.strip("/").split("/")[-1].split()
+    term = words[0] if words else "notes"
+    return (
+        f"Try remarkable_browse(query='{term}') to search names, "
+        "or remarkable_browse('/') to list the library."
+    )
+
+
+def lookup(
+    client,
+    document: str,
+    *,
+    kind: str = "any",
+    collection=None,
+    items_by_id: Optional[dict] = None,
+    include_trash: bool = False,
+    param: str = "document",
+    note: str = "",
+) -> Tuple[object, Optional[str]]:
+    """``(target, None)`` for the item named ``document``, or ``(None, error)``.
+
+    ``kind`` is "any" (document or folder), "document" or "pdf". A folder
+    given where a document is expected, or a notebook or EPUB where a PDF is
+    expected, is an ``invalid_parameter`` error; a missing item is
+    ``document_not_found`` with ``did_you_mean`` names from inside the root.
+    ``note`` is appended to every suggestion (e.g. "Nothing was changed.").
+    ``collection`` and ``items_by_id`` are read from ``client`` when omitted.
+    """
+    if collection is None:
+        collection = client.get_meta_items()
+    if items_by_id is None:
+        items_by_id = get_items_by_id(collection)
+    tail = f" {note}" if note else ""
+    wanted = "any" if kind == "any" else "document"
+    target = find_item(document, collection, items_by_id, wanted, include_trash)
+    if target is None and wanted == "document":
+        folder = find_item(document, collection, items_by_id, "folder")
+        if folder is not None:
+            what = "a PDF document" if kind == "pdf" else "a document"
+            listing = f"remarkable_browse('{display_path(folder, items_by_id)}')"
+            return None, invalid_param(
+                f"{param}: '{folder.VissibleName}' is a folder, not {what}.",
+                f"Name a document inside it; {listing} lists them.{tail}",
+            )
+    if target is None:
+        similar = find_similar_documents(document, scoped_items(collection, items_by_id, wanted))
+        return None, make_error(
+            error_type="document_not_found",
+            message=f"Document not found: '{document}'",
+            suggestion=_search_hint(document) + tail,
+            did_you_mean=similar or None,
+        )
+    if kind == "pdf":
+        try:
+            file_type = get_file_type(client, target)
+        except Exception:
+            file_type = None
+        if file_type in ("notebook", "epub"):
+            what = "an EPUB" if file_type == "epub" else "a notebook"
+            return None, invalid_param(
+                f"{param}: '{target.VissibleName}' is {what}, not a PDF.",
+                f"This tool works on PDF documents only.{tail}",
+            )
+    return target, None
+
+
+def lookup_folder(
+    path: Optional[str],
+    collection,
+    items_by_id: dict,
+    *,
+    param: str = "folder",
+    note: str = "",
+) -> Tuple[Optional[str], Optional[str]]:
+    """``(folder_id, None)`` for the folder at root-relative ``path`` (``""``
+    is the library root), or ``(None, error)``."""
+    folder_id = find_folder_id(path, collection, items_by_id)
+    if folder_id is not None:
+        return folder_id, None
+    tail = f" {note}" if note else ""
+    return None, make_error(
+        error_type="folder_not_found",
+        message=f"{param}: folder not found: '{path}'",
+        suggestion=f"Use remarkable_browse('/') to see available folders.{tail}",
+        did_you_mean=folder_paths(collection, items_by_id)[:10] or None,
+    )

@@ -53,7 +53,6 @@ from remarkable_mcp.extract import (
     extract_text_from_document_zip,
     extract_text_from_epub,
     extract_text_from_pdf,
-    find_similar_documents,
     get_background_color,
     get_cached_ocr_result,
     get_document_file_type,
@@ -66,7 +65,7 @@ from remarkable_mcp.extract import (
     render_page_full_page_from_document_zip,
     render_tablet_pdf_page_to_png,
 )
-from remarkable_mcp.lookup import find_item
+from remarkable_mcp.lookup import find_item, lookup
 from remarkable_mcp.lookup import is_cloud_archived as _is_cloud_archived
 from remarkable_mcp.pages import tablet_page
 from remarkable_mcp.pdf_marks import (
@@ -76,7 +75,7 @@ from remarkable_mcp.pdf_marks import (
     stored_marks,
 )
 from remarkable_mcp.pdf_ocr import pages_needing_ocr
-from remarkable_mcp.responses import make_error, make_response
+from remarkable_mcp.responses import invalid_param, make_error, make_response
 from remarkable_mcp.roots import get_root as _get_root_path
 from remarkable_mcp.roots import is_under_root as _is_within_root
 from remarkable_mcp.roots import to_library_path as _resolve_root_path
@@ -355,30 +354,11 @@ async def remarkable_read(
         # Internal page size for PDF/EPUB character-based pagination
         page_size = DEFAULT_PAGE_SIZE
 
-        root = _get_root_path()
-        documents = [
-            item
-            for item in collection
-            if not item.is_folder and not _is_cloud_archived(item, items_by_id)
-        ]
-        target_doc = _find_target_document(collection, items_by_id, document)
-
-        if not target_doc:
-            # Find similar documents for suggestion (only within root)
-            filtered_docs = [
-                doc for doc in documents if _is_within_root(get_item_path(doc, items_by_id), root)
-            ]
-            similar = find_similar_documents(document, filtered_docs)
-            search_term = document.split()[0] if document else "notes"
-            return make_error(
-                error_type="document_not_found",
-                message=f"Document not found: '{document}'",
-                suggestion=(
-                    f"Try remarkable_browse(query='{search_term}') to search, "
-                    "or remarkable_browse('/') to list all files."
-                ),
-                did_you_mean=similar if similar else None,
-            )
+        target_doc, error = lookup(
+            client, document, kind="document", collection=collection, items_by_id=items_by_id
+        )
+        if error:
+            return error
 
         doc_path = get_item_path(target_doc, items_by_id)
         file_type = await run_blocking(get_file_type, client, target_doc)
@@ -709,10 +689,9 @@ async def remarkable_read(
                             )
                     grep_matches = len(pattern.findall(page_content))
                 except re.error as e:
-                    return make_error(
-                        error_type="invalid_grep",
-                        message=f"Invalid regex pattern: {e}",
-                        suggestion="Use a valid regex pattern or simple text string.",
+                    return invalid_param(
+                        f"grep: invalid regex pattern: {e}",
+                        "Use a valid regex pattern or simple text string.",
                     )
 
             result = {
@@ -793,10 +772,9 @@ async def remarkable_read(
                     full_text = ""
                     total_chars = 0
             except re.error as e:
-                return make_error(
-                    error_type="invalid_grep",
-                    message=f"Invalid regex pattern: {e}",
-                    suggestion="Use a valid regex pattern or simple text string.",
+                return invalid_param(
+                    f"grep: invalid regex pattern: {e}",
+                    "Use a valid regex pattern or simple text string.",
                 )
 
         # Apply pagination
@@ -2013,58 +1991,35 @@ async def remarkable_image(
         collection = await run_blocking(client.get_meta_items)
         items_by_id = get_items_by_id(collection)
 
-        root = _get_root_path()
-        documents = [
-            item
-            for item in collection
-            if not item.is_folder and not _is_cloud_archived(item, items_by_id)
-        ]
-        target_doc = _find_target_document(collection, items_by_id, document)
-
-        if not target_doc:
-            # Find similar documents for suggestion (only within root)
-            filtered_docs = [
-                doc for doc in documents if _is_within_root(get_item_path(doc, items_by_id), root)
-            ]
-            similar = find_similar_documents(document, filtered_docs)
-            search_term = document.split()[0] if document else "notes"
-            return make_error(
-                error_type="document_not_found",
-                message=f"Document not found: '{document}'",
-                suggestion=(
-                    f"Try remarkable_browse(query='{search_term}') to search, "
-                    "or remarkable_browse('/') to list all files."
-                ),
-                did_you_mean=similar if similar else None,
-            )
+        target_doc, error = lookup(
+            client, document, kind="document", collection=collection, items_by_id=items_by_id
+        )
+        if error:
+            return error
 
         format_lower = output_format.lower()
         if format_lower not in ("png", "svg"):
-            return make_error(
-                error_type="invalid_format",
-                message=f"Invalid format: '{output_format}'. Supported formats: png, svg",
-                suggestion="Use output_format='png' for raster or 'svg' for vectors.",
+            return invalid_param(
+                f"output_format: invalid format '{output_format}'. Supported formats: png, svg",
+                "Use output_format='png' for raster or 'svg' for vectors.",
             )
 
         if (dpi is not None or region is not None) and format_lower != "png":
-            return make_error(
-                error_type="invalid_parameter",
-                message="dpi and region apply to PNG output only.",
-                suggestion="Use output_format='png' with dpi or region.",
+            return invalid_param(
+                "dpi and region apply to PNG output only.",
+                "Use output_format='png' with dpi or region.",
             )
         if dpi is not None and not (MIN_IMAGE_DPI <= dpi <= MAX_IMAGE_DPI):
-            return make_error(
-                error_type="invalid_parameter",
-                message=f"dpi must be between {MIN_IMAGE_DPI} and {MAX_IMAGE_DPI}.",
-                suggestion="Use dpi=300 to read handwriting; add region to keep images small.",
+            return invalid_param(
+                f"dpi must be between {MIN_IMAGE_DPI} and {MAX_IMAGE_DPI}.",
+                "Use dpi=300 to read handwriting; add region to keep images small.",
             )
         if region is not None:
             region_error = _image_region_error(region)
             if region_error:
-                return make_error(
-                    error_type="invalid_parameter",
-                    message=region_error,
-                    suggestion="Example: region=[0, 0.5, 1, 0.75] for the third quarter.",
+                return invalid_param(
+                    region_error,
+                    "Example: region=[0, 0.5, 1, 0.75] for the third quarter.",
                 )
 
         raw_doc = await run_blocking(client.download, target_doc)
@@ -2409,8 +2364,9 @@ def _select_pages(ranges: List[tuple], page_count: int) -> List[int]:
         first, last = out_of_range[0]
         label = f"{first}" if first == last else f"{first}-{last}"
         raise _ExportRequestError(
-            "invalid_page_selection",
-            f"Page selection {label} is outside the document, which has {page_count} page(s).",
+            "invalid_parameter",
+            f"pages: page selection {label} is outside the document, which has "
+            f"{page_count} page(s).",
             f"Choose pages between 1 and {page_count}.",
         )
     return sorted({page for first, last in ranges for page in range(first, last + 1)})
@@ -2988,29 +2944,28 @@ async def _remarkable_export_many(
 ):
     """remarkable_export for a folder and/or tags."""
 
-    def invalid(message: str, suggestion: str):
-        return make_error(
-            error_type="invalid_export_options", message=message, suggestion=suggestion
-        )
-
     if document is not None:
-        return invalid(
-            "Give document, or folder and/or tags, not both.",
+        return invalid_param(
+            "document: give document, or folder and/or tags, not both.",
             "Omit document to export a folder or tagged documents.",
         )
     if pages is not None:
-        return invalid("pages applies to one document only.", "Omit pages.")
+        return invalid_param("pages applies to one document only.", "Omit pages.")
     if output_format == "markdown" and pdf_mode != "merged":
-        return invalid("pdf_mode applies only to PDF exports.", "Use pdf_mode='merged'.")
+        return invalid_param("pdf_mode applies only to PDF exports.", "Use pdf_mode='merged'.")
     if output_format == "pdf" and include_ocr:
-        return invalid("include_ocr applies only to Markdown exports.", "Set include_ocr=False.")
+        return invalid_param(
+            "include_ocr applies only to Markdown exports.", "Set include_ocr=False."
+        )
     if tags is not None and (
         not isinstance(tags, list) or not tags or not all(isinstance(t, str) for t in tags)
     ):
-        return invalid("tags must be a non-empty list of tag names.", 'Example: tags=["Graded"]')
+        return invalid_param(
+            "tags must be a non-empty list of tag names.", 'Example: tags=["Graded"]'
+        )
     if save_to is None:
-        return invalid(
-            "Exporting several documents needs save_to, a folder to save them in.",
+        return invalid_param(
+            "save_to: exporting several documents needs a folder to save them in.",
             "Pass save_to as a folder inside REMARKABLE_EXPORT_DIRS.",
         )
     try:
@@ -3027,8 +2982,9 @@ async def _remarkable_export_many(
             "No documents matched; nothing was exported.",
         )
     if len(documents) > MAX_BATCH_EXPORTS:
-        return invalid(
-            f"{len(documents)} documents match; at most {MAX_BATCH_EXPORTS} are exported at once.",
+        return invalid_param(
+            f"folder/tags: {len(documents)} documents match; at most {MAX_BATCH_EXPORTS}"
+            " are exported at once.",
             "Narrow the export with a subfolder or tags.",
         )
     result = await run_blocking(
@@ -3144,46 +3100,40 @@ async def remarkable_export(
             document, output_format, pdf_mode, include_ocr, pages, save_to, overwrite, folder, tags
         )
     if not isinstance(document, str) or not document.strip():
-        return make_error(
-            error_type="invalid_export_options",
-            message="Give document, or folder and/or tags to export several.",
-            suggestion="Example: remarkable_export('Meeting Notes').",
+        return invalid_param(
+            "document: give a document, or folder and/or tags to export several.",
+            "Example: remarkable_export('Meeting Notes').",
         )
     if output_format == "markdown" and pdf_mode != "merged":
-        return make_error(
-            error_type="invalid_export_options",
-            message="pdf_mode applies only to PDF exports.",
-            suggestion="Use pdf_mode='merged' for Markdown, or choose output_format='pdf'.",
+        return invalid_param(
+            "pdf_mode applies only to PDF exports.",
+            "Use pdf_mode='merged' for Markdown, or choose output_format='pdf'.",
         )
     if output_format == "pdf" and include_ocr:
-        return make_error(
-            error_type="invalid_export_options",
-            message="include_ocr applies only to Markdown exports.",
-            suggestion="Set include_ocr=False, or choose output_format='markdown'.",
+        return invalid_param(
+            "include_ocr applies only to Markdown exports.",
+            "Set include_ocr=False, or choose output_format='markdown'.",
         )
     page_ranges = None
     if pages is not None:
         if output_format != "pdf":
-            return make_error(
-                error_type="invalid_export_options",
-                message="pages applies only to PDF exports.",
-                suggestion="Omit pages for Markdown, or choose output_format='pdf'.",
+            return invalid_param(
+                "pages applies only to PDF exports.",
+                "Omit pages for Markdown, or choose output_format='pdf'.",
             )
         try:
             page_ranges = _parse_page_spec(pages)
         except ValueError as exc:
-            return make_error(
-                error_type="invalid_page_selection",
-                message=str(exc),
-                suggestion="Examples: pages=5, pages='5-9', pages='1,3,10-12'.",
+            return invalid_param(
+                f"pages: {exc}",
+                "Examples: pages=5, pages='5-9', pages='1,3,10-12'.",
             )
 
     save_path = None
     if overwrite and save_to is None:
-        return make_error(
-            error_type="invalid_export_options",
-            message="overwrite applies only with save_to.",
-            suggestion="Pass save_to with the path to save at, or omit overwrite.",
+        return invalid_param(
+            "overwrite applies only with save_to.",
+            "Pass save_to with the path to save at, or omit overwrite.",
         )
     if save_to is not None:
         try:
@@ -3197,23 +3147,11 @@ async def remarkable_export(
         client = await run_blocking(get_rmapi)
         collection = await run_blocking(client.get_meta_items)
         items_by_id = get_items_by_id(collection)
-        target_doc = _find_target_document(collection, items_by_id, document)
-        if target_doc is None:
-            root = _get_root_path()
-            candidates = [
-                item
-                for item in collection
-                if not item.is_folder
-                and not _is_cloud_archived(item, items_by_id)
-                and _is_within_root(get_item_path(item, items_by_id), root)
-            ]
-            similar = find_similar_documents(document, candidates)
-            return make_error(
-                error_type="document_not_found",
-                message=f"Document not found: '{document}'",
-                suggestion="Use remarkable_browse() to find the exact document name or path.",
-                did_you_mean=similar if similar else None,
-            )
+        target_doc, error = lookup(
+            client, document, kind="document", collection=collection, items_by_id=items_by_id
+        )
+        if error:
+            return error
 
         if save_path is not None and overwrite:
             await run_blocking(export_save.check_replace, save_path, target_doc.ID)

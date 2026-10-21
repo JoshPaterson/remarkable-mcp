@@ -3449,52 +3449,61 @@ class TestWriteTargetResolutionSkipsTrash:
         return [trashed, trashed_folder, user_trash_notes, live, live_folder, user_trash]
 
     def test_name_lookup_prefers_live_item(self):
-        from remarkable_mcp.write_tools import _resolve_document
+        from remarkable_mcp.lookup import find_item
 
         trashed = self._item("Notes", "trashed-notes", parent="trash")
         live = self._item("Notes", "live-notes")
         collection = [trashed, live]
-        target = _resolve_document("Notes", collection, get_items_by_id(collection))
+        target = find_item("Notes", collection, get_items_by_id(collection), include_trash=True)
         assert target.ID == "live-notes"
 
     def test_name_lookup_ignores_trash_only_match(self):
-        from remarkable_mcp.write_tools import _resolve_document
+        from remarkable_mcp.lookup import find_item
 
         trashed = self._item("Morning Pages", "trashed", parent="trash")
-        assert _resolve_document("Morning Pages", [trashed], {trashed.ID: trashed}) is None
+        assert (
+            find_item("Morning Pages", [trashed], {trashed.ID: trashed}, include_trash=True) is None
+        )
 
     def test_explicit_trash_path_still_reaches_trashed_item(self):
         """SSH permanent delete needs to address items already in the trash."""
-        from remarkable_mcp.write_tools import _resolve_document
+        from remarkable_mcp.lookup import find_item
 
         trashed = self._item("Morning Pages", "trashed", parent="trash")
-        target = _resolve_document("/trash/Morning Pages", [trashed], {trashed.ID: trashed})
+        target = find_item(
+            "/trash/Morning Pages", [trashed], {trashed.ID: trashed}, include_trash=True
+        )
         assert target is trashed
 
     def test_relative_trash_path_does_not_reach_trashed_item(self):
-        from remarkable_mcp.write_tools import _resolve_document
+        from remarkable_mcp.lookup import find_item
 
         trashed = self._item("Morning Pages", "trashed", parent="trash")
-        assert _resolve_document("trash/Morning Pages", [trashed], {trashed.ID: trashed}) is None
+        assert (
+            find_item("trash/Morning Pages", [trashed], {trashed.ID: trashed}, include_trash=True)
+            is None
+        )
 
     def test_user_folder_named_trash_wins_over_trashed_item(self):
-        from remarkable_mcp.write_tools import _resolve_document
+        from remarkable_mcp.lookup import find_item
 
         collection = self._collection()
-        target = _resolve_document("/trash/Notes", collection, get_items_by_id(collection))
+        target = find_item(
+            "/trash/Notes", collection, get_items_by_id(collection), include_trash=True
+        )
         assert target.ID == "user-trash-notes"
 
     def test_parent_resolution_never_picks_trashed_folder(self):
-        from remarkable_mcp.write_tools import _resolve_parent_id
+        from remarkable_mcp.lookup import find_folder_id
 
         collection = self._collection()
         items_by_id = get_items_by_id(collection)
-        assert _resolve_parent_id("/Archive", items_by_id, collection) == "live-archive"
+        assert find_folder_id("/Archive", collection, items_by_id) == "live-archive"
 
         trashed_folder = self._item("Old", "trashed-old", parent="trash", is_folder=True)
         only_trashed = [trashed_folder]
         by_id = get_items_by_id(only_trashed)
-        assert _resolve_parent_id("/trash/Old", by_id, only_trashed) is None
+        assert find_folder_id("/trash/Old", only_trashed, by_id) is None
 
 
 class TestMarkdownPDFWriteback:

@@ -13,8 +13,10 @@ from urllib.parse import quote, unquote
 from mcp.server import MCPServer
 from mcp.server.mcpserver import Context
 from mcp.server.transport_security import TransportSecuritySettings
+from mcp.types import TextContent
 
 from remarkable_mcp import ocr
+from remarkable_mcp.responses import is_error_response
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +64,23 @@ class RemarkableMCP(MCPServer):
             logger.debug(f"Normalized resource URI path: {path} -> {encoded_path}")
 
         return await super().read_resource(uri_str, context)
+
+    async def call_tool(self, name, arguments, context: Context | None = None):
+        """Call a tool; a reply whose first text block is a JSON ``_error``
+        object is returned with ``isError`` set, its body unchanged."""
+        result = await super().call_tool(name, arguments, context)
+        return mark_tool_error(result)
+
+
+def mark_tool_error(result):
+    """``result`` with ``is_error`` set when its first block is an error reply."""
+    content = getattr(result, "content", None)
+    if not content or getattr(result, "is_error", True):
+        return result
+    first = content[0]
+    if isinstance(first, TextContent) and is_error_response(first.text):
+        return result.model_copy(update={"is_error": True})
+    return result
 
 
 def _build_instructions() -> str:

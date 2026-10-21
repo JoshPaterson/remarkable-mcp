@@ -659,7 +659,6 @@ async def _render_canvas_page_impl(document: str, page: int, ctx: Optional[Conte
     )
     from remarkable_mcp.concurrency import run_blocking
     from remarkable_mcp.extract import (
-        find_similar_documents,
         get_background_color,
         get_document_file_type,
         get_document_page_count,
@@ -667,13 +666,10 @@ async def _render_canvas_page_impl(document: str, page: int, ctx: Optional[Conte
         render_page_full_page_from_document_zip,
         render_tablet_pdf_page_to_png,
     )
+    from remarkable_mcp.lookup import lookup
     from remarkable_mcp.responses import make_error
     from remarkable_mcp.tools import (
         _apply_root_filter,
-        _find_target_document,
-        _get_root_path,
-        _is_cloud_archived,
-        _is_within_root,
     )
 
     background = await run_blocking(get_background_color)
@@ -681,29 +677,11 @@ async def _render_canvas_page_impl(document: str, page: int, ctx: Optional[Conte
     collection = await run_blocking(client.get_meta_items)
     items_by_id = get_items_by_id(collection)
 
-    root = _get_root_path()
-    documents = [
-        item
-        for item in collection
-        if not item.is_folder and not _is_cloud_archived(item, items_by_id)
-    ]
-    target_doc = _find_target_document(collection, items_by_id, document)
-
-    if not target_doc:
-        filtered_docs = [
-            doc for doc in documents if _is_within_root(get_item_path(doc, items_by_id), root)
-        ]
-        similar = find_similar_documents(document, filtered_docs)
-        search_term = document.split()[0] if document else "notes"
-        return make_error(
-            error_type="document_not_found",
-            message=f"Document not found: '{document}'",
-            suggestion=(
-                f"Try remarkable_browse(query='{search_term}') to search, "
-                "or remarkable_browse('/') to list all files."
-            ),
-            did_you_mean=similar if similar else None,
-        )
+    target_doc, error = lookup(
+        client, document, kind="document", collection=collection, items_by_id=items_by_id
+    )
+    if error:
+        return error
 
     raw_doc = await run_blocking(client.download, target_doc)
     with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as tmp:

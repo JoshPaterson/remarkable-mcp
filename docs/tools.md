@@ -731,7 +731,8 @@ storage is required.
 
 ## Error Handling
 
-All tools return structured errors with suggestions:
+All tools return structured errors with suggestions. An error reply sets the
+MCP `isError` flag on the tool result; its text is the JSON object below:
 
 ```json
 {
@@ -745,6 +746,12 @@ All tools return structured errors with suggestions:
 ```
 
 Common error types:
-- `document_not_found`: document does not exist (includes suggestions)
+- `document_not_found`: document does not exist (includes `did_you_mean`
+  suggestions from inside the configured root)
+- `folder_not_found`: a folder parameter names no folder (`did_you_mean`
+  lists folders)
+- `invalid_parameter`: a parameter is wrong; the message starts with the
+  parameter name, e.g. `pages: ...` or `document: 'Course' is a folder, not a
+  PDF document.` (also used for a notebook or EPUB given to a PDF-only tool)
 - `authentication_failed`: token invalid or SSH connection failed
 - `connection_error`: network or SSH connection issue

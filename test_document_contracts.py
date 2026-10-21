@@ -291,9 +291,8 @@ class TestLiveDocumentLookup:
 
         with (
             patch.object(tools, "get_rmapi", return_value=client),
-            patch.object(
-                tools,
-                "find_similar_documents",
+            patch(
+                "remarkable_mcp.lookup.find_similar_documents",
                 return_value=["Meeting Notes Live"],
             ) as find_similar,
         ):
@@ -858,7 +857,7 @@ class TestCanvasArchivedLookup:
             candidates.extend(documents)
             return ["Meeting notes live"]
 
-        monkeypatch.setattr(extract, "find_similar_documents", find_similar)
+        monkeypatch.setattr("remarkable_mcp.lookup.find_similar_documents", find_similar)
 
         result = await _render_canvas_page("Meting notes", 1, None)
 
