@@ -4747,6 +4747,54 @@ class TestSSHCacheConcurrency:
             assert upload.result(timeout=2) is None
 
 
+class TestSSHSingleFileType:
+    def test_single_file_type_is_cached_until_invalidated(self):
+        from remarkable_mcp.ssh import Document, SSHClient
+        from remarkable_mcp.write_tools import _invalidate_client_cache
+
+        client = SSHClient()
+        reads = []
+
+        def fake_download(remote_path, timeout=60):
+            reads.append(remote_path)
+            return b'{"fileType": "pdf"}'
+
+        client._scp_download = fake_download
+        doc = Document(id="doc-1", hash="doc-1", name="One", doc_type="DocumentType")
+        try:
+            assert client.get_file_type(doc) == "pdf"
+            assert client.get_file_type(doc) == "pdf"
+            assert len(reads) == 1
+            # The batch cache stays unset, so a full preload is still complete.
+            assert client._file_type_cache is None
+
+            _invalidate_client_cache(client)
+            assert client.get_file_type(doc) == "pdf"
+            assert len(reads) == 2
+        finally:
+            client.close()
+
+    def test_failed_single_file_type_read_is_not_cached(self):
+        from remarkable_mcp.ssh import Document, SSHClient
+
+        client = SSHClient()
+        reads = []
+
+        def fake_download(remote_path, timeout=60):
+            reads.append(remote_path)
+            if len(reads) == 1:
+                raise RuntimeError("transient")
+            return b'{"fileType": "epub"}'
+
+        client._scp_download = fake_download
+        doc = Document(id="doc-1", hash="doc-1", name="One", doc_type="DocumentType")
+        try:
+            assert client.get_file_type(doc) is None
+            assert client.get_file_type(doc) == "epub"
+        finally:
+            client.close()
+
+
 class TestSSHDownload:
     XOCHITL = "/home/root/.local/share/remarkable/xochitl"
 

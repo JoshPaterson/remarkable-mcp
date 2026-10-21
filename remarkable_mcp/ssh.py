@@ -195,6 +195,9 @@ class SSHClient:
         self._metadata_lock = threading.RLock()
         self._file_type_lock = threading.RLock()
         self._file_type_cache: Optional[dict[str, Optional[str]]] = None
+        # Per-document file types read outside the batch preload, keyed by
+        # doc id with the _file_type_generation they were read under.
+        self._single_file_types: dict[str, tuple[int, str]] = {}
         self._metadata_generation = 0
         self._file_type_generation = 0
         self._dispatcher = SSHDispatcher()
@@ -407,9 +410,8 @@ class SSHClient:
                 if self._file_type_cache is not None:
                     return func(*args, **kwargs)
         elif name == "get_file_type" and args:
-            with self._file_type_lock:
-                if self._file_type_cache is not None and args[0].id in self._file_type_cache:
-                    return func(*args, **kwargs)
+            if self._cached_file_type(args[0].id)[0]:
+                return func(*args, **kwargs)
         return await self.run_operation_async(
             name.replace("_", "-"),
             lambda: func(*args, **kwargs),
@@ -955,22 +957,40 @@ class SSHClient:
 
         Returns the extension without dot, or None if not a file-based document.
         """
-        with self._file_type_lock:
-            if self._file_type_cache is not None and doc.id in self._file_type_cache:
-                return self._file_type_cache[doc.id]
+        found, file_type = self._cached_file_type(doc.id)
+        if found:
+            return file_type
         return self.run_operation("file-type-read", lambda: self._load_file_type(doc))
 
-    def _load_file_type(self, doc: Document) -> Optional[str]:
+    def _cached_file_type(self, doc_id: str) -> tuple[bool, Optional[str]]:
+        """``(found, file_type)`` from the batch or per-document cache."""
         with self._file_type_lock:
-            if self._file_type_cache is not None and doc.id in self._file_type_cache:
-                return self._file_type_cache[doc.id]
-            content_file = f"{XOCHITL_PATH}/{doc.id}.content"
+            if self._file_type_cache is not None and doc_id in self._file_type_cache:
+                return True, self._file_type_cache[doc_id]
+            single = self._single_file_types.get(doc_id)
+            if single is not None and single[0] == self._file_type_generation:
+                return True, single[1]
+        return False, None
+
+    def _load_file_type(self, doc: Document) -> Optional[str]:
+        found, file_type = self._cached_file_type(doc.id)
+        if found:
+            return file_type
+        with self._file_type_lock:
+            generation = self._file_type_generation
+        content_file = f"{XOCHITL_PATH}/{doc.id}.content"
         try:
             content = self._scp_download(content_file, timeout=10)
             data = json.loads(content.decode("utf-8"))
-            return data.get("fileType")
+            file_type = data.get("fileType")
         except Exception:
             return None
+        # Only a definite type is cached: a failed read or a missing field
+        # may be transient and is retried on the next call.
+        if isinstance(file_type, str) and file_type:
+            with self._file_type_lock:
+                self._single_file_types[doc.id] = (generation, file_type)
+        return file_type
 
     def get_all_file_types(self) -> dict[str, Optional[str]]:
         """
