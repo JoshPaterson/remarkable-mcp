@@ -128,13 +128,15 @@ async def test_root_path_and_trash_filter_registration(registry, client, monkeyp
 async def test_text_resource_falls_back_to_ocr_and_reports_errors(registry):
     client = Mock()
     client.download.return_value = _notebook(text="")
-    resources._register_document(
-        client, _doc("nb-ocr", "Sketch"), file_types={"nb-ocr": "notebook"}
-    )
-    with patch(
-        "remarkable_mcp.extract.extract_handwriting_ocr", return_value=(["handwritten words"], "x")
-    ):
-        assert "handwritten words" in await _read("remarkable:///Sketch.txt")
+    empty = {"typed_text": [], "highlights": [], "pages": 1, "handwritten_text": None}
+    ocr = dict(empty, handwritten_text=["handwritten words"])
+    extract = Mock(side_effect=[empty, ocr])
+    with patch("remarkable_mcp.extract.extract_text_from_document_zip", extract):
+        resources._register_document(
+            client, _doc("nb-ocr", "Sketch"), file_types={"nb-ocr": "notebook"}
+        )
+    assert "handwritten words" in await _read("remarkable:///Sketch.txt")
+    assert [c.kwargs["include_ocr"] for c in extract.call_args_list] == [False, True]
     client.download.side_effect = RuntimeError("offline")
     assert (await _read("remarkable:///Sketch.txt")).startswith("Error: offline")
 
