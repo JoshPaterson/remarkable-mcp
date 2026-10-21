@@ -2818,7 +2818,8 @@ def page_ink_regions(tmpdir_path: Path, page: int) -> List[List[float]]:
     Each box is ``[left, top, right, bottom]`` in the frame of
     ``remarkable_image``'s ``region``, around strokes on visible layers that
     lie close together (roughly a word or a line of writing). Strokes the MCP
-    wrote (covers over marks) are left out. Empty when the page has no ink.
+    wrote (covers, erasable marks) are left out. Empty when the page has no
+    ink.
     """
     from remarkable_mcp.cover_layers import known_author_uuid
 
@@ -2845,10 +2846,13 @@ def page_ink_regions(tmpdir_path: Path, page: int) -> List[List[float]]:
     for layer in _scene_layers(tree, blocks):
         if not layer["visible"]:
             continue
-        ours = set()
-        if own is not None and getattr(layer["group"].node_id, "part1", None) == own:
-            children = layer["group"].children
-            ours = {id(v) for k, v in children.items() if getattr(k, "part1", None) == own}
+        # The MCP's own strokes (covers, erasable marks) are marks, not the
+        # user's ink, on whatever layer they are.
+        ours = (
+            {id(v) for k, v in layer["group"].children.items() if getattr(k, "part1", None) == own}
+            if own is not None
+            else set()
+        )
         for item, node_id in _scene_items(layer["group"]):
             if id(item) in ours:
                 continue
