@@ -541,6 +541,42 @@ class PageWriter:
         self._layer_list = _layers(self._blocks)
         return key(layer)
 
+    def set_layer_visible(self, layer: Id, shown: bool) -> bool:
+        """Show or hide ``layer``; False (and nothing written) when it is
+        already in that state.
+
+        The layer's tree node block is rewritten in place, as the tablet does
+        when the user toggles a layer: its ``visible`` value is stamped with
+        the MCP's author and the page's next counter, newer than every id and
+        timestamp in the page. The block keeps its header versions and every
+        other field.
+        """
+        from rmscene.scene_stream import TreeNodeBlock
+        from rmscene.tagged_block_common import CrdtId, LwwValue
+
+        current = next((entry for entry in self._layer_list if entry["id"] == layer), None)
+        if current is None:
+            raise InkError(f"The page has no layer {list(layer)}.")
+        if current["visible"] == bool(shown):
+            return False
+        number = self._ensure_author()
+        stamp = CrdtId(number, self._take(1))
+        parts, rewritten = [_header()], False
+        for btype, raw in raw_blocks(self.data):
+            block = _parse_one(raw) if btype == NODE_BLOCK else None
+            if isinstance(block, TreeNodeBlock) and key(block.group.node_id) == layer:
+                group = dataclasses.replace(block.group, visible=LwwValue(stamp, bool(shown)))
+                new = encode([dataclasses.replace(block, group=group)])
+                raw = new[:4] + raw[4:8] + new[8:]
+                rewritten = True
+            parts.append(raw)
+        if not rewritten:
+            raise InkError(f"The page has no node block for layer {list(layer)}.")
+        self.data = b"".join(parts)
+        self._blocks = parse(self.data)
+        self._layer_list = _layers(self._blocks)
+        return True
+
     def ink_layer(self, name: Optional[str]) -> Id:
         """The layer to put erasable ink or highlights on: the layer named
         ``name`` (made on top if the page has none), else the selected layer,

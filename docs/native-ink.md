@@ -105,6 +105,15 @@ cloud (2026-10-19):
 - **Concurrent edit.** A cover layer added while the tablet drew offline
   merged: both kept.
 
+## Showing and hiding layers
+
+When the user hides a layer, the tablet rewrites that layer's `TreeNodeBlock`
+in place with `visible=LwwValue((n, c), False)`: its own author number and the
+page's next counter (fixtures/tablet/layers_and_tags has such a layer).
+`remarkable_layers` does the same under the MCP's author: it re-encodes only
+that block, keeping its header version bytes, with `visible` stamped
+`(mcp, next counter)`, newer than every id and timestamp in the page.
+
 ## Text highlights (verified)
 
 The tablet's text highlights (made by selecting PDF text with the

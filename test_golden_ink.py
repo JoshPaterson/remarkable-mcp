@@ -165,3 +165,39 @@ def test_tablet_keeps_the_mcp_author_and_tombstones():
         b for b in read_blocks(io.BytesIO(erased)) if type(b).__name__ == "SceneLineItemBlock"
     ]
     assert any(b.item.value is None for b in blocks)
+
+
+def _layer_hidden():
+    """The tablet's page with the MCP's cover layer shown, and that page with
+    the layer hidden."""
+    tablet = _read("tablet_page_with_cover.rm")
+    writer = rm_ink.PageWriter(tablet, AUTHOR)
+    assert writer.set_layer_visible(writer.find_layer("Mark cover"), False)
+    return tablet, writer.data
+
+
+def test_layer_toggle_matches_its_golden_output():
+    _check_golden("layer_hidden.rm", _layer_hidden()[1])
+
+
+def test_layer_toggle_keeps_the_tablets_blocks():
+    """Only the layer's node block changes, and it keeps its header bytes;
+    the tablet's node blocks re-encode with the same body."""
+    tablet, hidden = _layer_hidden()
+    before, after = _raw_blocks(tablet), _raw_blocks(hidden)
+    assert [t for t, _ in before] == [t for t, _ in after]
+    changed = [(old, new) for (_, old), (_, new) in zip(before, after) if old != new]
+    assert len(changed) == 1
+    old, new = changed[0]
+    assert old[7] == 0x02 and new[4:8] == old[4:8]
+    for btype, raw in before:
+        if btype != 0x02:
+            continue
+        (block,) = read_blocks(io.BytesIO(HEADER_V6 + raw))
+        buf = io.BytesIO()
+        write_blocks(buf, [block], options={"version": "3.1"})
+        assert buf.getvalue()[len(HEADER_V6) + 8 :] == raw[8:]
+    assert [(layer["name"], layer["visible"]) for layer in rm_ink.page_layers(hidden)] == [
+        ("Mark cover", False),
+        ("Layer 1", True),
+    ]

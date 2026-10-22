@@ -242,7 +242,9 @@ With `"text"` and `"annotations"` the marks are listed under
 region. Regions are page fractions, as for `remarkable_image`'s `region`. A
 mark with a cover layer adds `[cover 'Mark cover': hidden on tablet]` to its
 line and `"cover": {"layer", "state"}` to its entry; the state is `hidden on
-tablet`, `shown on tablet` or `cover erased on tablet`.
+tablet`, `shown on tablet` or `cover erased on tablet`. The state follows the
+cover layer's visibility, which the user changes on the tablet and the write
+tool `remarkable_layers` changes from here.
 
 Marks are the agent's, not the user's ink. Erasable marks and covers are
 written as tablet ink, so the per-page lines also count them as strokes or
@@ -663,6 +665,7 @@ Regions are page fractions `[left, top, right, bottom]`, the frame
   or a line each (ink the MCP wrote, such as covers, is left out)
 - `free`: the largest empty regions, clear of ink, text and marks
 - `layers`: the page's layers, bottom first, with `visible` and `selected`
+  (`remarkable_layers` shows and hides them, cloud mode)
 
 Works in every transport and in read-only mode. `remarkable_mark_pdf`'s
 `layout_page` returns the same layout. Marks and a PDF's outline are listed by

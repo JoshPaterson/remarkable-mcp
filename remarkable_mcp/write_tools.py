@@ -1744,6 +1744,92 @@ OUTLINE_OPENING_LINES = 3
 MARGIN_BAND = 0.08
 
 
+def _layer_names(value, param: str) -> list:
+    """Layer names from a name or a list of names; ValueError otherwise."""
+    names = [value] if isinstance(value, str) else value
+    if not isinstance(names, list) or not all(isinstance(n, str) and n for n in names):
+        raise ValueError(f"{param} must be a layer name or a list of layer names.")
+    return list(dict.fromkeys(names))
+
+
+def _layer_pages(pages) -> Optional[list]:
+    """Tablet page numbers from a number, a list of numbers or ranges like
+    "3-5,9" (None: every page); ValueError if malformed."""
+    from remarkable_mcp.tools import _parse_page_spec
+
+    if pages is None:
+        return None
+    if isinstance(pages, list):
+        if not pages or not all(isinstance(p, int) and not isinstance(p, bool) for p in pages):
+            raise ValueError(
+                "pages must be a page number, a list of numbers or ranges like '3-5,9'."
+            )
+        pages = ",".join(str(p) for p in pages)
+    return sorted({p for first, last in _parse_page_spec(pages) for p in range(first, last + 1)})
+
+
+def _similar_layers(names: list, known: list) -> list:
+    """Layer names in ``known`` close to any of ``names``."""
+    import difflib
+
+    out: list = []
+    for name in names:
+        out += [k for k in known if k.lower() == name.lower()]
+        out += difflib.get_close_matches(name, known, n=3, cutoff=0.5)
+    return list(dict.fromkeys(out))
+
+
+def _layers_editor(show: list, hide: list, pages: Optional[list]):
+    """``edit(content, read_ink)`` for ``edit_document_files`` that shows the
+    layers named in ``show`` and hides those in ``hide`` on the given tablet
+    pages (None: every page). Pages without ink have no layers to change."""
+    from remarkable_mcp import rm_ink
+
+    wanted = {**{name: True for name in show}, **{name: False for name in hide}}
+
+    def edit(content: dict, read_ink) -> dict:
+        page_ids = content_page_ids(content)
+        selected = pages if pages is not None else list(range(1, len(page_ids) + 1))
+        outside = [p for p in selected if p > len(page_ids)]
+        if outside:
+            raise ValueError(
+                f"pages: page {outside[0]} is outside the document, which has "
+                f"{len(page_ids)} page(s)."
+            )
+        author = rm_ink.author_uuid()
+        changed, unchanged, known, found, ink = [], 0, [], set(), {}
+        for page in selected:
+            page_id = page_ids[page - 1]
+            data = read_ink(page_id)
+            if data is None:
+                continue
+            if not rm_ink.is_v6(data):
+                raise rm_ink.InkError(f"Page {page}'s ink is in an older format.")
+            writer = rm_ink.PageWriter(data, author)
+            for layer in writer.layers():
+                known.append(layer["name"])
+                shown = wanted.get(layer["name"])
+                if shown is None:
+                    continue
+                found.add(layer["name"])
+                if writer.set_layer_visible(layer["id"], shown):
+                    changed.append({"page": page, "layer": layer["name"], "visible": shown})
+                else:
+                    unchanged += 1
+            if writer.data != data:
+                ink[page_id] = writer.data
+        missing = [name for name in wanted if name not in found]
+        return {
+            "ink": ink,
+            "changed": changed,
+            "unchanged": unchanged,
+            "not_found": missing,
+            "known": list(dict.fromkeys(known)),
+        }
+
+    return edit
+
+
 def _page_openings(pdf: bytes, pages) -> dict:
     """The first lines of text on each PDF page in ``pages``, by page index,
     for checking outline targets. Left out: running headers and footers (a
@@ -2121,11 +2207,13 @@ async def _cloud_pdf_call(
     failure: str,
     invalid_errors: tuple,
     invalid_hint: str,
+    kind: str = "pdf",
 ):
     """Run ``run(client, target)`` in a worker thread for a cloud-only PDF
     tool, with ``target`` the PDF named ``document`` (None when no document
-    is given). ``invalid_errors`` become ``invalid_parameter`` errors; other
-    failures become a ``failed`` error reading ``failure: <reason>``."""
+    is given; with ``kind="document"``, any document but a folder).
+    ``invalid_errors`` become ``invalid_parameter`` errors; other failures
+    become a ``failed`` error reading ``failure: <reason>``."""
 
     def _impl():
         error = _require_managed_write_mode()
@@ -2135,17 +2223,18 @@ async def _cloud_pdf_call(
         try:
             target = None
             if document is not None:
-                target, error = lookup(client, document, kind="pdf")
+                target, error = lookup(client, document, kind=kind)
                 if error:
                     return error
             return run(client, target)
         except invalid_errors as e:
             return invalid_param(str(e), invalid_hint)
         except Exception as e:
+            what = "a PDF" if kind == "pdf" else "a document"
             return make_error(
                 error_type=failed,
                 message=f"{failure}: {e}",
-                suggestion="Check that the document is a PDF and try again.",
+                suggestion=f"Check that the document is {what} and try again.",
             )
 
     return await asyncio.to_thread(_impl)
@@ -3899,6 +3988,118 @@ def register_write_tools():
                     failure="Failed to change the outline",
                     invalid_errors=(MarkError,),
                     invalid_hint="Fix the outline and try again.",
+                )
+
+            @mcp.tool(annotations=WRITE_ANNOTATIONS)
+            async def remarkable_layers(
+                document: str,
+                show: Optional[Union[str, List[str]]] = None,
+                hide: Optional[Union[str, List[str]]] = None,
+                pages: Optional[Union[int, str, List[int]]] = None,
+            ):
+                """
+                <usecase>Show or hide layers on a document's pages: reveal answers
+                put under a covered layer, hide a "Mark cover" layer so the
+                marks under it show, or show and hide the user's own layers.</usecase>
+                <instructions>
+                Layers belong to pages; a name means that layer on every
+                selected page that has it. pages limits the change to some
+                tablet pages (default: every page). remarkable_page_layout
+                and annotation listings give each page's layers.
+
+                Covers: hiding a cover layer shows the marks it covers, and
+                showing it hides them. A mark added with "covered": true starts
+                hidden under its layer, so hiding that layer reveals it. Mark
+                listings follow, since a cover's state is read from its layer.
+
+                The user can switch a layer back on the tablet; the newest
+                change wins. The reply lists each layer changed (page, layer,
+                visible), how many were already as asked, and names not found
+                on any selected page. Nothing is written when nothing changes.
+                The tablet shows the change after its next sync.
+
+                Cloud mode only. PDFs, EPUBs and notebooks.
+                </instructions>
+                <parameters>
+                - document: Document name or path
+                - show: Layer name or list of names to show
+                - hide: Layer name or list of names to hide
+                - pages: Tablet page number, list of numbers, or ranges like
+                  "3-5,9"; default every page
+                </parameters>
+                <examples>
+                - remarkable_layers("Worksheet", hide="Answer key")  # reveal answers
+                - remarkable_layers("Worksheet", show="Mark cover", pages=2)
+                - remarkable_layers("Notes", hide=["Layer 2", "Sketch"], pages="3-5")
+                </examples>
+                """
+                from remarkable_mcp import rm_ink
+
+                try:
+                    shows = _layer_names(show, "show") if show is not None else []
+                    hides = _layer_names(hide, "hide") if hide is not None else []
+                    selected = _layer_pages(pages)
+                except ValueError as e:
+                    return invalid_param(str(e), 'Example: hide="Answer key", pages="2-3"')
+                if not shows and not hides:
+                    return invalid_param(
+                        "Give show or hide: the layer names to change.",
+                        'Example: remarkable_layers("Worksheet", hide="Answer key")',
+                    )
+                both = [name for name in shows if name in hides]
+                if both:
+                    return invalid_param(
+                        f"'{both[0]}' is in both show and hide.",
+                        "Name each layer in only one of them.",
+                    )
+
+                def run(client, target):
+                    edit = _layers_editor(shows, hides, selected)
+                    result = client.edit_document_files(target.ID, edit)
+                    if result["ink"]:
+                        _invalidate_client_cache(client)
+                        _clear_document_extraction_cache(target.ID)
+                    missing = result["not_found"]
+                    similar = _similar_layers(missing, result["known"]) if missing else []
+                    if missing and len(missing) == len(shows) + len(hides):
+                        where = "the selected pages" if selected is not None else "any page"
+                        return make_error(
+                            error_type="layer_not_found",
+                            message=f"No layer named {', '.join(map(repr, missing))} on {where}.",
+                            suggestion=(
+                                "Layer names are case-sensitive; remarkable_page_layout "
+                                "lists a page's layers. Nothing was changed."
+                            ),
+                            did_you_mean=similar or result["known"][:10] or None,
+                        )
+                    data = {
+                        "document": target.VissibleName,
+                        "changed": result["changed"],
+                        "unchanged": result["unchanged"],
+                    }
+                    if missing:
+                        data["not_found"] = missing
+                        if similar:
+                            data["did_you_mean"] = similar
+                    data["transport"] = "cloud"
+                    if result["changed"]:
+                        hint = (
+                            f"Changed {len(result['changed'])} layer(s) on "
+                            f"'{target.VissibleName}'. The tablet shows the change after "
+                            "its next sync."
+                        )
+                    else:
+                        hint = "Nothing changed: the layers were already as asked."
+                    return make_response(data, hint)
+
+                return await _cloud_pdf_call(
+                    document,
+                    run,
+                    failed="layers_failed",
+                    failure="Failed to change layers",
+                    invalid_errors=(rm_ink.InkError, ValueError),
+                    invalid_hint="Check the layer names and pages.",
+                    kind="document",
                 )
 
         @mcp.tool(annotations=DELETE_ANNOTATIONS)
