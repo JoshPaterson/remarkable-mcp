@@ -284,7 +284,7 @@ read-only.
 | Cloud | One-time registration | Connect | No | No | PDF and EPUB | Yes | Yes |
 | SSH | Developer mode | No | Yes | Yes | PDF and EPUB | Yes | Yes |
 
-¹ Folder ops = create folder / move / rename / delete. Upload and folder ops are enabled by default; pass `--read-only` to expose a read-only server. Deletes move items to the trash and prompt for confirmation when your client supports elicitation, and are refused without it unless `REMARKABLE_SKIP_CONFIRM=1` is set.
+¹ Folder ops = create folder / move / rename / move to Trash. Upload and folder ops are enabled by default; pass `--read-only` to expose a read-only server. Moving to Trash prompts for confirmation when your client supports elicitation, and is refused without it unless `REMARKABLE_SKIP_CONFIRM=1` is set.
 
 ² The desktop app itself signs in to the reMarkable cloud to sync; local directory mode just reads whatever the app has already synced to disk.
 
@@ -631,7 +631,7 @@ Write tools let you upload, organize, and manage documents on your reMarkable. *
 | Mkdir | ❌ | ✅ | ✅ | ❌ |
 | Move | ❌ | ✅ | ✅ | ❌ |
 | Rename | ❌ | ✅ | ✅ | ❌ |
-| Delete | ❌ | ✅ (→ trash) | ✅ (→ trash; optional permanent) | ❌ |
+| Move to Trash | ❌ | ✅ | ✅ | ❌ |
 
 ### Disabling Write Tools (read-only mode)
 
@@ -692,9 +692,11 @@ other modes leave them out of the schemas and ignore `defer_restart`.
 | `remarkable_pdf_outline(document, outline, dry_run)` | List, set or remove a PDF's outline, the table of contents the tablet shows, e.g. chapters for a book without one (**cloud only**) |
 | `remarkable_pdf_ocr(document, folder, tags, dry_run)` | Write OCR text into a PDF's scanned pages so they can be read, searched and highlighted; `dry_run=True` lists which PDFs need it (**cloud only**) |
 | `remarkable_pdf_pages(document, insert, dry_run)` | Insert blank, Markdown or PDF-file pages anywhere in a PDF; ink, marks, outline and OCR text stay on their pages (**cloud only**) |
-| `remarkable_delete(document, defer_restart, permanent)` | Move a document/folder (or a list, with one confirmation) to Trash; SSH can permanently remove it with `permanent=True` |
+| `remarkable_trash(document, defer_restart)` | Move a document/folder (or a list, with one confirmation) to the tablet's Trash, where it stays recoverable; never deletes permanently (cloud and SSH) |
 | `remarkable_refresh()` | Safely restart `xochitl` once to apply pending writes made with `defer_restart=True`; no-op after this process has confirmed a clean state — **SSH only** |
 | `remarkable_author(method, ..., defer_restart)` | Author native ink and notebooks — `draw` (append strokes), `add_page` (append a blank notebook page), `create_document` (new notebook) — **SSH only** |
+
+**Breaking change:** `remarkable_trash` replaces `remarkable_delete`, and the SSH-only `permanent=True` option is gone. Items are only ever moved to the tablet's Trash; empty the Trash on the tablet or in a reMarkable app. Replies keep the `deleted` key alongside the new `trashed` key.
 
 ### Safety
 
@@ -708,9 +710,9 @@ other modes leave them out of the schemas and ignore `defer_restart`.
 - **Text highlights are the tablet's own.** A `text_highlight` mark is written into the page's ink as the tablet's highlighter writes it (one item per line, with the tablet's text offsets and rectangles, calibrated on a Paper Pro), under the MCP's own author id. The user can erase it on the tablet, and listings show whether it is still there; removing the mark deletes it. It goes on the page's selected layer, or on a named layer (made on top if needed) so the user can hide all of the agent's highlights at once. `layout_page` (or `remarkable_page_layout`) lists the page's layers.
 - **Covers let the user hide marks on the tablet.** A mark added with `"cover": true` also gets white ink over it on a "Mark cover" layer at the bottom of its page, made hidden: showing the layer hides the mark, and the user's ink on the layers above stays visible. A layer name instead of `true` makes a separate group, and `"covered": true` makes a new layer shown. This is the only ink the MCP writes: it uses its own author id (stored in `~/.remarkable/mcp-author`) so it never collides with the tablet's ink, writes the PDF and the ink in one commit, and removes a cover by deleting its strokes the way the tablet does. On a page without ink it creates Layer 1 too, selected, so the user's writing never lands on the cover. Listings and `remarkable_read` give each covered mark's state (hidden on tablet, shown on tablet, or cover erased on tablet). See [native-ink notes](docs/native-ink.md).
 - **Layers are shown and hidden the way the tablet does it.** `remarkable_layers` rewrites only the layer's node block in the page's ink, giving its `visible` value a timestamp under the MCP's own author id that is newer than anything in the page, as the tablet does when the user toggles a layer; every other block is copied unchanged. The user can switch the layer back on the tablet. Changed pages go up in one commit, and a request that changes nothing writes nothing. Cover states in listings follow, since they are read from the layer.
-- **One document or a list take the same path.** Move, rename and delete run a single document as a batch of one, so a single reply has the same fields in cloud and SSH mode: both name the `transport`, and SSH replies add `refresh_pending`. A one-document cloud change is one metadata commit, like a batch.
-- **mkdir, move, rename, tag, delete register in cloud and SSH modes only** — they are not exposed on USB web (the tablet's USB web firmware has no folder/move/rename/delete endpoints), keeping the tool list scoped to what the active transport actually supports.
-- **Delete prompts for confirmation when possible** — if the client supports MCP elicitation, `remarkable_delete` asks the user to confirm before deleting. MCP SDK 2.x carries that prompt as a multi-round input request for `2026-07-28` clients and as push elicitation for legacy clients. If the client can't show a prompt, the delete is **refused** (not performed) unless `REMARKABLE_SKIP_CONFIRM=1` is set — so write-on-by-default can't silently delete from clients that lack elicitation. Cloud and SSH move items to Trash by default. SSH also supports `permanent=True` for an explicitly requested permanent removal; cloud permanent deletion remains a Trash-management operation in the app/tablet. Set `REMARKABLE_SKIP_CONFIRM=1` to allow deletes without a prompt in automated setups. All write tools carry `ToolAnnotations(read_only_hint=False)` (and `destructive_hint=True` for delete) so an agent harness can gate writes at the MCP layer.
+- **One document or a list take the same path.** Move, rename and trash run a single document as a batch of one, so a single reply has the same fields in cloud and SSH mode: both name the `transport`, and SSH replies add `refresh_pending`. A one-document cloud change is one metadata commit, like a batch.
+- **mkdir, move, rename, tag, trash register in cloud and SSH modes only** — they are not exposed on USB web (the tablet's USB web firmware has no folder/move/rename/trash endpoints), keeping the tool list scoped to what the active transport actually supports.
+- **Moving to Trash prompts for confirmation when possible** — `remarkable_trash` only moves items to the tablet's Trash, where they can be restored; it never deletes permanently. If the client supports MCP elicitation, it asks the user to confirm first. MCP SDK 2.x carries that prompt as a multi-round input request for `2026-07-28` clients and as push elicitation for legacy clients. If the client can't show a prompt, the move is **refused** (not performed) unless `REMARKABLE_SKIP_CONFIRM=1` is set, so write-on-by-default can't silently trash documents from clients that lack elicitation. Set `REMARKABLE_SKIP_CONFIRM=1` to allow it without a prompt in automated setups. All write tools carry `ToolAnnotations(read_only_hint=False)` so an agent harness can gate writes at the MCP layer; `remarkable_trash` is titled "Move to Trash" and marked `destructive_hint=False`, `idempotent_hint=True`, since the move is reversible.
 - **SSH work is fair and serialized per server** — one FIFO dispatcher owns every SSH subprocess, so startup scans, reads, uploads, mutations, and refresh probes cannot churn the tablet's USB CDC connection concurrently. Cached metadata reads bypass the queue.
 - **Concurrent SSH writes share a refresh barrier** — near-simultaneous writes are persisted in FIFO order, then every participating call waits for one shared `xochitl` restart before reporting success. A bounded debounce coalesces bursts without background or late success.
 - **SSH refreshes avoid the firmware emergency-reboot path** — the serialized refresh clears only `xochitl`'s systemd start counter immediately before restart, then requires stable, non-multiplexed SSH sessions on the same boot. OpenSSH aliases are resolved with `ssh -G`; if USB web was reachable at that effective host before restart, port 80 must recover too. A failed probe keeps `refresh_pending: true` and never replays the write.
@@ -787,11 +789,8 @@ remarkable_mark_pdf("Week 3 worksheet", remove=["q3", "q3-note", "score"], add=[
 # Reveal answers written under a covered layer, on pages 2-3 only
 remarkable_layers("Week 3 worksheet", hide="Answer key", pages="2-3")
 
-# Delete (destructive; confirms via elicitation when supported)
-remarkable_delete("Old Draft")
-
-# Permanently delete in SSH mode only
-remarkable_delete("Disposable Test", permanent=True)
+# Move to the tablet's Trash (recoverable; confirms via elicitation when supported)
+remarkable_trash("Old Draft")
 
 # Bulk import (SSH): defer the restart on each write, then refresh once.
 # One xochitl restart for the whole batch instead of one per upload.
@@ -956,9 +955,9 @@ macOS privacy protection keeps processes out of iCloud Drive and other protected
 
 Reinstalling or upgrading that Python (or recreating the virtual environment with another one) gives it a new path, which needs the grant again; check that `.venv/bin/python` still resolves to the granted file. Until then, copy the file to a folder the server can read, such as the staging folder set with `REMARKABLE_UPLOAD_STAGING_DIR`, and upload it from there; the error names that folder when it is set.
 
-### Deletes are refused
+### Moving to Trash is refused
 
-`remarkable_delete` asks the user to confirm through MCP elicitation. A client that cannot show that prompt gets a `confirmation_unavailable` error and nothing is deleted. To allow deletes without a prompt, set `REMARKABLE_SKIP_CONFIRM=1` (or `true`/`yes`) in the server's environment in the client configuration and restart the client. If deletes are refused again later, the variable is no longer set in the environment the server starts with.
+`remarkable_trash` asks the user to confirm through MCP elicitation. A client that cannot show that prompt gets a `confirmation_unavailable` error and nothing is changed. To allow it without a prompt, set `REMARKABLE_SKIP_CONFIRM=1` (or `true`/`yes`) in the server's environment in the client configuration and restart the client. If it is refused again later, the variable is no longer set in the environment the server starts with.
 
 ---
 

@@ -24,7 +24,7 @@ WRITE_TOOLS = [
     "remarkable_rename",
     "remarkable_tag",
     "remarkable_mark_pdf",
-    "remarkable_delete",
+    "remarkable_trash",
     "remarkable_refresh",
     "remarkable_author",
 ]

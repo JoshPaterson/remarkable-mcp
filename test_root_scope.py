@@ -180,13 +180,13 @@ async def test_rename_uses_the_root(cloud):
 
 
 async def test_delete_uses_the_root(cloud):
-    data = await _call("remarkable_delete", {"document": "/Notes"})
+    data = await _call("remarkable_trash", {"document": "/Notes"})
     assert _applied(cloud)[0] == "notes-in"
     assert data["path"] == "/Notes"
 
 
 async def test_delete_outside_document_is_not_found(cloud):
-    data = await _call("remarkable_delete", {"document": "/Outside"})
+    data = await _call("remarkable_trash", {"document": "/Outside"})
     assert data["_error"]["type"] == "document_not_found"
     cloud.update_documents_metadata.assert_not_called()
 

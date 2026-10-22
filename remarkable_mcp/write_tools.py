@@ -12,8 +12,8 @@ for backward compatibility but are now no-ops (write is the default). --write an
 --read-only are mutually exclusive.
 
 Write support by transport:
-- Cloud mode: upload, mkdir, move, rename, delete (-> trash)
-- SSH mode:   upload, mkdir, move, rename, delete
+- Cloud mode: upload, mkdir, move, rename, trash
+- SSH mode:   upload, mkdir, move, rename, trash
 - USB web mode: upload only (via POST /upload endpoint)
 
 Inspired by PR #70 from @McSchnizzle. SSH operations use the tablet filesystem,
@@ -27,7 +27,6 @@ import json
 import logging
 import os
 import re
-import shlex
 import socket
 import threading
 import time
@@ -66,7 +65,14 @@ UPLOAD_ANNOTATIONS = WRITE_ANNOTATIONS
 MKDIR_ANNOTATIONS = WRITE_ANNOTATIONS
 MOVE_ANNOTATIONS = WRITE_ANNOTATIONS
 RENAME_ANNOTATIONS = WRITE_ANNOTATIONS
-DELETE_ANNOTATIONS = ToolAnnotations(read_only_hint=False, destructive_hint=True)
+# Moving to Trash is reversible (restore from the tablet's Trash), and
+# trashing an item that is already in the Trash changes nothing.
+TRASH_ANNOTATIONS = ToolAnnotations(
+    title="Move to Trash",
+    read_only_hint=False,
+    destructive_hint=False,
+    idempotent_hint=True,
+)
 
 
 def read_only_enabled() -> bool:
@@ -105,7 +111,7 @@ def _require_write_transport() -> Optional[str]:
             suggestion=(
                 "Write tools are enabled by default. Remove the --read-only flag "
                 "(or unset REMARKABLE_READ_ONLY) and restart the server to enable "
-                "upload, mkdir, move, rename, and delete."
+                "upload, mkdir, move, rename, and trash."
             ),
         )
     return None
@@ -164,7 +170,7 @@ def _is_cloud_mode() -> bool:
 def _require_managed_write_mode() -> Optional[str]:
     """Return an error string unless in a mode that supports folder operations.
 
-    mkdir, move, rename and delete work in cloud and SSH modes. USB web only
+    mkdir, move, rename and trash work in cloud and SSH modes. USB web only
     supports uploads, while local-directory mode is read-only.
     """
     if _is_cloud_mode() or _is_ssh_mode():
@@ -173,7 +179,7 @@ def _require_managed_write_mode() -> Optional[str]:
         error_type="unsupported_in_usb_web",
         message="This operation isn't available in USB web mode",
         suggestion=(
-            "mkdir, move, rename and delete work in cloud mode (the "
+            "mkdir, move, rename and trash work in cloud mode (the "
             "default) and SSH mode. USB web supports upload only.\n"
             "Run with: remarkable-mcp  (cloud)  or  remarkable-mcp --ssh"
         ),
@@ -198,14 +204,6 @@ def _write_content_file(ssh_client: SSHClient, doc_uuid: str, content_data: dict
     content = json.dumps(content_data, indent=2)
     remote_path = f"{XOCHITL_PATH}/{doc_uuid}.content"
     ssh_client._ssh_command(f"cat > '{remote_path}' << 'REMARKABLE_EOF'\n{content}\nREMARKABLE_EOF")
-    ssh_client.mark_operation_dirty()
-
-
-def _permanently_delete_ssh_entry(ssh_client: SSHClient, doc_uuid: str) -> None:
-    """Remove one resolved UUID and all of its sidecar files from the tablet."""
-    entry = shlex.quote(f"{XOCHITL_PATH}/{doc_uuid}")
-    sidecar_prefix = shlex.quote(f"{XOCHITL_PATH}/{doc_uuid}.")
-    ssh_client._ssh_command(f"rm -rf {entry} {sidecar_prefix}*")
     ssh_client.mark_operation_dirty()
 
 
@@ -969,7 +967,7 @@ def _add_upload_source(response: str, fields: dict) -> str:
 
 def lookup(client, document: str, **options):
     """``lookup.lookup`` for write tools: an explicit ``/trash/...`` path (no
-    root set) also reaches a trashed item, e.g. to delete it permanently."""
+    root set) also reaches a trashed item, e.g. to move it out of the Trash."""
     return lookup_item(client, document, include_trash=True, **options)
 
 
@@ -2106,23 +2104,21 @@ def _rename_many(
     return _write_reply(data, cloud, restarted, f"Renamed {len(targets)} items in one change.")
 
 
-def _delete_many(
+def _trash_many(
     client,
     names: List[str],
     cloud: bool,
-    permanent: bool,
     defer_restart: bool,
     single: bool = False,
 ):
-    """Move documents or folders to the trash (or, over SSH with
-    ``permanent``, remove them) in one write. ``single`` gives the
-    one-document reply shape."""
+    """Move documents or folders to the Trash in one write. ``single`` gives
+    the one-document reply shape."""
     collection = client.get_meta_items()
     items_by_id = get_items_by_id(collection)
     targets, error = _resolve_targets(names, collection, items_by_id)
     if error:
         return error
-    deleted = [
+    trashed = [
         {
             "name": t.VissibleName,
             "path": display_path(t, items_by_id),
@@ -2130,52 +2126,18 @@ def _delete_many(
         }
         for t in targets
     ]
-    if permanent:
-        for target in targets:
-            if target.is_folder and any(item.Parent == target.ID for item in collection):
-                return make_error(
-                    error_type="folder_not_empty",
-                    message=f"Cannot permanently delete non-empty folder '{target.VissibleName}'.",
-                    suggestion=(
-                        "Permanently delete its contents first, or omit permanent=True "
-                        "to move it to Trash. Nothing was changed."
-                    ),
-                )
-        for target in targets:
-            _permanently_delete_ssh_entry(client, target.ID)
-        restarted = _maybe_restart_xochitl(client, defer_restart)
-    else:
-        changes = [(t, _trash_metadata) for t in targets]
-        restarted = _update_metadata(client, cloud, changes, defer_restart)
+    changes = [(t, _trash_metadata) for t in targets]
+    restarted = _update_metadata(client, cloud, changes, defer_restart)
     if not cloud:
         for target in targets:
             _update_deferred_ssh_cache(client, restarted, remove_id=target.ID)
             _clear_document_extraction_cache(target.ID)
-    where = "permanently deleted" if permanent else "moved to Trash"
-    verify = (
-        "It will no longer appear in the active library."
-        if permanent
-        else "It stays recoverable from the device's Trash."
-    )
+    verify = "It stays recoverable from the tablet's Trash."
     if single:
-        data = {"deleted": True, **deleted[0], "permanent": permanent}
-        return _write_reply(data, cloud, restarted, f"Document {where}.", verify)
-    data = {"deleted": deleted, "count": len(targets), "permanent": permanent}
-    return _write_reply(data, cloud, restarted, f"{len(targets)} items {where}.", verify)
-
-
-def _permanent_delete_error() -> Optional[str]:
-    """The error for ``permanent=True`` in cloud mode, else None."""
-    if not _is_cloud_mode():
-        return None
-    return make_error(
-        error_type="permanent_delete_unsupported",
-        message="Permanent deletion is not supported in cloud mode.",
-        suggestion=(
-            "Delete normally to move the item to Trash, then empty "
-            "Trash from a reMarkable app or tablet."
-        ),
-    )
+        data = {"trashed": True, "deleted": True, **trashed[0]}
+        return _write_reply(data, cloud, restarted, "Document moved to Trash.", verify)
+    data = {"trashed": trashed, "deleted": trashed, "count": len(targets)}
+    return _write_reply(data, cloud, restarted, f"{len(targets)} items moved to Trash.", verify)
 
 
 async def _dispatch(operation: str, impl, defer_restart: bool = False):
@@ -2240,27 +2202,26 @@ async def _cloud_pdf_call(
     return await asyncio.to_thread(_impl)
 
 
-class _DeleteConfirmation(BaseModel):
-    """Schema for confirming a destructive delete via elicitation."""
+class _TrashConfirmation(BaseModel):
+    """Schema for confirming a move to Trash via elicitation."""
 
     confirm: bool = Field(
         default=False,
-        description="Set to true to confirm this destructive delete operation.",
+        description="Set to true to confirm moving the items to Trash.",
     )
 
 
-def _delete_confirmation_available(ctx: Context) -> bool:
-    """Return whether deletion may proceed via elicitation or explicit bypass."""
+def _trash_confirmation_available(ctx: Context) -> bool:
+    """Return whether trashing may proceed via elicitation or explicit bypass."""
     if os.environ.get("REMARKABLE_SKIP_CONFIRM", "").lower() in ("1", "true", "yes"):
         return True
     return client_supports_elicitation(ctx)
 
 
-def _resolve_delete_confirmation(
+def _resolve_trash_confirmation(
     document: Union[str, List[str]],
-    permanent: bool,
-    confirmation_available: Annotated[bool, Resolve(_delete_confirmation_available)],
-) -> _DeleteConfirmation | Elicit[_DeleteConfirmation]:
+    confirmation_available: Annotated[bool, Resolve(_trash_confirmation_available)],
+) -> _TrashConfirmation | Elicit[_TrashConfirmation]:
     """Resolve confirmation over a legacy back-channel or a modern input round."""
     skip = os.environ.get("REMARKABLE_SKIP_CONFIRM", "").lower() in (
         "1",
@@ -2268,59 +2229,56 @@ def _resolve_delete_confirmation(
         "yes",
     )
     if skip:
-        return _DeleteConfirmation(confirm=True)
+        return _TrashConfirmation(confirm=True)
     if not confirmation_available:
-        return _DeleteConfirmation(confirm=False)
+        return _TrashConfirmation(confirm=False)
     what = _describe_documents(document)
-    if permanent:
-        message = (
-            f"Permanently delete {what} from your reMarkable? "
-            "This is irreversible and cannot be recovered from Trash."
-        )
-    else:
-        message = f"Delete {what} from your reMarkable? This moves it to the trash."
+    message = (
+        f"Move {what} to the Trash on your reMarkable? "
+        "It can be restored from the tablet's Trash."
+    )
     return Elicit(
         message,
-        _DeleteConfirmation,
+        _TrashConfirmation,
     )
 
 
-def _delete_confirmation_abort(
-    confirmation: ElicitationResult[_DeleteConfirmation],
+def _trash_confirmation_abort(
+    confirmation: ElicitationResult[_TrashConfirmation],
     confirmation_available: bool,
     document: str,
 ) -> Optional[str]:
-    """Return an abort response unless a destructive delete was confirmed.
+    """Return an abort response unless the move to Trash was confirmed.
 
-    Returns None to proceed with the delete, or a response string (a
-    cancellation or a refusal) to abort.
+    Returns None to proceed, or a response string (a cancellation or a
+    refusal) to abort. ``document`` is the quoted description from
+    ``_describe_documents``.
 
-    Delete is destructive, so confirmation is required. It is bypassed only when
-    REMARKABLE_SKIP_CONFIRM=1 (for headless automation). When the client cannot
-    show a confirmation prompt — no elicitation support, or elicitation fails at
-    runtime — the delete is REFUSED rather than performed silently, so a client
-    that can't prompt the user cannot delete documents unattended. Write tools
-    are on by default, and most MCP clients don't support elicitation yet, so
-    this refusal path is the common case for unattended setups.
+    Confirmation is required. It is bypassed only when REMARKABLE_SKIP_CONFIRM=1
+    (for headless automation). When the client cannot show a confirmation
+    prompt (no elicitation support, or elicitation fails at runtime) the move
+    is refused rather than performed silently, so a client that can't prompt
+    the user cannot trash documents unattended. Write tools are on by default,
+    and most MCP clients don't support elicitation yet, so this refusal path is
+    the common case for unattended setups.
     """
     if not confirmation_available:
         return make_error(
             "confirmation_unavailable",
             (
-                f"Refused to delete '{document}': this client cannot show a "
-                "confirmation prompt (no MCP elicitation support) and delete is "
-                "a destructive operation."
+                f"Refused to move {document} to Trash: this client cannot show a "
+                "confirmation prompt (no MCP elicitation support)."
             ),
             (
-                "Confirm the delete from a client that supports elicitation, or "
-                "set REMARKABLE_SKIP_CONFIRM=1 to allow deletes without a prompt "
-                "(e.g. for headless automation)."
+                "Confirm from a client that supports elicitation, or set "
+                "REMARKABLE_SKIP_CONFIRM=1 to move items to Trash without a "
+                "prompt (e.g. for headless automation)."
             ),
         )
     if confirmation.action != "accept" or not getattr(confirmation.data, "confirm", False):
         return make_response(
-            {"deleted": False, "cancelled": True, "document": document},
-            "Delete cancelled — nothing was changed.",
+            {"trashed": False, "deleted": False, "cancelled": True, "document": document},
+            "Move to Trash cancelled; nothing was changed.",
         )
     return None
 
@@ -4015,10 +3973,11 @@ def register_write_tools():
                 The user can switch a layer back on the tablet; the newest
                 change wins. Writing on a hidden layer that is selected on
                 the tablet shows it again, so a hidden selected layer stays
-                hidden only until the user writes on that page. The reply lists each layer changed (page, layer,
-                visible), how many were already as asked, and names not found
-                on any selected page. Nothing is written when nothing changes.
-                The tablet shows the change after its next sync.
+                hidden only until the user writes on that page. The reply
+                lists each layer changed (page, layer, visible), how many were
+                already as asked, and names not found on any selected page.
+                Nothing is written when nothing changes. The tablet shows the
+                change after its next sync.
 
                 Cloud mode only. PDFs, EPUBs and notebooks.
                 </instructions>
@@ -4104,48 +4063,45 @@ def register_write_tools():
                     kind="document",
                 )
 
-        @mcp.tool(annotations=DELETE_ANNOTATIONS)
-        async def remarkable_delete(
+        @mcp.tool(annotations=TRASH_ANNOTATIONS)
+        async def remarkable_trash(
             document: Union[str, List[str]],
             defer_restart: bool = False,
-            permanent: bool = False,
             *,
             confirmation: Annotated[
-                ElicitationResult[_DeleteConfirmation],
-                Resolve(_resolve_delete_confirmation),
+                ElicitationResult[_TrashConfirmation],
+                Resolve(_resolve_trash_confirmation),
             ],
-            confirmation_available: Annotated[bool, Resolve(_delete_confirmation_available)],
+            confirmation_available: Annotated[bool, Resolve(_trash_confirmation_available)],
         ) -> str:
             """
-            <usecase>Delete a document or folder on the reMarkable tablet.</usecase>
+            <usecase>Move documents or folders to the tablet's Trash, where they stay
+            recoverable.</usecase>
             <instructions>
-            DESTRUCTIVE operation. By default the item is moved to the tablet's
-            Trash and remains recoverable. In SSH mode only, permanent=True removes
-            the resolved UUID and all sidecar files instead; use that only when the
-            user explicitly asked for permanent deletion. Give a list to delete
-            several in one write, with one confirmation for all of them; every name
-            is checked first, and if any cannot be found nothing is deleted.
+            A reversible move: the item goes to the tablet's Trash and can be
+            restored from there. This tool never deletes anything permanently.
+            Give a list to trash several in one write, with one confirmation for
+            all of them; every name is checked first, and if any cannot be found
+            nothing is changed.
 
-            Works in cloud and SSH modes (default; --read-only disables). Not available over the
-            USB web interface.
+            Works in cloud and SSH modes (default; --read-only disables). Not
+            available over the USB web interface.
 
             If the client supports elicitation, this tool asks the user to confirm
-            before deleting. If the client cannot show a confirmation prompt, the
-            delete is refused unless REMARKABLE_SKIP_CONFIRM=1 is set (for headless
+            first. If the client cannot show a confirmation prompt, the move is
+            refused unless REMARKABLE_SKIP_CONFIRM=1 is set (for headless
             automation).
             </instructions>
             <parameters>
-            - document: Name or path of the document/folder to delete, or a list
+            - document: Name or path of the document/folder, or a list
             - defer_restart: SSH only. Skip the xochitl restart so a batch of
-              deletes can refresh once via remarkable_refresh() instead of once
-              per delete. Sets "refresh_pending": true. Ignored in cloud mode.
-            - permanent: SSH only. Permanently remove the resolved document/folder
-              files instead of moving the item to Trash (default: False).
+              writes can refresh once via remarkable_refresh() instead of once
+              per write. Sets "refresh_pending": true. Ignored in cloud mode.
             </parameters>
             <examples>
-            - remarkable_delete("Old Notes")
-            - remarkable_delete("/Books/Archive/Old Draft")
-            - remarkable_delete(["Draft 1", "Draft 2"])
+            - remarkable_trash("Old Notes")
+            - remarkable_trash("/Books/Archive/Old Draft")
+            - remarkable_trash(["Draft 1", "Draft 2"])
             </examples>
             """
             error = _require_managed_write_mode()
@@ -4155,27 +4111,23 @@ def register_write_tools():
             if names is None:
                 return _invalid_document_list()
 
-            abort = _delete_confirmation_abort(
+            abort = _trash_confirmation_abort(
                 confirmation, confirmation_available, _describe_documents(document)
             )
             if abort:
                 return abort
 
-            if permanent:
-                error = _permanent_delete_error()
-                if error:
-                    return error
             single = isinstance(document, str)
 
             def _impl() -> str:
                 return _run_batch(
-                    "delete",
-                    lambda client, cloud: _delete_many(
-                        client, names, cloud, permanent, defer_restart, single=single
+                    "trash",
+                    lambda client, cloud: _trash_many(
+                        client, names, cloud, defer_restart, single=single
                     ),
                 )
 
-            return await _dispatch("delete", _impl, defer_restart)
+            return await _dispatch("trash", _impl, defer_restart)
 
     async def remarkable_refresh() -> str:
         """

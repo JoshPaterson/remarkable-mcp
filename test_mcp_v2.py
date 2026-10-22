@@ -172,11 +172,10 @@ async def test_export_resource_link_works_in_both_protocol_eras(mode, expected_v
     ("mode", "expected_version"),
     [("auto", "2026-07-28"), ("legacy", "2025-11-25")],
 )
-@pytest.mark.parametrize("permanent", [False, True])
-async def test_delete_confirmation_works_in_both_protocol_eras(
-    monkeypatch, mode: str, expected_version: str, permanent: bool
+async def test_trash_confirmation_works_in_both_protocol_eras(
+    monkeypatch, mode: str, expected_version: str
 ):
-    """A confirmed delete uses MRTR for modern clients and push for legacy."""
+    """A confirmed move to Trash uses MRTR for modern clients and push for legacy."""
     for variable in (
         "REMARKABLE_SKIP_CONFIRM",
         "REMARKABLE_READ_ONLY",
@@ -197,13 +196,9 @@ async def test_delete_confirmation_works_in_both_protocol_eras(
         nonlocal confirmation_calls
         confirmation_calls += 1
         assert "Old Notes" in params.message
-        if permanent:
-            assert "irreversible" in params.message.lower()
-            assert "cannot be recovered" in params.message.lower()
-            assert "trash" in params.message.lower()
-        else:
-            assert "moves it to the trash" in params.message.lower()
-            assert "irreversible" not in params.message.lower()
+        assert "to the trash" in params.message.lower()
+        assert "restored" in params.message.lower()
+        assert "delete" not in params.message.lower()
         return ElicitResult(action="accept", content={"confirm": True})
 
     loader_start, loader_stop = _without_background_loader()
@@ -214,19 +209,15 @@ async def test_delete_confirmation_works_in_both_protocol_eras(
     ):
         async with Client(mcp, mode=mode, elicitation_callback=confirm) as client:
             result = await client.call_tool(
-                "remarkable_delete",
-                {"document": "Old Notes", "permanent": permanent},
+                "remarkable_trash",
+                {"document": "Old Notes"},
             )
             assert client.protocol_version == expected_version
 
     payload = json.loads(result.content[0].text)
     assert confirmation_calls == 1
-    if permanent:
-        assert payload["_error"]["type"] == "permanent_delete_unsupported"
-        api_client.update_documents_metadata.assert_not_called()
-    else:
-        assert payload["deleted"] is True
-        (applies,) = api_client.update_documents_metadata.call_args.args
-        metadata = {"parent": ""}
-        applies["doc-1"](metadata)
-        assert metadata["parent"] == "trash"
+    assert payload["trashed"] is True
+    (applies,) = api_client.update_documents_metadata.call_args.args
+    metadata = {"parent": ""}
+    applies["doc-1"](metadata)
+    assert metadata["parent"] == "trash"
