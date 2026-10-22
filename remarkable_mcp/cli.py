@@ -63,7 +63,7 @@ Examples:
   # Run as MCP server (cloud API, write-enabled by default)
   uvx remarkable-mcp
 
-  # Run as a read-only server (no upload/mkdir/move/rename/delete)
+  # Run as a read-only server (no upload/mkdir/move/rename/trash)
   uvx remarkable-mcp --read-only
 
   # Run Streamable HTTP for a local OpenWebUI instance
@@ -160,7 +160,7 @@ Streamable HTTP Security:
         "--write",
         action="store_true",
         help=(
-            "Deprecated no-op. Write tools (upload, mkdir, move, rename, delete) "
+            "Deprecated no-op. Write tools (upload, mkdir, move, rename, trash) "
             "are enabled by default, so this flag has no effect. Kept for backward "
             "compatibility. Mutually exclusive with --read-only."
         ),
@@ -169,7 +169,7 @@ Streamable HTTP Security:
         "--read-only",
         action="store_true",
         help=(
-            "Disable all write tools (upload, mkdir, move, rename, delete) and "
+            "Disable all write tools (upload, mkdir, move, rename, trash) and "
             "expose a read-only server. Mutually exclusive with --write."
         ),
     )

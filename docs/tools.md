@@ -524,7 +524,7 @@ remarkable_status()
 | `connection` | Connection details |
 | `document_count` | Total documents in library (filtered by root if configured) |
 | `write_enabled` | Whether write tools are enabled (the default; `false` only with `--read-only`) |
-| `capabilities` | Effective capabilities for the active transport (read/render/export/upload/mkdir/move/rename/delete) |
+| `capabilities` | Effective capabilities for the active transport (read/render/export/upload/mkdir/move/rename/tag/mark_pdf/trash) |
 | `capabilities_by_transport` | The full per-transport capability matrix |
 | `root_path` | Configured root path filter (only present if set) |
 | `ocr_backend` | Which OCR backend is configured |

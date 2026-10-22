@@ -366,12 +366,12 @@ class TestRemarkableStatus:
             assert caps["export"] is True
         # Cloud and SSH have full write surface; USB web is upload-only.
         for mode in ("cloud", "ssh"):
-            assert all(matrix[mode][op] for op in ("upload", "mkdir", "move", "rename", "delete"))
+            assert all(matrix[mode][op] for op in ("upload", "mkdir", "move", "rename", "trash"))
         assert matrix["usb-web"]["upload"] is True
-        assert not any(matrix["usb-web"][op] for op in ("mkdir", "move", "rename", "delete"))
+        assert not any(matrix["usb-web"][op] for op in ("mkdir", "move", "rename", "trash"))
         # Local directory is strictly read-only.
         assert not any(
-            matrix["local-dir"][op] for op in ("upload", "mkdir", "move", "rename", "delete")
+            matrix["local-dir"][op] for op in ("upload", "mkdir", "move", "rename", "trash")
         )
 
         # Effective capabilities always cover read/render/export.
@@ -2993,7 +2993,7 @@ class TestWriteTools:
             "remarkable_mkdir",
             "remarkable_move",
             "remarkable_rename",
-            "remarkable_delete",
+            "remarkable_trash",
         ]
 
         for tool_name in write_tool_names:
@@ -3022,7 +3022,7 @@ class TestWriteTools:
                 "remarkable_mkdir",
                 "remarkable_move",
                 "remarkable_rename",
-                "remarkable_delete",
+                "remarkable_trash",
             ]
 
             for tool_name in write_tool_names:
@@ -3035,13 +3035,13 @@ class TestWriteTools:
                 "remarkable_mkdir",
                 "remarkable_move",
                 "remarkable_rename",
-                "remarkable_delete",
+                "remarkable_trash",
             ]:
                 mcp._tool_manager._tools.pop(name, None)
 
     @pytest.mark.asyncio
-    async def test_delete_moves_document_to_trash(self):
-        """SSH delete mirrors current-firmware Trash metadata semantics."""
+    async def test_trash_moves_document_to_trash(self):
+        """SSH trash mirrors current-firmware Trash metadata semantics."""
         from remarkable_mcp.write_tools import register_write_tools
 
         with patch.dict(os.environ, {"REMARKABLE_USE_SSH": "1"}):
@@ -3091,12 +3091,13 @@ class TestWriteTools:
                     mock_get_rmapi.return_value = mock_client
 
                     result = await _call_tool(
-                        "remarkable_delete",
+                        "remarkable_trash",
                         {
                             "document": "Test Doc",
                         },
                     )
                     data = json.loads(result.content[0].text)
+                    assert data["trashed"] is True
                     assert data["deleted"] is True
                     assert data["name"] == "Test Doc"
                     # Current firmware represents Trash via parent="trash".
@@ -3115,126 +3116,13 @@ class TestWriteTools:
                 "remarkable_mkdir",
                 "remarkable_move",
                 "remarkable_rename",
-                "remarkable_delete",
-            ]:
-                mcp._tool_manager._tools.pop(name, None)
-
-    @pytest.mark.asyncio
-    async def test_permanent_delete_removes_resolved_ssh_entry(self):
-        from remarkable_mcp.write_tools import register_write_tools
-
-        with patch.dict(os.environ, {"REMARKABLE_USE_SSH": "1"}):
-            register_write_tools()
-
-        try:
-            mock_doc = Mock()
-            mock_doc.VissibleName = "Disposable Test"
-            mock_doc.ID = "doc-123"
-            mock_doc.Parent = ""
-            mock_doc.is_folder = False
-
-            mock_client = Mock(
-                spec=[
-                    "get_meta_items",
-                    "_documents",
-                    "_documents_by_id",
-                    "host",
-                    "user",
-                    "port",
-                    "password",
-                ]
-            )
-            mock_client.get_meta_items.return_value = [mock_doc]
-            with (
-                patch("remarkable_mcp.write_tools.get_rmapi", return_value=mock_client),
-                patch("remarkable_mcp.write_tools._permanently_delete_ssh_entry") as mock_purge,
-                patch("remarkable_mcp.write_tools._write_metadata") as mock_write_meta,
-                patch("remarkable_mcp.write_tools._restart_xochitl"),
-                patch.dict(
-                    os.environ,
-                    {"REMARKABLE_USE_SSH": "1", "REMARKABLE_SKIP_CONFIRM": "1"},
-                ),
-            ):
-                result = await _call_tool(
-                    "remarkable_delete",
-                    {"document": "Disposable Test", "permanent": True},
-                )
-                data = json.loads(result.content[0].text)
-
-            assert data["deleted"] is True
-            assert data["permanent"] is True
-            mock_purge.assert_called_once_with(mock_client, "doc-123")
-            mock_write_meta.assert_not_called()
-        finally:
-            for name in [
-                "remarkable_upload",
-                "remarkable_mkdir",
-                "remarkable_move",
-                "remarkable_rename",
-                "remarkable_delete",
-            ]:
-                mcp._tool_manager._tools.pop(name, None)
-
-    @pytest.mark.asyncio
-    async def test_permanent_delete_rejects_non_empty_folder(self):
-        from remarkable_mcp.write_tools import register_write_tools
-
-        with patch.dict(os.environ, {"REMARKABLE_USE_SSH": "1"}):
-            register_write_tools()
-
-        try:
-            folder = Mock()
-            folder.VissibleName = "Smoke Folder"
-            folder.ID = "folder-123"
-            folder.Parent = ""
-            folder.is_folder = True
-            child = Mock()
-            child.VissibleName = "Child"
-            child.ID = "child-123"
-            child.Parent = folder.ID
-            child.is_folder = False
-
-            mock_client = Mock(
-                spec=[
-                    "get_meta_items",
-                    "_documents",
-                    "_documents_by_id",
-                    "host",
-                    "user",
-                    "port",
-                    "password",
-                ]
-            )
-            mock_client.get_meta_items.return_value = [folder, child]
-            with (
-                patch("remarkable_mcp.write_tools.get_rmapi", return_value=mock_client),
-                patch("remarkable_mcp.write_tools._permanently_delete_ssh_entry") as mock_purge,
-                patch.dict(
-                    os.environ,
-                    {"REMARKABLE_USE_SSH": "1", "REMARKABLE_SKIP_CONFIRM": "1"},
-                ),
-            ):
-                result = await _call_tool(
-                    "remarkable_delete",
-                    {"document": "Smoke Folder", "permanent": True},
-                )
-                data = json.loads(result.content[0].text)
-
-            assert data["_error"]["type"] == "folder_not_empty"
-            mock_purge.assert_not_called()
-        finally:
-            for name in [
-                "remarkable_upload",
-                "remarkable_mkdir",
-                "remarkable_move",
-                "remarkable_rename",
-                "remarkable_delete",
+                "remarkable_trash",
             ]:
                 mcp._tool_manager._tools.pop(name, None)
 
     @pytest.mark.asyncio
     async def test_managed_write_tools_registered_in_cloud_mode(self):
-        """Cloud mode now has full write parity: mkdir/move/rename/delete register."""
+        """Cloud mode now has full write parity: mkdir/move/rename/trash register."""
         from remarkable_mcp.write_tools import register_write_tools
 
         # Cloud mode: neither SSH nor USB web
@@ -3249,14 +3137,14 @@ class TestWriteTools:
                 assert "remarkable_mkdir" in names
                 assert "remarkable_move" in names
                 assert "remarkable_rename" in names
-                assert "remarkable_delete" in names
+                assert "remarkable_trash" in names
             finally:
                 for name in [
                     "remarkable_upload",
                     "remarkable_mkdir",
                     "remarkable_move",
                     "remarkable_rename",
-                    "remarkable_delete",
+                    "remarkable_trash",
                 ]:
                     mcp._tool_manager._tools.pop(name, None)
 
@@ -3280,7 +3168,7 @@ class TestWriteTools:
                     "remarkable_mkdir",
                     "remarkable_move",
                     "remarkable_rename",
-                    "remarkable_delete",
+                    "remarkable_trash",
                 )
             ]
 
@@ -3293,7 +3181,7 @@ class TestWriteTools:
                 "remarkable_mkdir",
                 "remarkable_move",
                 "remarkable_rename",
-                "remarkable_delete",
+                "remarkable_trash",
             ]:
                 mcp._tool_manager._tools.pop(name, None)
 
@@ -3341,7 +3229,7 @@ class TestWriteTools:
                     "remarkable_mkdir",
                     "remarkable_move",
                     "remarkable_rename",
-                    "remarkable_delete",
+                    "remarkable_trash",
                 ]:
                     mcp._tool_manager._tools.pop(name, None)
 
@@ -3356,7 +3244,7 @@ class TestWriteTools:
             "remarkable_mkdir",
             "remarkable_move",
             "remarkable_rename",
-            "remarkable_delete",
+            "remarkable_trash",
         ):
             mcp._tool_manager._tools.pop(name, None)
         with patch.dict(os.environ, env, clear=True):
@@ -3368,14 +3256,14 @@ class TestWriteTools:
                 assert "remarkable_mkdir" not in names
                 assert "remarkable_move" not in names
                 assert "remarkable_rename" not in names
-                assert "remarkable_delete" not in names
+                assert "remarkable_trash" not in names
             finally:
                 for name in [
                     "remarkable_upload",
                     "remarkable_mkdir",
                     "remarkable_move",
                     "remarkable_rename",
-                    "remarkable_delete",
+                    "remarkable_trash",
                 ]:
                     mcp._tool_manager._tools.pop(name, None)
 
@@ -3413,7 +3301,7 @@ class TestWriteTools:
                     "remarkable_mkdir",
                     "remarkable_move",
                     "remarkable_rename",
-                    "remarkable_delete",
+                    "remarkable_trash",
                 ]:
                     mcp._tool_manager._tools.pop(name, None)
 
@@ -3464,7 +3352,7 @@ class TestWriteTargetResolutionSkipsTrash:
         )
 
     def test_explicit_trash_path_still_reaches_trashed_item(self):
-        """SSH permanent delete needs to address items already in the trash."""
+        """Write tools can address items already in the trash by explicit path."""
         from remarkable_mcp.lookup import find_item
 
         trashed = self._item("Morning Pages", "trashed", parent="trash")
@@ -3727,7 +3615,7 @@ class TestCloudWriteDispatch:
             "remarkable_mkdir",
             "remarkable_move",
             "remarkable_rename",
-            "remarkable_delete",
+            "remarkable_trash",
         ]:
             mcp._tool_manager._tools.pop(name, None)
 
@@ -3799,7 +3687,7 @@ class TestCloudWriteDispatch:
                 self._cleanup()
 
     @pytest.mark.asyncio
-    async def test_cloud_delete_dispatch(self):
+    async def test_cloud_trash_dispatch(self):
         from remarkable_mcp.write_tools import register_write_tools
 
         env = {**self._cloud_env(), "REMARKABLE_SKIP_CONFIRM": "1"}
@@ -3810,7 +3698,7 @@ class TestCloudWriteDispatch:
                 client = Mock(spec=["get_meta_items", "update_documents_metadata"])
                 client.get_meta_items.return_value = [target]
                 with patch("remarkable_mcp.write_tools.get_rmapi", return_value=client):
-                    result = await _call_tool("remarkable_delete", {"document": "Old Notes"})
+                    result = await _call_tool("remarkable_trash", {"document": "Old Notes"})
                 data = json.loads(result.content[0].text)
                 assert data["deleted"] is True
                 assert data["transport"] == "cloud"
@@ -3819,8 +3707,8 @@ class TestCloudWriteDispatch:
                 self._cleanup()
 
     @pytest.mark.asyncio
-    async def test_cloud_delete_refused_without_elicitation(self):
-        """Default-on writes: a client that can't confirm must NOT delete silently."""
+    async def test_cloud_trash_refused_without_elicitation(self):
+        """Default-on writes: a client that can't confirm must NOT trash silently."""
         from remarkable_mcp.write_tools import register_write_tools
 
         # No REMARKABLE_SKIP_CONFIRM, and the client does not support elicitation.
@@ -3838,7 +3726,7 @@ class TestCloudWriteDispatch:
                         return_value=False,
                     ),
                 ):
-                    result = await _call_tool("remarkable_delete", {"document": "Old Notes"})
+                    result = await _call_tool("remarkable_trash", {"document": "Old Notes"})
                 data = json.loads(result.content[0].text)
                 assert data["_error"]["type"] == "confirmation_unavailable"
                 client.update_documents_metadata.assert_not_called()
@@ -3846,8 +3734,8 @@ class TestCloudWriteDispatch:
                 self._cleanup()
 
     @pytest.mark.asyncio
-    async def test_cloud_delete_skip_confirm_bypasses_elicitation(self):
-        """REMARKABLE_SKIP_CONFIRM=1 allows deletes without a prompt (automation)."""
+    async def test_cloud_trash_skip_confirm_bypasses_elicitation(self):
+        """REMARKABLE_SKIP_CONFIRM=1 allows trashing without a prompt (automation)."""
         from remarkable_mcp.write_tools import register_write_tools
 
         env = {**self._cloud_env(), "REMARKABLE_SKIP_CONFIRM": "1"}
@@ -3864,7 +3752,7 @@ class TestCloudWriteDispatch:
                         return_value=False,
                     ),
                 ):
-                    result = await _call_tool("remarkable_delete", {"document": "Old Notes"})
+                    result = await _call_tool("remarkable_trash", {"document": "Old Notes"})
                 data = json.loads(result.content[0].text)
                 assert data["deleted"] is True
                 assert _applied(client, "doc-1")["parent"] == "trash"
@@ -3872,7 +3760,7 @@ class TestCloudWriteDispatch:
                 self._cleanup()
 
     @pytest.mark.asyncio
-    async def test_cloud_delete_cancelled_by_elicitation(self):
+    async def test_cloud_trash_cancelled_by_elicitation(self):
         """Modern multi-round elicitation cancellation leaves the device untouched."""
         from mcp.client import ClientRequestContext
         from mcp.types import ElicitRequestParams, ElicitResult
@@ -3898,9 +3786,10 @@ class TestCloudWriteDispatch:
                 ):
                     async with Client(mcp, elicitation_callback=decline) as mcp_client:
                         result = await mcp_client.call_tool(
-                            "remarkable_delete", {"document": "Old Notes"}
+                            "remarkable_trash", {"document": "Old Notes"}
                         )
                 data = json.loads(result.content[0].text)
+                assert data["trashed"] is False
                 assert data["deleted"] is False
                 assert data["cancelled"] is True
                 client.update_documents_metadata.assert_not_called()
@@ -7950,7 +7839,7 @@ class TestDeferRestart:
         "remarkable_mkdir",
         "remarkable_move",
         "remarkable_rename",
-        "remarkable_delete",
+        "remarkable_trash",
         "remarkable_refresh",
         "remarkable_author",
     ]

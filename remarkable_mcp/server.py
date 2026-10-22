@@ -138,7 +138,7 @@ TOOL_ORDER = {
             "remarkable_pdf_pages",
             "remarkable_pdf_ocr",
             "remarkable_author",
-            "remarkable_delete",
+            "remarkable_trash",
             "remarkable_refresh",
         ]
     )
@@ -273,7 +273,8 @@ Connected directly to the tablet over SSH: 10-100x faster than the cloud.
         if write_mode:
             instructions += """
 ### Write Safety
-- **Delete is destructive**: the MCP client should confirm with the user first
+- `remarkable_trash` moves items to the tablet's Trash, where they can be
+  restored; it asks the user to confirm when the client supports it
 - Each write restarts xochitl so the tablet shows it. Concurrent writes are
   serialized and share one restart; every call waits for it before returning
 - For a batch, pass `defer_restart=True` to each write (or set
@@ -290,7 +291,7 @@ Connected through the tablet's USB web interface.
         if write_mode:
             instructions += """Only uploads are available: the web interface
 puts them in the folder open on the tablet. mkdir, move, rename, tag and
-delete need SSH or cloud mode.
+trash need SSH or cloud mode.
 """
     else:
         instructions += """
@@ -318,8 +319,8 @@ unsynced work; signing out, unpairing or resetting does not.
             instructions += """
 ### Write Safety
 Writes change your cloud library and sync to all your devices.
-- **Delete is destructive** (it moves items to the Trash): the MCP client
-  should confirm with the user first
+- `remarkable_trash` moves items to the tablet's Trash, where they can be
+  restored; it asks the user to confirm when the client supports it
 - Use `remarkable_browse()` to verify changes
 - Run with `--read-only` to disable all write tools
 
@@ -435,7 +436,7 @@ from remarkable_mcp import (  # noqa: E402
 
 # Conditionally register write tools when enabled.
 # Write works in three transports: cloud (default), SSH, and USB web.
-# Cloud and SSH support the full set (upload/mkdir/move/rename/delete); the USB
+# Cloud and SSH support the full set (upload/mkdir/move/rename/trash); the USB
 # web interface only supports upload, so only that tool registers in USB mode
 # (see the per-tool gating in write_tools.register_write_tools). Local-directory
 # mode is strictly read-only and registers no write tools.

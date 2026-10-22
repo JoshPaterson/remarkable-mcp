@@ -1,4 +1,4 @@
-"""Moving, renaming and deleting several documents in one write."""
+"""Moving, renaming and trashing several documents in one write."""
 
 import hashlib
 import json
@@ -10,7 +10,7 @@ import pytest
 from remarkable_mcp.server import mcp
 from remarkable_mcp.sync import RemarkableClient, _hash_entries, _serialize_doc_index
 
-TOOLS = ("remarkable_move", "remarkable_rename", "remarkable_delete")
+TOOLS = ("remarkable_move", "remarkable_rename", "remarkable_trash")
 DOCS = {
     "doc-a": ("Week 1", "", False),
     "doc-b": ("Week 2", "", False),
@@ -137,8 +137,8 @@ async def test_rename_several_in_one_commit(cloud):
     assert cloud.metadata("doc-b")["visibleName"] == "Week 2 - graded"
 
 
-async def test_delete_several_in_one_commit(cloud):
-    data = await _call("remarkable_delete", document=["Week 1", "Week 2"])
+async def test_trash_several_in_one_commit(cloud):
+    data = await _call("remarkable_trash", document=["Week 1", "Week 2"])
 
     assert data["count"] == 2 and cloud.commits == 1
     assert cloud.metadata("doc-a")["parent"] == "trash"
@@ -154,8 +154,8 @@ async def test_delete_several_in_one_commit(cloud):
         ("remarkable_rename", {"renames": {"Week 1": "A", "Nope": "B"}}, "'Nope'"),
         ("remarkable_rename", {"renames": {"Week 1": "A"}, "document": "Week 2"}, "not both"),
         ("remarkable_rename", {"renames": {}}, "not both"),
-        ("remarkable_delete", {"document": ["Week 1", "Nope"]}, "'Nope'"),
-        ("remarkable_delete", {"document": []}, "non-empty list"),
+        ("remarkable_trash", {"document": ["Week 1", "Nope"]}, "'Nope'"),
+        ("remarkable_trash", {"document": []}, "non-empty list"),
     ],
 )
 async def test_one_bad_item_changes_nothing(cloud, tool, arguments, message):
@@ -171,10 +171,10 @@ async def test_single_names_keep_their_old_responses(cloud):
 
 
 def test_one_confirmation_lists_every_item(monkeypatch):
-    from remarkable_mcp.write_tools import _resolve_delete_confirmation
+    from remarkable_mcp.write_tools import _resolve_trash_confirmation
 
     monkeypatch.delenv("REMARKABLE_SKIP_CONFIRM", raising=False)
-    elicit = _resolve_delete_confirmation(["Week 1", "Week 2"], False, True)
+    elicit = _resolve_trash_confirmation(["Week 1", "Week 2"], True)
 
     assert "2 items ('Week 1', 'Week 2')" in elicit.message
 
@@ -235,11 +235,12 @@ def _batch_entry(tool, batch):
         return dict(batch["moved"][0], to=batch["to"])
     if tool == "remarkable_rename":
         return batch["renamed"][0]
-    return dict(batch["deleted"][0], permanent=batch["permanent"])
+    assert batch["deleted"] == batch["trashed"]
+    return batch["trashed"][0]
 
 
 def _single_entry(single):
-    dropped = ("moved", "renamed", "deleted", "_hint", "transport", "refresh_pending")
+    dropped = ("moved", "renamed", "trashed", "deleted", "_hint", "transport", "refresh_pending")
     return {k: v for k, v in single.items() if k not in dropped}
 
 
@@ -295,7 +296,7 @@ def test_ssh_single_and_batch_replies_agree(monkeypatch, tool):
         elif tool == "remarkable_rename":
             reply = write_tools._rename_many(client, {"Week 1": "First"}, False, True, single)
         else:
-            reply = write_tools._delete_many(client, ["Week 1"], False, False, True, single)
+            reply = write_tools._trash_many(client, ["Week 1"], False, True, single)
         return json.loads(reply)
 
     single, batch = run(True), run(False)

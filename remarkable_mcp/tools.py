@@ -1682,15 +1682,15 @@ async def remarkable_status() -> str:
     Capability notes:
     - Export is available in every transport and creates only a bounded temporary
       local resource; it never modifies the tablet.
-    - Cloud (default): full read/render/export/upload/mkdir/move/rename/delete — no device
+    - Cloud (default): full read/render/export/upload/mkdir/move/rename/trash — no device
       needed, works from anywhere your token is valid.
     - SSH: full capabilities over a local/USB connection to the tablet.
     - USB web: read, render, export, and upload (to root) only — the tablet's USB web
-      interface firmware exposes no folder/move/rename/delete endpoints. For full
+      interface firmware exposes no folder/move/rename/trash endpoints. For full
       write parity over a USB cable, use SSH mode pointed at the USB IP.
     - Local directory: fully offline read/render/export access to the desktop app's sync
       cache. Strictly read-only to avoid corrupting app-managed state.
-    Write tools (upload/mkdir/move/rename/delete) are enabled by default; run
+    Write tools (upload/mkdir/move/rename/trash) are enabled by default; run
     with --read-only (or REMARKABLE_READ_ONLY=1) to expose a read-only server.
     </instructions>
     <examples>
@@ -1750,7 +1750,7 @@ async def remarkable_status() -> str:
             "rename": True,
             "tag": True,
             "mark_pdf": True,
-            "delete": True,
+            "trash": True,
         },
         "ssh": {
             "read": True,
@@ -1762,7 +1762,7 @@ async def remarkable_status() -> str:
             "rename": True,
             "tag": True,
             "mark_pdf": False,
-            "delete": True,
+            "trash": True,
         },
         "usb-web": {
             "read": True,
@@ -1774,7 +1774,7 @@ async def remarkable_status() -> str:
             "rename": False,
             "tag": False,
             "mark_pdf": False,
-            "delete": False,
+            "trash": False,
         },
         # Local directory is strictly read-only: the folder is the desktop
         # app's private sync cache, so direct writes would bypass sync.
@@ -1788,7 +1788,7 @@ async def remarkable_status() -> str:
             "rename": False,
             "tag": False,
             "mark_pdf": False,
-            "delete": False,
+            "trash": False,
         },
     }
     writes_on = write_enabled()
@@ -1863,13 +1863,13 @@ async def remarkable_status() -> str:
             if transport == "usb-web":
                 hint_parts.append(
                     "Write is enabled, but the USB web interface only supports upload "
-                    "(to root). For mkdir/move/rename/delete over USB, use SSH mode."
+                    "(to root). For mkdir/move/rename/trash over USB, use SSH mode."
                 )
             else:
                 marks = " mark_pdf (cloud only)," if transport == "cloud" else ""
                 hint_parts.append(
                     f"Write is enabled: upload, mkdir, move, rename, tag,{marks} and "
-                    "delete are available."
+                    "trash are available."
                 )
         elif selected_transport == "local-dir":
             hint_parts.append(

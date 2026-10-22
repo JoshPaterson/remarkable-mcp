@@ -18,9 +18,9 @@ def test_instructions_mention_every_registered_tool():
 
 
 def test_tool_list_follows_the_registry():
-    tools = [t for t in mcp._tool_manager.list_tools() if t.name != "remarkable_delete"]
+    tools = [t for t in mcp._tool_manager.list_tools() if t.name != "remarkable_trash"]
     instructions = _build_instructions(tools)
-    assert "`remarkable_delete(" not in instructions
+    assert "`remarkable_trash(" not in instructions
     assert "`remarkable_search(" in instructions
 
 

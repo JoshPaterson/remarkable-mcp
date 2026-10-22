@@ -73,10 +73,23 @@ def test_cloud_schemas_leave_out_ssh_only_options(monkeypatch):
 
 def test_ssh_schemas_keep_defer_restart(monkeypatch):
     tools = _register(monkeypatch, REMARKABLE_USE_SSH="1")
-    for name in ("remarkable_move", "remarkable_upload", "remarkable_delete"):
+    for name in ("remarkable_move", "remarkable_upload", "remarkable_trash"):
         assert "defer_restart" in _properties(tools[name]), name
         assert "remarkable_refresh" in tools[name].description, name
     assert "remarkable_refresh" in tools
+
+
+@pytest.mark.parametrize("env", [{}, {"REMARKABLE_USE_SSH": "1"}])
+def test_trash_is_a_reversible_move(monkeypatch, env):
+    tools = _register(monkeypatch, **env)
+    assert "remarkable_delete" not in tools
+    trash = tools["remarkable_trash"]
+    assert "permanent" not in _properties(trash)
+    assert trash.annotations.title == "Move to Trash"
+    assert trash.annotations.read_only_hint is False
+    assert trash.annotations.destructive_hint is False
+    assert trash.annotations.idempotent_hint is True
+    assert "Trash" in trash.description and "DESTRUCTIVE" not in trash.description
 
 
 @pytest.fixture

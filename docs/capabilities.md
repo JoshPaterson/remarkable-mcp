@@ -53,9 +53,9 @@ results, including `Elicit`:
 - On a legacy connection, the same resolver uses the established
   server-to-client request.
 
-remarkable-mcp uses this compatibility layer for destructive delete confirmation.
+remarkable-mcp uses this compatibility layer to confirm `remarkable_trash`.
 Tool schemas do not expose the hidden resolver parameters. If the client does not
-advertise elicitation, delete fails closed.
+advertise elicitation, moving to Trash fails closed.
 
 `MCPServer` protects multi-round request state with a process-local key by
 default. This is appropriate for stdio and the supported single-process HTTP

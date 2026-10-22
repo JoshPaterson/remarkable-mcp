@@ -37,7 +37,7 @@ Each `(mode, tool)` cell is one of:
 | Result | Meaning |
 | ------ | ------- |
 | **PASS** ✅ | The tool ran and returned a sensible result for this transport. |
-| **N/A** ⛔ | The transport does not expose this tool — it is *correctly hidden* (e.g. `mkdir`/`move`/`rename`/`delete` over USB web, or `remarkable_author` outside SSH). This is expected, **not** a failure. |
+| **N/A** ⛔ | The transport does not expose this tool — it is *correctly hidden* (e.g. `mkdir`/`move`/`rename`/`trash` over USB web, or `remarkable_author` outside SSH). This is expected, **not** a failure. |
 | **SKIP** | The tool could not be run (mode unreachable, or no target document to read). |
 | **FAIL** ❌ | The tool is exposed but errored or returned the wrong thing. **This is the only result that means something is broken.** |
 
@@ -55,12 +55,12 @@ tool visibility changes.
 | ---- | :---: | :---: | :-----: | :-: |
 | `remarkable_status` / `browse` / `recent` / `search` / `read` / `image` / `canvas` | PASS | PASS | PASS | PASS |
 | `remarkable_upload` | **N/A** | PASS | PASS | PASS |
-| `remarkable_mkdir` / `rename` / `move` / `delete` | **N/A** | PASS | **N/A** | PASS |
+| `remarkable_mkdir` / `rename` / `move` / `trash` | **N/A** | PASS | **N/A** | PASS |
 | `remarkable_author` | **N/A** | **N/A** | **N/A** | PASS |
 
 USB web is read + render + upload only. It preserves the uploaded filename but
 does not accept a destination-folder parameter; the tablet web service chooses
-the folder. Its HTTP API exposes no folder/move/rename/delete endpoints, so those tools are not registered
+the folder. Its HTTP API exposes no folder/move/rename/trash endpoints, so those tools are not registered
 in that mode (shown as N/A). Local directory mode is strictly read-only (the
 folder is the desktop app's private sync cache), so no write tool registers
 there. `remarkable_author` requires native `.rm` write-back and is SSH-only
@@ -86,7 +86,7 @@ for cleanup.
 ## Caveats
 
 - **USB upload can leave a file behind.** USB web has no delete endpoint. If SSH
-  is available in the same run, the harness removes the timestamped filename
+  is available in the same run, the harness moves the timestamped file to Trash
   automatically. Otherwise delete it from the tablet by hand, or use
   `--read-only`.
 - **SSH requires working key auth.** With `--ssh`/`--usb` the harness disables the

@@ -13,7 +13,7 @@ first; pushing files over SSH can reset the USB web interface, so SSH (the only
 mode that writes to the device filesystem) runs LAST, after the USB-web checks
 are done.
 
-The server HIDES tools a transport cannot support (e.g. mkdir/move/rename/delete
+The server HIDES tools a transport cannot support (e.g. mkdir/move/rename/trash
 are not registered over USB web; remarkable_author is SSH-only). The harness is
 therefore ``tools/list``-driven: it asks each running server which tools it
 actually exposes and only exercises those. Any tool in the master list that a
@@ -97,7 +97,7 @@ ALL_TOOLS = [
     "remarkable_move",
     "remarkable_author",
     "remarkable_refresh",
-    "remarkable_delete",
+    "remarkable_trash",
 ]
 
 READ_TOOLS = {
@@ -116,10 +116,10 @@ WRITE_TOOLS = {
     "remarkable_move",
     "remarkable_author",
     "remarkable_refresh",
-    "remarkable_delete",
+    "remarkable_trash",
 }
 
-# Per-mode launch spec. Every mode gets REMARKABLE_SKIP_CONFIRM=1 so the delete
+# Per-mode launch spec. Every mode gets REMARKABLE_SKIP_CONFIRM=1 so the trash
 # tool's confirmation (which refuses without MCP elicitation) does not block this
 # non-interactive harness -- this also validates the documented automation escape
 # hatch. usb/ssh disable cloud fallback so a dead device cannot silently pass via
@@ -169,7 +169,7 @@ TIMEOUTS = {
     "remarkable_author": 120,
     "remarkable_refresh": 120,
     "remarkable_upload": 120,
-    "remarkable_delete": 90,
+    "remarkable_trash": 90,
     "_default": 60,
 }
 
@@ -708,7 +708,7 @@ async def run_read_phase(session, mode, rec, registered):
 
 
 async def run_write_phase(session, mode, rec, registered):
-    """upload, mkdir, rename, move, author, delete -- only the exposed ones.
+    """upload, mkdir, rename, move, author, trash -- only the exposed ones.
 
     All created items are confined to a unique per-run folder and cleaned up.
     Tools that are not exposed in this transport were already recorded N/A.
@@ -891,7 +891,7 @@ async def run_write_phase(session, mode, rec, registered):
             state, note = classify_ok(payload, is_err, exc)
             nb_path = f"{folder_path}/{nb_name}"
             if state == PASS:
-                created.insert(0, ("doc", nb_path))  # delete before its folder
+                created.insert(0, ("doc", nb_path))  # trash before its folder
                 ap_payload, ap_err, ap_exc = await call_tool(
                     session,
                     "remarkable_author",
@@ -924,8 +924,8 @@ async def run_write_phase(session, mode, rec, registered):
             else:
                 rec.record(mode, "remarkable_author", state, note)
 
-        # --- delete (cleanup) -------------------------------------------
-        if "remarkable_delete" in registered:
+        # --- trash (cleanup) --------------------------------------------
+        if "remarkable_trash" in registered:
             # Also sweep any USB-web leftover from an earlier USB phase. The web
             # service chooses its folder, so resolve the unique visible name.
             usb_leftover_sources = {}
@@ -936,35 +936,32 @@ async def run_write_phase(session, mode, rec, registered):
                         created.append(("doc", leftover))
                         usb_leftover_sources[leftover] = data
 
-            delete_states = []
+            trash_states = []
             for _kind, path in created:
-                delete_args = {"document": path}
+                trash_args = {"document": path}
                 if is_ssh:
-                    # Smoke artifacts are disposable test data; do not fill the
-                    # tablet's Trash or let sync restore them after validation.
-                    delete_args["permanent"] = True
-                    delete_args["defer_restart"] = True
+                    trash_args["defer_restart"] = True
                 payload, is_err, exc = await call_tool(
                     session,
-                    "remarkable_delete",
-                    delete_args,
-                    TIMEOUTS["remarkable_delete"],
+                    "remarkable_trash",
+                    trash_args,
+                    TIMEOUTS["remarkable_trash"],
                 )
                 st, _ = classify_ok(payload, is_err, exc)
-                delete_states.append((path, st))
+                trash_states.append((path, st))
                 if st == PASS and path in usb_leftover_sources:
                     usb_leftover_sources[path].pop("usb_upload_leftover", None)
-            if not delete_states:
-                rec.record(mode, "remarkable_delete", SKIP, "nothing was created to delete")
+            if not trash_states:
+                rec.record(mode, "remarkable_trash", SKIP, "nothing was created to trash")
             else:
-                failed = [p for p, s in delete_states if s != PASS]
+                failed = [p for p, s in trash_states if s != PASS]
                 if failed:
                     rec.modes[mode]["cleanup_pending"] = failed
-                    rec.record(mode, "remarkable_delete", FAIL, f"could not delete: {failed}")
+                    rec.record(mode, "remarkable_trash", FAIL, f"could not trash: {failed}")
                 else:
                     rec.modes[mode].pop("cleanup_pending", None)
                     rec.record(
-                        mode, "remarkable_delete", PASS, f"deleted {len(delete_states)} item(s)"
+                        mode, "remarkable_trash", PASS, f"trashed {len(trash_states)} item(s)"
                     )
 
         # SSH writes above are intentionally deferred. Refresh exactly once,
@@ -1204,7 +1201,7 @@ def main():
     parser.add_argument(
         "--read-only",
         action="store_true",
-        help="Skip all write tools (upload/mkdir/rename/move/author/delete)",
+        help="Skip all write tools (upload/mkdir/rename/move/author/trash)",
     )
     args = parser.parse_args()
 

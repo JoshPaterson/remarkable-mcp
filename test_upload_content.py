@@ -19,7 +19,7 @@ WRITE_TOOLS = [
     "remarkable_mkdir",
     "remarkable_move",
     "remarkable_rename",
-    "remarkable_delete",
+    "remarkable_trash",
     "remarkable_refresh",
     "remarkable_author",
 ]
