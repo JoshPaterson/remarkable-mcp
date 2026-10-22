@@ -1175,6 +1175,52 @@ class RemarkableClient:
         self._sync_root(mutate)
         return outcome.get("result")
 
+    def edit_document_files(self, doc_id: str, edit: "Any") -> Any:
+        """Change one document's page ink files and return ``edit``'s result.
+
+        ``edit(content, read_ink)`` gets the document's ``.content`` dict and
+        ``read_ink(page_id)`` (a page's ``.rm`` file or None) and returns a
+        result whose ``"ink"`` (``{page_id: bytes}``) replaces or adds those
+        files. Works on any document (PDF, EPUB or notebook). When a file
+        changed, the metadata's ``lastModified`` is refreshed and everything is
+        written in one commit; otherwise nothing is committed.
+        """
+        from remarkable_mcp import tablet_json
+
+        outcome: Dict[str, Any] = {}
+
+        def mutate(entries):
+            entry = self._require_entry(entries, doc_id)
+            files = self._parse_index(self._get_file(entry["hash"], f"{doc_id}.docSchema"))
+            by_id = {f["id"]: f for f in files}
+            content_file = next((f for f in files if f["id"].endswith(".content")), None)
+            meta_file = next((f for f in files if f["id"].endswith(".metadata")), None)
+            if content_file is None or meta_file is None:
+                raise CloudWriteError(f"Document {doc_id} has no content or metadata blob.")
+            content = json.loads(self._get_file(content_file["hash"], content_file["id"]))
+            read_ink = self.ink_reader(doc_id, files)
+            result = edit(content, read_ink)
+            outcome["result"] = result
+            replaced: Dict[str, Dict[str, Any]] = {}
+            for page_id, data in (result.get("ink") or {}).items():
+                name = f"{doc_id}/{page_id}.rm"
+                if name in by_id and read_ink(page_id) == data:
+                    continue
+                replaced[name] = self._upload_file_blob(data, name)
+            if not replaced:
+                return entries
+            metadata = json.loads(self._get_file(meta_file["hash"], meta_file["id"]))
+            metadata["lastModified"] = self._now_ms()
+            replaced[meta_file["id"]] = self._upload_file_blob(
+                tablet_json.dumps(metadata).encode("utf-8"), meta_file["id"]
+            )
+            new_files = [replaced.pop(f["id"], f) for f in files]
+            new_files += list(replaced.values())
+            return self._replace_root_entry(entries, self._upload_doc_index(doc_id, new_files))
+
+        self._sync_root(mutate)
+        return outcome.get("result")
+
     def _replace_root_entry(self, entries, new_entry):
         """Return ``entries`` with the entry matching ``new_entry['id']`` replaced."""
         return [new_entry if e["id"] == new_entry["id"] else e for e in entries]

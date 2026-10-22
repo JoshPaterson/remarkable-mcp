@@ -133,6 +133,7 @@ TOOL_ORDER = {
             "remarkable_rename",
             "remarkable_tag",
             "remarkable_mark_pdf",
+            "remarkable_layers",
             "remarkable_pdf_outline",
             "remarkable_pdf_pages",
             "remarkable_pdf_ocr",
