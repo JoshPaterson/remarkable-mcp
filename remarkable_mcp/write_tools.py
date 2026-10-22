@@ -4013,7 +4013,9 @@ def register_write_tools():
                 listings follow, since a cover's state is read from its layer.
 
                 The user can switch a layer back on the tablet; the newest
-                change wins. The reply lists each layer changed (page, layer,
+                change wins. Writing on a hidden layer that is selected on
+                the tablet shows it again, so a hidden selected layer stays
+                hidden only until the user writes on that page. The reply lists each layer changed (page, layer,
                 visible), how many were already as asked, and names not found
                 on any selected page. Nothing is written when nothing changes.
                 The tablet shows the change after its next sync.
