@@ -73,7 +73,8 @@ instead of `true` (e.g. "Answer key") makes a group the user hides separately;
 `"covered": true` makes a new layer shown, so its marks start hidden (e.g.
 answers to reveal later). Listings give each covered mark's layer and state:
 hidden on tablet, shown on tablet, or cover erased on tablet. Treat marks the
-user has hidden as dismissed. Removing a mark removes its cover.
+user has hidden as dismissed. Removing a mark removes its cover. Adding marks
+never changes the page's selected layer.
 remarkable_layers shows or hides a cover layer on the user's behalf: hide a
 `covered` layer to reveal its answers, or show "Mark cover" to hide its marks;
 listings then report the new state.
