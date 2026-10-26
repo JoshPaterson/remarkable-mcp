@@ -137,3 +137,11 @@ def test_a_page_without_scene_info_gets_one_after_its_page_info():
 def test_a_first_ink_file_keeps_its_selection():
     out = _cover(None)
     assert _scene_info_raw(out) == _scene_info_raw(rm_ink.first_page_rm(AUTHOR))
+
+
+def test_ink_on_an_unselected_page_goes_on_the_layer_it_selects():
+    page = rm_ink.PageWriter(STALE_PAGE.read_bytes(), AUTHOR)
+    layer = page.ink_layer(None)
+    page.add_lines(layer, [{"points": [[0.1, 0.5], [0.3, 0.5]], "width": 1.0}], A4, "fineliner", 0)
+    assert layer == LAYER_3
+    assert rm_ink.selected_layer(page.data) == LAYER_3
