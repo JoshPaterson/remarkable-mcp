@@ -648,6 +648,7 @@ class PageWriter:
     def ink_layer(self, name: Optional[str]) -> Id:
         """The layer to put erasable ink or highlights on: the layer named
         ``name`` (made on top if the page has none), else the selected layer,
+        else the layer the write selects for the user (see ``_user_layer``),
         else the first layer the MCP did not make. Cover layers are never
         used."""
         if name is not None:
@@ -661,6 +662,8 @@ class PageWriter:
         selected = self.selected_layer()
         if selected is not None and selected not in self.covers:
             return selected
+        if self._pin is not None and self._pin not in self.covers:
+            return self._pin
         own = [layer["id"] for layer in self._layer_list if layer["id"][0] != self._number]
         if not own:
             raise InkError("The page has no layer to put ink on.")
