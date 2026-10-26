@@ -17,6 +17,7 @@ to the written format, regenerate it with ``GOLDEN_UPDATE=1 pytest
 test_golden_ink.py`` and re-check the new output on a tablet.
 """
 
+import dataclasses
 import io
 import os
 import struct
@@ -120,14 +121,44 @@ def test_writers_match_their_golden_output(name):
 @pytest.mark.parametrize("name", list(_writes()))
 def test_writes_keep_the_tablets_blocks(name):
     """Every block of the tablet's file is kept, in order and unchanged, except
-    the author table (which gains the MCP's author)."""
+    the author table (which gains the MCP's author) and the SceneInfo (whose
+    selection is pinned to Layer 1, see the next test)."""
     if name == "first_page.rm":
         return
-    before = [raw for t, raw in _raw_blocks(_read("tablet_highlight_page.rm")) if t != 0x09]
-    after = [raw for t, raw in _raw_blocks(_writes()[name]) if t != 0x09]
+    skip = (0x09, 0x0D)
+    before = [raw for t, raw in _raw_blocks(_read("tablet_highlight_page.rm")) if t not in skip]
+    after = [raw for t, raw in _raw_blocks(_writes()[name]) if t not in skip]
     remaining = iter(after)
     for raw in before:
         assert any(raw == candidate for candidate in remaining), "a tablet block changed"
+
+
+def _scene_info(data: bytes):
+    (raw,) = [raw for t, raw in _raw_blocks(data) if t == 0x0D]
+    (block,) = read_blocks(io.BytesIO(HEADER_V6 + raw))
+    return raw, block
+
+
+@pytest.mark.parametrize("name", list(_writes()))
+def test_writes_pin_the_selection_to_layer_1(name):
+    """The tablet's page selects no layer, so each write selects Layer 1 (a
+    first ink file already does). The SceneInfo block keeps its header bytes
+    and every field but the selection, which is stamped with the MCP's author
+    and a counter newer than any other in the page."""
+    data = _writes()[name]
+    assert rm_ink.selected_layer(data) == rm_ink.LAYER_1
+    if name == "first_page.rm":
+        return
+    old_raw, old = _scene_info(_read("tablet_highlight_page.rm"))
+    new_raw, new = _scene_info(data)
+    assert new_raw[4:8] == old_raw[4:8]
+    restored = rm_ink.encode([dataclasses.replace(new, current_layer=old.current_layer)])
+    assert restored[8:] == old_raw[8:]
+    stamp = new.current_layer.timestamp
+    assert stamp.part1 == rm_ink.author_number(data, AUTHOR)
+    blocks = rm_ink.parse(data)
+    others = [i.part2 for i in rm_ink.iter_crdt_ids(blocks) if i != stamp]
+    assert stamp.part2 > max(others)
 
 
 def test_first_ink_file_has_the_accepted_structure():
@@ -181,15 +212,18 @@ def test_layer_toggle_matches_its_golden_output():
 
 
 def test_layer_toggle_keeps_the_tablets_blocks():
-    """Only the layer's node block changes, and it keeps its header bytes;
-    the tablet's node blocks re-encode with the same body."""
+    """Only the layer's node block and the SceneInfo (which selected no layer,
+    and now selects Layer 1) change, and they keep their header bytes; the
+    tablet's node blocks re-encode with the same body."""
     tablet, hidden = _layer_hidden()
     before, after = _raw_blocks(tablet), _raw_blocks(hidden)
     assert [t for t, _ in before] == [t for t, _ in after]
     changed = [(old, new) for (_, old), (_, new) in zip(before, after) if old != new]
-    assert len(changed) == 1
-    old, new = changed[0]
-    assert old[7] == 0x02 and new[4:8] == old[4:8]
+    assert [old[7] for old, _ in changed] == [0x0D, 0x02]
+    for old, new in changed:
+        assert new[4:8] == old[4:8]
+    assert rm_ink.selected_layer(tablet) is None
+    assert rm_ink.selected_layer(hidden) == rm_ink.LAYER_1
     for btype, raw in before:
         if btype != 0x02:
             continue

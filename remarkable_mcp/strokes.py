@@ -336,7 +336,8 @@ def append_strokes(original_bytes: bytes, strokes: list[dict], author=None) -> b
     counter, on the layer ``rm_ink.PageWriter.ink_layer`` picks: the page's
     selected layer, never a layer holding the MCP's mark covers. Every block
     of the original is kept unchanged except the author table, which gains
-    the author.
+    the author, and the SceneInfo, whose selection is pinned to the user's
+    layer when it selects none (see ``rm_ink.PageWriter``).
     """
     if not strokes:
         raise StrokeError("No strokes provided to write.")

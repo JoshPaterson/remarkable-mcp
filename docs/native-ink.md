@@ -100,8 +100,7 @@ cloud (2026-10-19):
 - **Page with no ink.** Create Layer 1 as well (as in step 4 above) and add a
   `SceneInfo` whose `current_layer` is Layer 1 `(0, 11)`. Without a
   `SceneInfo` the tablet selected the cover layer, so the user's writing went
-  onto it. On pages with ink, leave `SceneInfo` alone (`current_layer` may be
-  `(0, 0)`; the tablet then selects Layer 1).
+  onto it. On pages with ink, see "Selected layer" below.
 - **Concurrent edit.** A cover layer added while the tablet drew offline
   merged: both kept.
 
@@ -113,6 +112,32 @@ page's next counter (fixtures/tablet/layers_and_tags has such a layer).
 `remarkable_layers` does the same under the MCP's author: it re-encodes only
 that block, keeping its header version bytes, with `visible` stamped
 `(mcp, next counter)`, newer than every id and timestamp in the page.
+
+## Selected layer
+
+`SceneInfo.current_layer` selects the layer the user writes on. Tablet pages
+with only Layer 1 store `current_layer = (0, 0)` stamped `(0, 0)`, i.e. no
+selection, and some pages select a layer that no longer exists. With no live
+selection the tablet selects the newest layer when it loads the page, so a
+layer the MCP adds (a cover at the bottom, or a named ink or highlight layer
+on top) would become the active layer.
+
+Every page the MCP writes (`rm_ink.PageWriter`: layers, strokes, text
+highlights, tombstones, visibility) therefore keeps the user's layer
+selected:
+
+- If `SceneInfo` selects a live layer, it is never changed, even when that
+  layer is one the MCP made.
+- Otherwise the selection is pinned to the user's layer: the newest layer the
+  MCP did not make (highest counter among layers not under the MCP's author),
+  chosen from the page as it was before the edit. On a single-layer page this
+  is Layer 1. A page with no such layer is left unselected.
+- The pin rewrites the `SceneInfo` block in place, keeping its header version
+  bytes and every other field, with `current_layer=LwwValue((mcp, c),
+  layer)` where `c` is newer than every id and timestamp in the page. A page
+  without `SceneInfo` gets one after its page info block, as a first ink file
+  does. All other blocks are copied as raw bytes.
+- A page the MCP does not change is written back unchanged.
 
 ## Text highlights (verified)
 

@@ -27,7 +27,7 @@ TREE_BLOCK, NODE_BLOCK, GLYPH_ITEM_BLOCK, GROUP_ITEM_BLOCK, LINE_BLOCK = (
     0x04,
     0x05,
 )
-TEXT_BLOCK, PAGE_INFO_BLOCK, AUTHORS_BLOCK = 0x07, 0x0A, 0x09
+TEXT_BLOCK, PAGE_INFO_BLOCK, AUTHORS_BLOCK, SCENE_INFO_BLOCK = 0x07, 0x0A, 0x09, 0x0D
 
 AUTHOR_FILE_NAME = "mcp-author"
 # Covers are white fineliner strokes.
@@ -256,6 +256,22 @@ def tombstone(data: bytes, item_ids: Iterable[Sequence[int]]) -> bytes:
 # --- Pages and layers --------------------------------------------------------
 
 
+def _scene_info(layer: Id, number: int, counter: int) -> Any:
+    """A SceneInfo as the MCP writes a new one: ``layer`` selected (stamped
+    ``(number, counter)``), the background shown, and the standard paper."""
+    from rmscene.scene_stream import SceneInfo
+    from rmscene.tagged_block_common import CrdtId, LwwValue
+
+    from remarkable_mcp.strokes import DEFAULT_PAPER_SIZE
+
+    return SceneInfo(
+        current_layer=LwwValue(CrdtId(number, counter), crdt(layer)),
+        background_visible=LwwValue(CrdtId(number, counter + 1), True),
+        root_document_visible=LwwValue(CrdtId(0, 0), True),
+        paper_size=DEFAULT_PAPER_SIZE,
+    )
+
+
 def first_page_rm(author: uuid.UUID) -> bytes:
     """A first ink file for a page: Layer 1, selected, as the tablet makes it.
 
@@ -263,20 +279,11 @@ def first_page_rm(author: uuid.UUID) -> bytes:
     text page) and selects Layer 1 in its SceneInfo (without one, the tablet
     selects the newest layer, which would put the user's writing on a cover).
     """
-    from rmscene.scene_stream import SceneInfo
-    from rmscene.tagged_block_common import CrdtId, LwwValue
-
     from remarkable_mcp import notebooks
-    from remarkable_mcp.strokes import DEFAULT_PAPER_SIZE
 
     base = notebooks.blank_page_rm_bytes(author_uuid=str(author))
     number = author_number(base, author) or 1
-    info = SceneInfo(
-        current_layer=LwwValue(CrdtId(number, 2), crdt(LAYER_1)),
-        background_visible=LwwValue(CrdtId(number, 3), True),
-        root_document_visible=LwwValue(CrdtId(0, 0), True),
-        paper_size=DEFAULT_PAPER_SIZE,
-    )
+    info = _scene_info(LAYER_1, number, 2)
     parts = [_header()]
     for btype, raw in raw_blocks(base):
         if btype != TEXT_BLOCK:
@@ -284,6 +291,36 @@ def first_page_rm(author: uuid.UUID) -> bytes:
         if btype == PAGE_INFO_BLOCK:
             parts.append(encode([info]))
     return b"".join(parts)
+
+
+def select_layer(data: bytes, layer: Id, number: int, counter: int) -> bytes:
+    """``data`` with its SceneInfo selecting ``layer``, stamped ``(number,
+    counter)``; a page without SceneInfo gets one after its page info block
+    (using counters ``counter`` and ``counter + 1``).
+
+    Each SceneInfo block is rewritten in place: it keeps its header versions
+    and every other field. All other blocks are copied as raw bytes.
+    """
+    from rmscene.scene_stream import SceneInfo
+    from rmscene.tagged_block_common import CrdtId, LwwValue
+
+    value = LwwValue(CrdtId(number, counter), crdt(layer))
+    raw = raw_blocks(data)
+    parts, rewritten = [_header()], False
+    for btype, block_raw in raw:
+        block = _parse_one(block_raw) if btype == SCENE_INFO_BLOCK else None
+        if isinstance(block, SceneInfo):
+            new = encode([dataclasses.replace(block, current_layer=value)])
+            block_raw = new[:4] + block_raw[4:8] + new[8:]
+            rewritten = True
+        parts.append(block_raw)
+    if rewritten:
+        return b"".join(parts)
+    info = encode([_scene_info(layer, number, counter)])
+    types = [t for t, _ in raw]
+    at = types.index(PAGE_INFO_BLOCK) + 1 if PAGE_INFO_BLOCK in types else 0
+    blocks = [r for _, r in raw]
+    return b"".join([_header(), *blocks[:at], info, *blocks[at:]])
 
 
 def _layers(blocks: list) -> List[Dict[str, Any]]:
@@ -402,6 +439,13 @@ class PageWriter:
     ``covers`` and ``inks`` are the MCP's cover and ink layers (see
     ``layer_roles``, given ``cover_ids`` and ``ink_ids``); erasable ink and
     highlights never go on a cover layer, and covers never on an ink layer.
+
+    The MCP never changes which layer the user has selected. A page whose
+    SceneInfo selects no live layer (tablet pages with only Layer 1 store no
+    selection, and the tablet then selects the newest layer, which would be
+    a layer the MCP adds) is written with the selection pinned to the user's
+    layer: the newest layer the MCP did not make, as the page was before the
+    edit. A live selection, even of an MCP layer, is kept as it is.
     """
 
     def __init__(
@@ -412,13 +456,37 @@ class PageWriter:
         ink_ids: Iterable[Sequence[int]] = (),
     ):
         self.author = author
-        self.data = first_page_rm(author) if data is None else data
-        self._blocks = parse(self.data)
+        self._data = first_page_rm(author) if data is None else data
+        self._blocks = parse(self._data)
         self._layer_list = _layers(self._blocks)
         self._number = author_number_in(self._blocks, author)
         self._authored = False
         self._counter = next_counter(self._blocks)
         self.covers, self.inks = layer_roles(self._blocks, self._number, cover_ids, ink_ids)
+        self._source = self._data
+        self._pin = None if self.selected_layer() is not None else self._user_layer()
+        self._pinned: Optional[Tuple[bytes, bytes]] = None
+
+    @property
+    def data(self) -> bytes:
+        """The page's ``.rm`` file with the changes made (the unchanged file
+        when nothing changed)."""
+        if self._pin is None or self._data == self._source:
+            return self._data
+        if self._pinned is None or self._pinned[0] != self._data:
+            data, number = with_author(self._data, self.author)
+            pinned = select_layer(data, self._pin, number, self._take(2))
+            self._pinned = (self._data, pinned)
+        return self._pinned[1]
+
+    def _user_layer(self) -> Optional[Id]:
+        """The newest live layer the MCP did not make, or None."""
+        own = [
+            layer["id"]
+            for layer in self._layer_list
+            if self._number is None or layer["id"][0] != self._number
+        ]
+        return max(own, key=lambda layer: (layer[1], layer[0])) if own else None
 
     @property
     def number(self) -> Optional[int]:
@@ -427,7 +495,7 @@ class PageWriter:
 
     def _ensure_author(self) -> int:
         if not self._authored:
-            self.data, self._number = with_author(self.data, self.author)
+            self._data, self._number = with_author(self._data, self.author)
             self._authored = True
         return self._number
 
@@ -455,7 +523,7 @@ class PageWriter:
 
     def append(self, blocks: Sequence[Any]) -> None:
         """Append new item blocks (with ids from ``new_ids``) to the page."""
-        self.data += encode(blocks)
+        self._data += encode(blocks)
 
     def layers(self) -> List[Dict[str, Any]]:
         """The page's live layers, bottom first (see ``page_layers``)."""
@@ -529,15 +597,15 @@ class PageWriter:
                 value=layer,
             ),
         )
-        self.data = _splice(
-            self.data,
+        self._data = _splice(
+            self._data,
             {
                 TREE_BLOCK: encode([tree]),
                 NODE_BLOCK: encode([node]),
                 GROUP_ITEM_BLOCK: encode([item]),
             },
         )
-        self._blocks = parse(self.data)
+        self._blocks = parse(self._data)
         self._layer_list = _layers(self._blocks)
         return key(layer)
 
@@ -562,7 +630,7 @@ class PageWriter:
         number = self._ensure_author()
         stamp = CrdtId(number, self._take(1))
         parts, rewritten = [_header()], False
-        for btype, raw in raw_blocks(self.data):
+        for btype, raw in raw_blocks(self._data):
             block = _parse_one(raw) if btype == NODE_BLOCK else None
             if isinstance(block, TreeNodeBlock) and key(block.group.node_id) == layer:
                 group = dataclasses.replace(block.group, visible=LwwValue(stamp, bool(shown)))
@@ -572,8 +640,8 @@ class PageWriter:
             parts.append(raw)
         if not rewritten:
             raise InkError(f"The page has no node block for layer {list(layer)}.")
-        self.data = b"".join(parts)
-        self._blocks = parse(self.data)
+        self._data = b"".join(parts)
+        self._blocks = parse(self._data)
         self._layer_list = _layers(self._blocks)
         return True
 
@@ -638,7 +706,7 @@ class PageWriter:
                 block = dataclasses.replace(block, item=item)
             new.append(block)
             ids.append([number, counter])
-        self.data += encode(new)
+        self._data += encode(new)
         return ids
 
     def add_glyphs(
@@ -682,9 +750,9 @@ class PageWriter:
             )
             new.append(SceneGlyphItemBlock(parent_id=crdt(layer), item=item))
             ids.append([number, counter])
-        self.data += encode(new)
+        self._data += encode(new)
         return ids
 
     def tombstone(self, item_ids: Iterable[Sequence[int]]) -> None:
         """Delete strokes or text highlights in place."""
-        self.data = tombstone(self.data, item_ids)
+        self._data = tombstone(self._data, item_ids)
